@@ -280,9 +280,75 @@ impl Provider for OpenAICompatibleProvider {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    /// Mock provider for testing agent loop
+    pub struct MockProvider {
+        model: String,
+        responses: Arc<Mutex<VecDeque<Result<ChatResponse, ProviderError>>>>,
+        slow_responses: Arc<Mutex<VecDeque<Duration>>>,
+    }
+
+    impl MockProvider {
+        pub fn new(model: &str) -> Self {
+            Self {
+                model: model.to_string(),
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                slow_responses: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
+
+        pub fn add_response(&mut self, response: ChatResponse) {
+            self.responses.lock().unwrap().push_back(Ok(response));
+        }
+
+        pub fn add_slow_response(&mut self, delay: Duration) {
+            self.slow_responses.lock().unwrap().push_back(delay);
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, ProviderError> {
+            self.chat_with_tools(messages, &[]).await
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDef],
+        ) -> Result<ChatResponse, ProviderError> {
+            let delay = { self.slow_responses.lock().unwrap().pop_front() };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+                return Err(ProviderError::Timeout("Simulated timeout".into()));
+            }
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(ProviderError::ServerError(
+                    "No more mock responses".into(),
+                )))
+        }
+
+        fn count_tokens(&self, text: &str) -> u64 {
+            (text.len() / 4).max(1) as u64
+        }
+
+        fn model(&self) -> &str {
+            &self.model
+        }
+
+        fn vendor(&self) -> &str {
+            "mock"
+        }
+    }
 
     #[tokio::test]
     async fn test_simple_chat() {

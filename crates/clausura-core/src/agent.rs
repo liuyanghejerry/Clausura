@@ -1,1 +1,274 @@
+use crate::provider::Provider;
+use crate::tools::ToolRegistry;
+use crate::types::{Finding, FinishReason, Message, ProviderError, Role, TaskContract, Usage};
+use std::time::{Duration, Instant};
 
+/// Result from the agent loop
+#[derive(Debug)]
+pub struct AgentResult {
+    pub messages: Vec<Message>,
+    pub findings: Vec<Finding>,
+    pub usage: Usage,
+    pub duration_ms: u64,
+    pub truncated: bool,
+}
+
+/// Configuration for the agent loop
+pub struct AgentConfig<'a> {
+    pub contract: &'a TaskContract,
+    pub provider: &'a dyn Provider,
+    pub tools: &'a ToolRegistry,
+    pub initial_messages: Vec<Message>,
+}
+
+/// Run the bounded agent loop.
+pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, ProviderError> {
+    let start = Instant::now();
+    let max_iterations: u32 = 10;
+    let mut messages = config.initial_messages;
+    let mut total_usage = Usage::default();
+    let mut truncated = false;
+    let mut running_tokens: u64 = 0;
+
+    let tool_descriptions = config.tools.list_definitions();
+    let tools_json = serde_json::to_string_pretty(&tool_descriptions).unwrap_or_default();
+    let system_prompt = format!(
+        "{}\n\nAvailable tools:\n{}\n\nRespond in JSON format with a `findings` array.",
+        config.contract.prompt_template, tools_json,
+    );
+
+    messages.insert(
+        0,
+        Message {
+            role: Role::System,
+            content: system_prompt,
+        },
+    );
+
+    for _iteration in 0..max_iterations {
+        if start.elapsed() > Duration::from_secs(config.contract.timeout_secs) {
+            return Err(ProviderError::Timeout("Task timeout exceeded".into()));
+        }
+
+        if running_tokens >= config.contract.token_budget {
+            truncated = true;
+            break;
+        }
+
+        let response = config
+            .provider
+            .chat_with_tools(&messages, config.tools.list_definitions().as_slice())
+            .await?;
+
+        total_usage.input_tokens += response.usage.input_tokens;
+        total_usage.output_tokens += response.usage.output_tokens;
+        total_usage.total_tokens += response.usage.total_tokens;
+        running_tokens += response.usage.total_tokens;
+
+        match response.finish_reason {
+            FinishReason::Stop => {
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.message.content.clone(),
+                });
+
+                let findings = extract_findings(&response.message.content);
+                return Ok(AgentResult {
+                    messages,
+                    findings,
+                    usage: total_usage,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    truncated,
+                });
+            }
+            FinishReason::ToolCalls => {
+                if let Some(tool_calls) = response.tool_calls {
+                    let tool_call_content = serde_json::to_string(&tool_calls).unwrap_or_default();
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: tool_call_content,
+                    });
+
+                    for tc in &tool_calls {
+                        match config.tools.get(&tc.name) {
+                            Some(tool) => {
+                                let result = tool.execute(tc.arguments.clone()).await;
+                                match result {
+                                    Ok(output) => {
+                                        messages.push(Message {
+                                            role: Role::Tool,
+                                            content: output,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        messages.push(Message {
+                                            role: Role::Tool,
+                                            content: format!("Error: {}", e),
+                                        });
+                                    }
+                                }
+                            }
+                            None => {
+                                messages.push(Message {
+                                    role: Role::Tool,
+                                    content: format!("Error: Tool '{}' not found", tc.name),
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            FinishReason::Length => {
+                truncated = true;
+                break;
+            }
+            FinishReason::ContentFilter | FinishReason::Other(_) => {
+                break;
+            }
+        }
+    }
+
+    let last_content = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+
+    let findings = extract_findings(&last_content);
+
+    Ok(AgentResult {
+        messages,
+        findings,
+        usage: total_usage,
+        duration_ms: start.elapsed().as_millis() as u64,
+        truncated,
+    })
+}
+
+/// Extract findings from agent output JSON.
+/// Tries to parse the content as JSON and extract a `findings` array.
+/// If that fails, returns an empty vec.
+fn extract_findings(content: &str) -> Vec<Finding> {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(findings) = json.get("findings").and_then(|f| f.as_array()) {
+            let parsed: Vec<Finding> = findings
+                .iter()
+                .filter_map(|f| serde_json::from_value(f.clone()).ok())
+                .collect();
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+        if let Ok(findings) = serde_json::from_value::<Vec<Finding>>(json) {
+            return findings;
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::tests::MockProvider;
+    use crate::tools::default_tools;
+    use crate::types::{AmbiguityPolicy, ChatResponse, ToolCall};
+    use tempfile::TempDir;
+
+    fn test_contract() -> TaskContract {
+        TaskContract {
+            id: "test".into(),
+            name: "test".into(),
+            description: "".into(),
+            model: "gpt-4o".into(),
+            vendor: "openai".into(),
+            prompt_template: "Review the code and return findings as JSON.".into(),
+            tool_allowlist: vec!["git".into()],
+            token_budget: 100000,
+            timeout_secs: 60,
+            ambiguity_policy: AmbiguityPolicy::FailClosed,
+            gating_rules: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_with_tool_calls() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root);
+
+        let mut mock = MockProvider::new("gpt-4o");
+        mock.add_response(ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: "Checking code...".into(),
+            },
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                name: "git_diff".into(),
+                arguments: serde_json::json!({}),
+            }]),
+        });
+        mock.add_response(ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "test finding", "evidence": "test"}]}"#.into(),
+            },
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let contract = test_contract();
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message {
+                role: Role::User,
+                content: "Review the diff".into(),
+            }],
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(!result.findings.is_empty());
+        assert!(result.duration_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_halts_on_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let tools = default_tools(tmp.path().to_path_buf());
+
+        let mut mock = MockProvider::new("slow-model");
+        mock.add_slow_response(Duration::from_secs(10));
+
+        let mut contract = test_contract();
+        contract.timeout_secs = 1;
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message {
+                role: Role::User,
+                content: "Hi".into(),
+            }],
+        };
+
+        let result = run_agent_loop(config).await;
+        assert!(result.is_err());
+    }
+}
