@@ -16,6 +16,12 @@ dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tiktoken-rs = "0.5"
 rand = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+rmp-serde = "1"
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt", "time"] }
+tracing-appender = "0.2"
+regex-lite = "0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
