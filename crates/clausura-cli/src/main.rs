@@ -1,4 +1,7 @@
 use clap::{Parser, Subcommand};
+use commands::run::RunArgs;
+
+mod commands;
 
 #[derive(Parser)]
 #[command(name = "clausura", about = "CI-native agent CLI tool")]
@@ -10,10 +13,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Run a Clausura task
-    Run {
-        #[arg(short, long, default_value = ".clausura.yaml")]
-        config: std::path::PathBuf,
-    },
+    Run(RunArgs),
     /// Manage checkpoints
     Snapshot {
         #[command(subcommand)]
@@ -39,7 +39,16 @@ enum SnapshotAction {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _cli = Cli::parse();
-    // TODO: wire up in Task 14
-    Ok(())
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Run(args) => {
+            let exit_code = commands::run::execute(args).await;
+            std::process::exit(exit_code);
+        }
+        Commands::Snapshot { action: _ } => {
+            eprintln!("Snapshot commands not yet implemented (Task 15)");
+            Ok(())
+        }
+    }
 }
