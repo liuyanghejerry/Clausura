@@ -11,6 +11,11 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 thiserror = "1"
 async-trait = "0.1"
+serde_yaml = "0.9"
+dirs = "5"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tiktoken-rs = "0.5"
+rand = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
