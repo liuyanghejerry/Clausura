@@ -1,0 +1,5 @@
+target/
+.clausura/
+*.db
+*.sarif
+.sisyphus/

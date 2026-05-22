@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/clausura-core", "crates/clausura-cli"]
+resolver = "2"
