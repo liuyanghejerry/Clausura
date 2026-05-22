@@ -28,3 +28,20 @@ fn test_run_dry_run() {
     let mut cmd = Command::cargo_bin("clausura").unwrap();
     cmd.args(["run", "--dry-run"]).assert().failure();
 }
+
+#[test]
+fn test_snapshot_help() {
+    let mut cmd = Command::cargo_bin("clausura").unwrap();
+    cmd.args(["snapshot", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("show"))
+        .stdout(predicate::str::contains("delete"));
+}
+
+#[test]
+fn test_snapshot_list() {
+    let mut cmd = Command::cargo_bin("clausura").unwrap();
+    cmd.args(["snapshot", "list"]).assert().success();
+}

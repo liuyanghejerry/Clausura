@@ -9,6 +9,8 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
+colored = "2"
+atty = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"

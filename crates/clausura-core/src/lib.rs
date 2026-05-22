@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod build_info;
 pub mod checkpoint;
 pub mod ci;
 pub mod config;

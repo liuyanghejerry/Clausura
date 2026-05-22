@@ -1,0 +1,38 @@
+name: 'Clausura Code Review'
+description: 'AI-powered code review agent for CI pipelines'
+author: 'Clausura'
+
+inputs:
+  config:
+    description: 'Path to .clausura.yaml config file'
+    required: false
+    default: '.clausura.yaml'
+  model:
+    description: 'Override the LLM model'
+    required: false
+  vendor:
+    description: 'Override the LLM vendor'
+    required: false
+  api_key:
+    description: 'API key for the LLM provider'
+    required: false
+  token_budget:
+    description: 'Override token budget'
+    required: false
+  timeout:
+    description: 'Override timeout in seconds'
+    required: false
+
+runs:
+  using: 'composite'
+  steps:
+    - run: clausura run --config ${{ inputs.config }}
+      shell: bash
+      env:
+        CLAUSURA_API_KEY: ${{ inputs.api_key }}
+        CLAUSURA_MODEL: ${{ inputs.model }}
+        CLAUSURA_VENDOR: ${{ inputs.vendor }}
+
+branding:
+  icon: 'check-circle'
+  color: 'green'

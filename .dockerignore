@@ -1,0 +1,5 @@
+target/
+.git/
+.sisyphus/
+*.db
+*.sarif
