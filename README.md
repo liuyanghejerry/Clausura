@@ -59,6 +59,60 @@ clausura --version
 # clausura 1.0.0 (commit: abc1234, built: 2026-05-23)
 ```
 
+## Supported LLM Providers
+
+Clausura supports three vendor categories out of the box:
+
+### 1. OpenAI-compatible
+
+Any LLM that exposes an OpenAI-compatible `/chat/completions` endpoint:
+
+| Shorthand | Base URL | Auth Header |
+|-----------|----------|-------------|
+| `openai` | `https://api.openai.com/v1` | `Authorization: Bearer` |
+| `deepseek` | `https://api.deepseek.com/v1` | `Authorization: Bearer` |
+| `groq` | `https://api.groq.com/openai/v1` | `Authorization: Bearer` |
+| `ollama` | `http://localhost:11434/v1` | `Authorization: Bearer` |
+| (custom) | User-defined | `Authorization: Bearer` |
+
+```yaml
+vendor: deepseek   # shorthand
+# or full config:
+vendor:
+  type: openai_compatible
+  base_url: "https://api.mistral.ai/v1"
+```
+
+### 2. Anthropic-compatible
+
+Claude models via Anthropic's native Messages API:
+
+| Shorthand | Base URL | Auth Header |
+|-----------|----------|-------------|
+| `anthropic` | `https://api.anthropic.com` | `x-api-key` |
+| `claude` | `https://api.anthropic.com` | `x-api-key` |
+
+```yaml
+vendor: anthropic
+model: claude-sonnet-4-20250514
+```
+
+Uses Anthropic's native Messages API (`/v1/messages`) with `x-api-key` auth and `anthropic-version: 2023-06-01`.
+
+### 3. Custom
+
+For enterprise-internal LLMs with non-standard authentication:
+
+```yaml
+vendor:
+  type: custom
+  base_url: "https://llm.internal.company.com/v1"
+  auth_header: "X-API-Key"
+  api_key_env: "INTERNAL_LLM_KEY"
+```
+
+Uses the OpenAI-compatible API format (`/chat/completions`) with configurable base URL and auth header. The `auth_header` defaults to `Authorization`; the `api_key_env` defaults to `CLAUSURA_API_KEY`.
+
 ## Quick Start
 
 ### 1. Create a configuration file
@@ -131,7 +185,13 @@ task:
 
   # LLM provider
   model: gpt-4o                      # Required (or set CLAUSURA_MODEL).
-  vendor: openai                     # Default: "". Used to derive API base URL.
+  vendor: openai                     # Shorthand (backward compatible).
+  # Or with full config:
+  vendor:
+    type: openai_compatible          # openai_compatible | anthropic_compatible | custom
+    base_url: "https://api.deepseek.com/v1"  # Optional. Override API endpoint.
+    auth_header: "X-API-Key"         # Optional. For custom auth (default: Authorization).
+    api_key_env: "MY_SECRET_KEY"     # Optional. Env var for API key (default: CLAUSURA_API_KEY).
 
   # Prompt
   prompt_template: "{{task_description}}"  # Default. The agent's system prompt.
@@ -305,6 +365,10 @@ Findings from the agent are evaluated by the rule engine using pure counting:
 
 No LLM calls, no heuristics. Just deterministic logic your pipeline can trust.
 
+### LLM provider abstraction
+
+Three vendor categories: OpenAI-compatible (works with OpenAI, DeepSeek, Groq, Ollama, vLLM, Mistral), Anthropic-compatible (native Claude Messages API), and Custom (configurable enterprise endpoints). Factory function `create_provider()` dispatches on vendor type.
+
 ### Tool sandboxing
 
 Three built-in tools:
@@ -361,7 +425,7 @@ clausura/
         context.rs              # Token budget tracking and context truncation
         executor.rs             # Task lifecycle orchestrator
         logging.rs              # Structured logging (JSON or pretty)
-        provider.rs             # LLM provider abstraction (OpenAI-compatible)
+        provider.rs             # LLM provider (OpenAI/Anthropic/Custom + factory)
         rules.rs                # Deterministic rule engine for gating
         sarif.rs                # SARIF v2.1.0 output formatter
         snapshot.rs             # Snapshot manager (save/restore)
