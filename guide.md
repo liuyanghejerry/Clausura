@@ -1,344 +1,374 @@
-# Clausura 端到端实践指南
+# Clausura + Playwright 端到端 CI 实践
 
-> 适用版本: clausura 1.0.0 (commit: 475c790)
+> 适用版本: clausura 1.0.0
 > 仓库: https://github.com/clausura/clausura
 
-## 场景设定
+## 场景
 
-假设你维护一个 Rust Web 项目 `acme/api-server`。团队提交了一个 PR，里面混了两个典型问题：
+假设你维护一个 Node.js 电商项目 `mini-shop`。团队开了一个 PR，新增了登录和结账功能。PR 合并前需要两道关卡：Playwright 保证页面功能正常，Clausura 保证代码没有安全问题。
 
-1. **SQL 注入漏洞** -- 代码用 `format!` 拼接 SQL 字符串，没有参数化查询
-2. **生产代码里用了 `unwrap()`** -- 虽然不是每次都会崩溃，但不符合团队规范
+项目文件结构：
 
-你的目标是在 PR 合并到 `main` 之前自动拦截这些问题。Clausura 作为 CI 中的一个门禁步骤，跑 LLM Agent 审查 diff，产出结构化结果，然后由确定性规则引擎决定是否放行。
+```
+mini-shop/
+  package.json
+  server.js                  # Express 后端
+  .clausura.yaml             # Clausura 代码审查配置
+  .github/
+    workflows/
+      e2e.yml                # CI 工作流
+  public/
+    login.html               # 登录页面
+    checkout.html            # 结账页面
+  tests/
+    checkout.spec.ts         # Playwright 浏览器测试
+```
 
-## 第一步：编写任务配置
+目标：PR 合并到 `main` 之前，Playwright 必须通过（检查页面功能），Clausura 也必须通过（检查代码质量）。两者任一失败就阻断合并。
 
-在项目根目录创建 `.clausura.yaml`：
+## 项目代码
+
+### package.json
+
+```json
+{
+  "name": "mini-shop",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "playwright test"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.40.0"
+  }
+}
+```
+
+### server.js
+
+一个有意包含漏洞的 Express 服务器。登录接口用 `req.query.user` 直接拼 SQL，存在 SQL 注入漏洞。结账接口正常。
+
+```javascript
+const express = require('express');
+const app = express();
+app.use(express.static('public'));
+app.use(express.json());
+
+// 数据库模拟
+const db = { query: (sql, callback) => {
+  // 模拟查库
+  if (sql.includes('admin')) callback(null, [{ name: 'admin', role: 'admin' }]);
+  else callback(null, []);
+}};
+
+// 有漏洞的登录接口 (SQL 注入)
+app.get('/api/login', (req, res) => {
+  const user = req.query.user;  // 未做参数化
+  const sql = `SELECT * FROM users WHERE name = '${user}'`;  // SQL 注入漏洞
+  db.query(sql, (err, rows) => {
+    if (rows && rows.length > 0) {
+      res.json({ success: true, user: rows[0] });
+    } else {
+      res.json({ success: false });
+    }
+  });
+});
+
+// 正常的结账接口
+app.post('/api/checkout', (req, res) => {
+  const { items } = req.body;
+  if (!items || items.length === 0) {
+    return res.status(400).json({ error: 'Cart is empty' });
+  }
+  res.json({ success: true, order_id: Date.now() });
+});
+
+app.listen(3000, () => console.log('Server on :3000'));
+```
+
+### public/login.html
+
+```html
+<!DOCTYPE html>
+<html>
+<head><title>Login</title></head>
+<body>
+  <h1>Login</h1>
+  <input id="username" type="text" placeholder="Username" />
+  <button id="login-btn">Login</button>
+  <div id="welcome"></div>
+  <script>
+    document.getElementById('login-btn').onclick = async () => {
+      const user = document.getElementById('username').value;
+      const res = await fetch(`/api/login?user=${user}`);
+      const data = await res.json();
+      if (data.success) {
+        document.getElementById('welcome').textContent =
+          'Welcome, ' + data.user.name;
+      }
+    };
+  </script>
+</body>
+</html>
+```
+
+### public/checkout.html
+
+```html
+<!DOCTYPE html>
+<html>
+<head><title>Checkout</title></head>
+<body>
+  <h1>Checkout</h1>
+  <ul id="items">
+    <li>T-shirt - $19.99</li>
+    <li>Mug - $9.99</li>
+  </ul>
+  <button id="checkout-btn">Place Order</button>
+  <div id="result"></div>
+  <script>
+    document.getElementById('checkout-btn').onclick = async () => {
+      const res = await fetch('/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: ['T-shirt', 'Mug'] })
+      });
+      const data = await res.json();
+      if (data.success) {
+        document.getElementById('result').textContent =
+          'Order placed: ' + data.order_id;
+      } else {
+        document.getElementById('result').textContent =
+          'Error: ' + data.error;
+      }
+    };
+  </script>
+</body>
+</html>
+```
+
+## Playwright 测试
+
+`tests/checkout.spec.ts` 是一个端到端浏览器测试。它启动浏览器，模拟用户完成登录和结账操作，验证页面是否正确渲染。
+
+```typescript
+import { test, expect } from '@playwright/test';
+
+test('checkout flow works end to end', async ({ page }) => {
+  await page.goto('http://localhost:3000/login.html');
+  await page.fill('#username', 'admin');
+  await page.click('#login-btn');
+  await expect(page.locator('#welcome')).toContainText('admin');
+
+  await page.goto('http://localhost:3000/checkout.html');
+  await page.click('#checkout-btn');
+  await expect(page.locator('#result')).toContainText('success');
+});
+```
+
+这个测试覆盖了完整的用户路径：登录 -> 看到欢迎信息 -> 进入结账页 -> 下单 -> 看到成功提示。如果任何一个步骤的 DOM 发生变化或者接口返回异常，测试就会失败。
+
+## Clausura 配置
+
+`.clausura.yaml` 配置了代码安全审查任务。Clausura 会读取 PR 的代码 diff，交给 LLM 检查安全问题，然后用确定性规则引擎判定是否放行。
 
 ```yaml
 version: "1"
 task:
-  name: pr-code-review
-  description: "Pull request code review for api-server"
+  name: code-security-review
   model: gpt-4o
   vendor: openai
   prompt_template: |
-    You are reviewing a pull request for a Rust web application at {{repo}}.
-    The current commit is {{commit_sha}} on branch {{branch}}.
+    Review the following Node.js server code for security issues.
+    Focus on:
+    1. SQL injection — any string concatenation in SQL queries
+    2. Hardcoded credentials or secrets
+    3. Missing input validation
+    4. XSS vulnerabilities
 
-    Review the git diff for:
-    1. SQL injection vulnerabilities (concatenated SQL strings, missing parameterization)
-    2. Use of `unwrap()` in non-test production code
-    3. Missing error handling
-
-    For each issue, output a JSON finding with:
-    - rule_id: "no-sql-injection" for SQL injection, "no-unwrap-in-production" for unwrap in prod code
-    - severity: "error" for SQL injection, "warning" for unwrap
-    - message: clear description of what's wrong
-    - location: file path and line numbers
-    - evidence: the problematic code snippet
-  token_budget: 16000
-  timeout_secs: 120
-  ambiguity_policy: fail_closed
+    For each finding use:
+    - rule_id: "sql-injection" for SQL injection, "hardcoded-secret" for credentials, "missing-validation" for input issues, "xss" for XSS
+    - severity: "error" for exploitable issues, "warning" for best practice violations
+  token_budget: 8000
+  timeout_secs: 60
   gating:
-    - rule: no-sql-injection
-      description: "SQL injection is a blocker - must use parameterized queries"
+    - rule: sql-injection
+      description: "SQL injection is a critical security vulnerability"
       min_severity: error
       max_findings: 0
       action: fail
-    - rule: no-unwrap-in-production
-      description: "unwrap() in production code should be avoided"
-      min_severity: warning
+    - rule: hardcoded-secret
+      description: "No hardcoded credentials in source"
+      min_severity: error
       max_findings: 0
       action: fail
+    - rule: missing-validation
+      description: "All user inputs must be validated"
+      min_severity: warning
+      max_findings: 2
+      action: warn
 ```
 
-关键设计点：
+配置要点：
 
-- `gating` 下定义了两个规则，rule id 需要和 LLM 输出的 `rule_id` 对应
-- `no-sql-injection` 是零容忍，发现一个就 `fail`
-- `no-unwrap-in-production` 也是零容忍，但 severity 设为 warning
-- `ambiguity_policy: fail_closed` 意味着 LLM 输出格式不对时，宁可阻断也不要放过
+- `gating` 下定义了三条规则，rule id 需要和 LLM 输出的 `rule_id` 对应
+- `sql-injection` 是零容忍，发现一个就 `fail`，阻断 CI
+- `hardcoded-secret` 也是零容忍
+- `missing-validation` 允许最多 2 个 warning，超出只记录不阻断
 
-## 第二步：本地验证
+## GitHub Actions 工作流
 
-在推送 CI 之前，先在本地验证配置和效果。
-
-```bash
-# 1. 验证配置文件语法
-clausura run --validate-config
-```
-
-预期输出：
-
-```
-[1/2] Loading configuration...
-[2/2] Validating configuration...
-OK: Configuration is valid
-```
-
-如果配置有问题，会返回到 exit code 3，并输出具体错误。
-
-```bash
-# 2. 预览执行计划（不调用 LLM）
-clausura run --dry-run
-```
-
-输出样例：
-
-```
-[1/2] Loading configuration...
-[2/2] Planning execution...
-
-Task Plan:
-  Name: pr-code-review
-  ID: task-pr-code-review
-  Model: gpt-4o
-  Vendor: openai
-  Token budget: 16000
-  Timeout: 120s
-  Gating rules: 2
-```
-
-dry-run 不会调用 LLM，只展示解析后的配置，适合用来确认 `gating` 规则是否按预期加载。
-
-```bash
-# 3. 实际执行（需要 API key）
-export CLAUSURA_API_KEY=sk-...
-clausura run
-```
-
-## 第三步：CI 集成
-
-### GitHub Actions
+`.github/workflows/e2e.yml` 定义了两个并行 job：`playwright` 和 `clausura`。两者都跑完后，任一失败都会让整个 pipeline 变红。
 
 ```yaml
-name: Code Review
+name: E2E Pipeline
 
 on:
   pull_request:
     branches: [main]
 
 jobs:
-  review:
+  playwright:
+    name: Playwright Browser Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - run: npm ci
+
+      - run: npx playwright install --with-deps chromium
+
+      - name: Start server and run tests
+        run: |
+          node server.js &
+          sleep 2
+          npx playwright test
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report/
+
+  clausura:
+    name: Clausura Code Review
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2  # 需要 git history 才能做 diff
+          fetch-depth: 2
 
-      - uses: clausura/clausura@v1
+      - name: Run Clausura
+        run: clausura run --config .clausura.yaml
+        env:
+          CLAUSURA_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
         with:
-          config: .clausura.yaml
-          api_key: ${{ secrets.OPENAI_API_KEY }}
-          model: gpt-4o
-          vendor: openai
-          token_budget: 16000
-          timeout: 120
+          sarif_file: clausura-output.sarif
 ```
 
-Clausura 的 GitHub Action 会自动检测 `GITHUB_ACTIONS` 环境变量，提取仓库名、PR 号、commit SHA 和分支名，填充到 `prompt_template` 的模板变量中。
+Playwright job 做了三件事：安装依赖、启动服务器、跑浏览器测试。失败时上传测试报告方便排查。Clausura job 需要 `fetch-depth: 2` 来获取 git diff 信息。它把 SARIF 结果上传到 GitHub Advanced Security，让问题直接显示在 PR diff 上。
 
-### GitLab CI
+## 执行结果对比
 
-```yaml
-code-review:
-  image: ghcr.io/clausura/clausura:latest
-  script:
-    - clausura run --config .clausura.yaml
-  variables:
-    CLAUSURA_API_KEY: $OPENAI_API_KEY
-    CLAUSURA_MODEL: "gpt-4o"
-```
+### 场景 A：两个都通过
 
-### Jenkins
+| Job | 状态 | 输出 |
+|-----|------|------|
+| Playwright | ✅ Pass | 3 tests passed, checkout flow works |
+| Clausura | ✅ Pass | Findings: 0, Exit: 0 |
 
-```groovy
-stage('Code Review') {
-    environment {
-        CLAUSURA_API_KEY = credentials('llm-api-key')
-    }
-    steps {
-        sh 'clausura run'
-    }
-}
-```
+PR 可以合并。代码没有安全问题，页面功能正常。
 
-三种 CI 平台走的是同一个二进制，区别只在于环境变量的传递方式。Clausura 自动识别 CI 类型，无需额外配置。
+### 场景 B：只有 Clausura 发现 SQL 注入
 
-## 第四步：预期输出
+| Job | 状态 | 输出 |
+|-----|------|------|
+| Playwright | ✅ Pass | 3 tests passed |
+| Clausura | ❌ Fail | Findings: 1 (sql-injection), Exit: 1 |
 
-### 成功场景（无问题发现）
+Playwright 通过了，因为 SQL 注入不影响页面渲染。无论传什么用户名，服务器都返回 JSON，页面照样显示欢迎信息。但 Clausura 从代码层面发现了拼接 SQL 的问题。这正是两种测试互补的体现。
 
-如果你的 PR 是干净的，运行后日志类似：
+Clausura 的实际日志输出：
 
 ```
 [1/4] Loading configuration...
 [2/4] Initializing agent...
 [3/4] Executing task...
-  pr-code-review
-[4/4] Processing results...
-Success: Task completed successfully
-  Findings: 0 | Exit: 0 | Tokens: 2340 | Duration: 5500ms
-```
-
-`exit 0` 表示所有门禁规则通过。SARIF 文件（默认输出到 `clausura-output.sarif`）内容如下：
-
-```json
-{
-  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-  "version": "2.1.0",
-  "runs": [
-    {
-      "tool": {
-        "driver": {
-          "name": "Clausura",
-          "informationUri": "https://github.com/clausura/clausura"
-        }
-      },
-      "results": []
-    }
-  ]
-}
-```
-
-### 失败场景（发现 SQL 注入）
-
-假设 PR 引入了这样的代码：
-
-```rust
-fn get_user_by_id(conn: &Connection, user_id: &str) -> Result<User, Error> {
-    let sql = format!("SELECT * FROM users WHERE id = '{}'", user_id);
-    conn.query(&sql)
-}
-```
-
-LLM 会返回 findings，Clausura 的输出：
-
-```
-[1/4] Loading configuration...
-[2/4] Initializing agent...
-[3/4] Executing task...
-  pr-code-review
+  code-security-review
 [4/4] Processing results...
 Error: Task failed
-  Findings: 2 | Exit: 1 | Tokens: 3450 | Duration: 7200ms
+  Findings: 1 | Exit: 1 | Tokens: 2340 | Duration: 5500ms
 ```
 
-`exit 1` 表示有 rules 触发了 `action: fail`。对应的 SARIF 文件：
+生成的 SARIF finding 内容：
 
 ```json
 {
-  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-  "version": "2.1.0",
-  "runs": [
-    {
-      "tool": {
-        "driver": {
-          "name": "Clausura",
-          "informationUri": "https://github.com/clausura/clausura"
-        }
-      },
-      "results": [
-        {
-          "ruleId": "no-sql-injection",
-          "level": "error",
-          "message": {
-            "text": "SQL injection vulnerability: user input `user_id` is concatenated into SQL query string via `format!`. Use parameterized queries instead."
-          },
-          "locations": [
-            {
-              "physicalLocation": {
-                "artifactLocation": {
-                  "uri": "src/db/users.rs"
-                },
-                "region": {
-                  "startLine": 42,
-                  "endLine": 43
-                }
-              }
-            }
-          ]
-        },
-        {
-          "ruleId": "no-unwrap-in-production",
-          "level": "warning",
-          "message": {
-            "text": "`unwrap()` used on `parse` result in production code. Use `match` or `?` for proper error handling."
-          },
-          "locations": [
-            {
-              "physicalLocation": {
-                "artifactLocation": {
-                  "uri": "src/handlers/users.rs"
-                },
-                "region": {
-                  "startLine": 78,
-                  "endLine": 78
-                }
-              }
-            }
-          ]
-        }
-      ]
+  "ruleId": "sql-injection",
+  "level": "error",
+  "message": {
+    "text": "SQL injection vulnerability in /api/login: user input 'user' is directly concatenated into SQL query without parameterization"
+  },
+  "locations": [{
+    "physicalLocation": {
+      "artifactLocation": { "uri": "server.js" },
+      "region": { "startLine": 15, "endLine": 16 }
     }
-  ]
+  }]
 }
 ```
 
-GitHub Advanced Security 会消费这个 SARIF 文件，把问题直接标注在 PR diff 上 -- 每一行被标记的代码旁边会出现注释，开发者不用看 CI 日志，直接在 PR 页面上就能看到 "SQL injection vulnerability" 之类的提示。
+这个 SARIF 文件被上传到 GitHub Advanced Security 后，会在 PR 的 `server.js` 第 15-16 行旁边直接标注 "SQL injection vulnerability"，开发者不用看 CI 日志就能发现问题。
 
-## 第五步：解读结果
+### 场景 C：只有 Playwright 发现结账功能挂了
 
-| Exit Code | 含义 | 对应操作 |
-|-----------|------|---------|
-| 0 | 通过 | 合并按钮变绿，CI 放行 |
-| 1 | 阻断 | PR 被拦截，开发者修复后重新推送 |
-| 2 | 运行时错误 | CI 自身出问题了（超时、API 配额不足、网络错误），需要运维介入 |
-| 3 | 配置错误 | 检查 `.clausura.yaml` 格式和必填字段 |
+| Job | 状态 | 输出 |
+|-----|------|------|
+| Playwright | ❌ Fail | checkout flow broken, element not found |
+| Clausura | ✅ Pass | Findings: 0, Exit: 0 |
 
-`exit 2` 的典型场景：
+假设有人改了 `checkout.html` 的 DOM 结构，把按钮的 `id` 从 `checkout-btn` 改成了 `submit-order`，但没更新 Playwright 测试。Clausura 检查的是代码层面，看不出 DOM 结构变化。但 Playwright 在浏览器里真实点击，找不到元素就会报错。
 
-- LLM API 返回 429（限流）
-- 请求超时（diff 太大或网络延迟）
-- `CLAUSURA_API_KEY` 未设置
+这就体现了分层测试的价值：Clausura 管代码质量，Playwright 管功能正确。两者互不替代。
 
-`exit 3` 的典型场景：
+## 关键认识
 
-- `version` 字段缺失
-- `task.model` 未设置且 `CLAUSURA_MODEL` 环境变量也不存在
-- `task.token_budget` 或 `task.timeout_secs` 为 0
+| 维度 | Playwright | Clausura |
+|------|-----------|----------|
+| 测试对象 | 用户可见行为（页面渲染、交互） | 代码质量（安全、规范、架构） |
+| 失败原因 | 功能回归、DOM 变化 | SQL 注入、硬编码密钥、不良实践 |
+| 时机 | 每次 PR | 每次 PR |
+| 反馈形式 | 测试报告 + 截图 | SARIF + 门禁判定 |
+| 误报率 | 低（真实浏览器执行） | 取决于 LLM 质量和 prompt 设计 |
+| 修复成本 | 改测试或改 DOM | 改代码 + 重新审查 |
 
-## 常见问题
+两种工具各管一摊，加在一起构成完整的质量门禁。Playwright 像质检员，在用户能接触到的地方把关。Clausura 像代码审计师，在开发者写完代码但还没部署之前发现问题。
 
-**问：为什么不直接用 GitHub Copilot / CodeRabbit？**
+## 扩展思路
 
-Clausura 是自托管的，模型、规则、提示词完全由你控制。你可以把它接上任何 OpenAI 兼容的 API（包括本地模型），数据不出本地网络。门禁规则是确定性的，不存在 "今天通过了明天通不过" 的情况。
+给一个更完整的 pipeline 示意图：
 
-**问：能用本地模型吗？**
+```
+PR Push
+  ├── Playwright (浏览器测试) --- 3 tests --- ✅ Pass
+  ├── Clausura (代码审查)     --- 0 findings - ✅ Pass
+  ├── ESLint (代码规范)       --- 0 errors --- ✅ Pass
+  └── Build (构建检查)        --- success ---- ✅ Pass
+                                    |
+                            All green -> Auto-merge
+```
 
-可以。设置 `vendor: ollama`、`model: llama3`，然后 `CLAUSURA_API_KEY=ollama` 即可。Clausura 使用 OpenAI 兼容的 API 协议，Ollama 暴露的接口天然兼容。
+你可以在 Playwright 和 Clausura 之外再加入 lint、类型检查、构建验证等步骤。每个步骤都是独立的 job，并行执行，互不阻塞。只有全部通过才允许合并。
 
-**问：token 预算怎么定？**
-
-经验值：diff 在 500 行以内用 8000，500 到 2000 行用 16000。保守一点就加 50%。如果超了，LLM 上下文会被截断，Agent 循环也会提前终止 -- 所以预算设大一点比设小一点好。
-
-**问：同一次提交结果会变吗？**
-
-规则引擎是纯确定性的：相同的 findings 走相同的规则，产出相同的 exit code。LLM 输出每次可能有微小差异（措辞不同、是否发现边缘问题），但 `exit_code` 不会出现 0 和 1 之间的摇摆 -- 除非 diff 本身触到了 LLM 的判断边界。如果对稳定性要求极高，可以考虑用 `proceed_with_caution` 策略处理边界情况。
-
-**问：能跳过某些规则吗？**
-
-可以在配置里把规则的 `action` 改成 `warn` 或 `ignore`，这样即使触发也不会阻断 CI。适合渐进式推行新规则的场景：先用 `warn` 跑一段时间，等团队适应了再切到 `fail`。
-
-## 更多场景
-
-上面的例子是代码审查，但 Clausura 的架构不限于此。换了 prompt 和 rules，可以做完全不同的事。
-
-- **国际化翻译检查** -- 扫描源代码文件，检查 `t!("...")` 调用是否在翻译文件里有对应条目。规则设为 `max_findings: 0, action: fail`，确保不会漏掉翻译。
-- **依赖版本一致性** -- 跨多个 crate 或仓库检查同一个依赖的版本号是否一致，防止依赖冲突。
-- **代码风格合规** -- 虽然不是 linter 的替代品，但可以检查一些 linter 管不到的约定，比如 "TODO 注释必须带 issue 编号"。
-- **架构合规** -- 检查 `http::` 模块是否直接引用了 `db::` 模块，强制分层架构。
-
-每个场景只需要换 `.clausura.yaml` 里的 `prompt_template` 和 `gating` 规则，CI 配置不用动。
+Clausura 的配置可以按团队需求定制。换一个 `prompt_template` 和 `gating` 规则，就能从安全检查变成架构合规检查或依赖一致性检查。CI 配置不用动，改 `.clausura.yaml` 就可以。
