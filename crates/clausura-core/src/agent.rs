@@ -174,7 +174,7 @@ mod tests {
     use super::*;
     use crate::provider::tests::MockProvider;
     use crate::tools::default_tools;
-    use crate::types::{AmbiguityPolicy, ChatResponse, ToolCall};
+    use crate::types::{AmbiguityPolicy, ChatResponse, ToolCall, VendorConfig};
     use tempfile::TempDir;
 
     fn test_contract() -> TaskContract {
@@ -183,7 +183,7 @@ mod tests {
             name: "test".into(),
             description: "".into(),
             model: "gpt-4o".into(),
-            vendor: "openai".into(),
+            vendor: VendorConfig::openai(),
             prompt_template: "Review the code and return findings as JSON.".into(),
             tool_allowlist: vec!["git".into()],
             token_budget: 100000,

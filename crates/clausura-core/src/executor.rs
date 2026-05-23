@@ -1,7 +1,7 @@
 use crate::agent::{run_agent_loop, AgentConfig};
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
-use crate::provider::{OpenAICompatibleProvider, OpenAIProviderConfig};
+use crate::provider::create_provider;
 use crate::rules::RuleEngine;
 use crate::sarif::SarifFormatter;
 use crate::snapshot::SnapshotManager;
@@ -17,13 +17,12 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
     let start = Instant::now();
     let task_id = config.task.id.clone();
 
-    let provider = match OpenAICompatibleProvider::new(OpenAIProviderConfig {
-        model: config.task.model.clone(),
-        api_key: config.api_key.clone().unwrap_or_default(),
-        base_url: format!("https://api.{}.com/v1", config.task.vendor),
-        max_retries: 3,
-        timeout_secs: config.task.timeout_secs,
-    }) {
+    let provider = match create_provider(
+        &config.task.vendor,
+        &config.task.model,
+        &config.api_key.clone().unwrap_or_default(),
+        config.task.timeout_secs,
+    ) {
         Ok(p) => p,
         Err(e) => {
             return ExecutionReport {
@@ -75,7 +74,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
 
     let agent_config = AgentConfig {
         contract: &config.task,
-        provider: &provider,
+        provider: provider.as_ref(),
         tools: &tools,
         initial_messages,
     };

@@ -121,7 +121,12 @@ pub async fn execute(args: RunArgs) -> i32 {
         eprintln!("  {} {}", "Name:".bold(), config.task.name);
         eprintln!("  {} {}", "ID:".bold(), config.task.id);
         eprintln!("  {} {}", "Model:".bold(), config.task.model);
-        eprintln!("  {} {}", "Vendor:".bold(), config.task.vendor);
+        eprintln!(
+            "  {} {:?} ({})",
+            "Vendor:".bold(),
+            config.task.vendor.vendor_type,
+            config.task.vendor.effective_base_url()
+        );
         eprintln!("  {} {}", "Token budget:".bold(), config.task.token_budget);
         eprintln!("  {} {}s", "Timeout:".bold(), config.task.timeout_secs);
         eprintln!(

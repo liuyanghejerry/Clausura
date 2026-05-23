@@ -7,7 +7,9 @@
 ///
 /// The API key is NEVER read from the YAML file — it must come from
 /// a CLI flag or the `CLAUSURA_API_KEY` environment variable.
-use crate::types::{AmbiguityPolicy, ConfigError, GateAction, GateRule, Severity, TaskContract};
+use crate::types::{
+    AmbiguityPolicy, ConfigError, GateAction, GateRule, Severity, TaskContract, VendorConfig,
+};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -226,7 +228,7 @@ impl Config {
 
         // ---- Layer 2: CLI overrides ----
         let model = cli_model.unwrap_or(&yaml_task.model).to_string();
-        let vendor = cli_vendor.unwrap_or(&yaml_task.vendor).to_string();
+        let vendor = VendorConfig::from_name(cli_vendor.unwrap_or(&yaml_task.vendor));
         let token_budget = cli_token_budget.unwrap_or(yaml_task.token_budget);
         let timeout = cli_timeout.unwrap_or(yaml_task.timeout_secs);
 
@@ -330,7 +332,7 @@ task:
         .unwrap();
         assert_eq!(config.task.name, "code-review");
         assert_eq!(config.task.model, "gpt-4o");
-        assert_eq!(config.task.vendor, "openai");
+        assert_eq!(config.task.vendor, VendorConfig::openai());
         assert_eq!(config.task.token_budget, 16000);
         assert_eq!(config.task.timeout_secs, 120);
         assert_eq!(config.task.gating_rules.len(), 1);
@@ -369,7 +371,7 @@ task:
         assert_eq!(config.task.model, "gpt-4o");
         assert_eq!(config.task.token_budget, 32000);
         // These should still come from YAML
-        assert_eq!(config.task.vendor, "openai");
+        assert_eq!(config.task.vendor, VendorConfig::openai());
         assert_eq!(config.task.timeout_secs, 60);
     }
 
@@ -586,7 +588,7 @@ task:
         .unwrap();
         assert_eq!(config.task.name, "default");
         assert_eq!(config.task.model, "gpt-4o");
-        assert_eq!(config.task.vendor, "openai");
+        assert_eq!(config.task.vendor, VendorConfig::openai());
         assert_eq!(config.task.token_budget, 16000);
         assert_eq!(config.task.timeout_secs, 120);
         assert_eq!(config.task.prompt_template, "{{task_description}}");

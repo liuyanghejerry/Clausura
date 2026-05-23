@@ -156,6 +156,183 @@ pub enum AmbiguityPolicy {
     ProceedWithCaution,
 }
 
+/// Supported LLM vendor API types.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum VendorType {
+    /// OpenAI-compatible API (OpenAI, DeepSeek, Groq, Ollama, vLLM, etc.)
+    #[serde(alias = "openai_compatible", alias = "openai")]
+    #[default]
+    OpenAiCompatible,
+    /// Anthropic Messages API (Claude)
+    #[serde(alias = "anthropic_compatible", alias = "anthropic", alias = "claude")]
+    AnthropicCompatible,
+    /// User-defined enterprise LLM with custom auth
+    Custom,
+}
+
+/// Vendor-specific configuration.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct VendorConfig {
+    /// Vendor API type
+    #[serde(rename = "type", default)]
+    pub vendor_type: VendorType,
+    /// Base URL override (for Anthropic, defaults to https://api.anthropic.com)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Auth header name (for Custom, defaults to "Authorization")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
+    /// Environment variable name for the API key (defaults to CLAUSURA_API_KEY)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+}
+
+impl Default for VendorConfig {
+    fn default() -> Self {
+        VendorConfig {
+            vendor_type: VendorType::OpenAiCompatible,
+            base_url: None,
+            auth_header: None,
+            api_key_env: None,
+        }
+    }
+}
+
+impl VendorConfig {
+    /// Create a VendorConfig from a vendor name string (e.g., "openai", "anthropic", "ollama").
+    /// This is used by the config loader to convert YAML/CLI string values into VendorConfig.
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "" => VendorConfig::default(),
+            "openai" | "openai_compatible" => VendorConfig::openai(),
+            "ollama" => VendorConfig::ollama(),
+            "anthropic" | "claude" | "anthropic_compatible" => VendorConfig::anthropic(),
+            "deepseek" => VendorConfig {
+                vendor_type: VendorType::OpenAiCompatible,
+                base_url: Some("https://api.deepseek.com/v1".into()),
+                ..Default::default()
+            },
+            "groq" => VendorConfig {
+                vendor_type: VendorType::OpenAiCompatible,
+                base_url: Some("https://api.groq.com/openai/v1".into()),
+                ..Default::default()
+            },
+            other => VendorConfig {
+                vendor_type: VendorType::OpenAiCompatible,
+                base_url: Some(format!("https://api.{}.com/v1", other)),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Create an OpenAI-compatible vendor config.
+    pub fn openai() -> Self {
+        VendorConfig {
+            vendor_type: VendorType::OpenAiCompatible,
+            base_url: Some("https://api.openai.com/v1".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Create an Anthropic-compatible vendor config.
+    pub fn anthropic() -> Self {
+        VendorConfig {
+            vendor_type: VendorType::AnthropicCompatible,
+            base_url: Some("https://api.anthropic.com".into()),
+            auth_header: Some("x-api-key".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Create an Ollama vendor config (OpenAI-compatible).
+    pub fn ollama() -> Self {
+        VendorConfig {
+            vendor_type: VendorType::OpenAiCompatible,
+            base_url: Some("http://localhost:11434/v1".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Get the effective base URL.
+    pub fn effective_base_url(&self) -> &str {
+        self.base_url.as_deref().unwrap_or(match self.vendor_type {
+            VendorType::OpenAiCompatible => "https://api.openai.com/v1",
+            VendorType::AnthropicCompatible => "https://api.anthropic.com",
+            VendorType::Custom => "",
+        })
+    }
+
+    /// Get the effective auth header name.
+    pub fn auth_header_name(&self) -> &str {
+        self.auth_header
+            .as_deref()
+            .unwrap_or(match self.vendor_type {
+                VendorType::AnthropicCompatible => "x-api-key",
+                _ => "Authorization",
+            })
+    }
+}
+
+/// A helper for deserializing VendorConfig from either a string or an object.
+/// String form: "openai", "ollama", "anthropic" → maps to the corresponding VendorConfig preset.
+/// Object form: { type: "openai_compatible", base_url: "...", auth_header: "..." }
+impl<'de> Deserialize<'de> for VendorConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        struct VendorConfigVisitor;
+
+        impl<'de> de::Visitor<'de> for VendorConfigVisitor {
+            type Value = VendorConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a vendor name string or a vendor config object")
+            }
+
+            // Handle string form: "openai", "ollama", "anthropic" — delegates to from_name
+            fn visit_str<E>(self, value: &str) -> Result<VendorConfig, E>
+            where
+                E: de::Error,
+            {
+                Ok(VendorConfig::from_name(value))
+            }
+
+            // Handle map form: { type: "...", base_url: "...", ... }
+            fn visit_map<M>(self, map: M) -> Result<VendorConfig, M::Error>
+            where
+                M: de::MapAccess<'de>,
+            {
+                #[derive(Deserialize)]
+                struct VendorConfigRaw {
+                    #[serde(rename = "type", default)]
+                    vendor_type: VendorType,
+                    #[serde(default)]
+                    base_url: Option<String>,
+                    #[serde(default)]
+                    auth_header: Option<String>,
+                    #[serde(default)]
+                    api_key_env: Option<String>,
+                }
+
+                let raw = VendorConfigRaw::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(VendorConfig {
+                    vendor_type: raw.vendor_type,
+                    base_url: raw.base_url,
+                    auth_header: raw.auth_header,
+                    api_key_env: raw.api_key_env,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(VendorConfigVisitor)
+    }
+}
+
 /// Task contract — defines what a task does, how it runs, and gating rules
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct TaskContract {
@@ -164,7 +341,8 @@ pub struct TaskContract {
     #[serde(default)]
     pub description: String,
     pub model: String,
-    pub vendor: String,
+    #[serde(default)]
+    pub vendor: VendorConfig,
     pub prompt_template: String,
     #[serde(default)]
     pub tool_allowlist: Vec<String>,
@@ -334,7 +512,7 @@ mod tests {
             name: "Test".into(),
             description: "".into(),
             model: "gpt-4o".into(),
-            vendor: "openai".into(),
+            vendor: VendorConfig::openai(),
             prompt_template: "Review: {{diff}}".into(),
             tool_allowlist: vec![],
             token_budget: 32000,
@@ -379,5 +557,50 @@ mod tests {
         assert!(Severity::Error > Severity::Warning);
         assert!(Severity::Warning > Severity::Info);
         assert!(Severity::Info > Severity::Hint);
+    }
+
+    #[test]
+    fn test_vendor_config_openai() {
+        let cfg = VendorConfig::openai();
+        assert_eq!(cfg.vendor_type, VendorType::OpenAiCompatible);
+        assert_eq!(cfg.effective_base_url(), "https://api.openai.com/v1");
+        assert_eq!(cfg.auth_header_name(), "Authorization");
+    }
+
+    #[test]
+    fn test_vendor_config_anthropic() {
+        let cfg = VendorConfig::anthropic();
+        assert_eq!(cfg.vendor_type, VendorType::AnthropicCompatible);
+        assert_eq!(cfg.effective_base_url(), "https://api.anthropic.com");
+        assert_eq!(cfg.auth_header_name(), "x-api-key");
+    }
+
+    #[test]
+    fn test_vendor_config_ollama() {
+        let cfg = VendorConfig::ollama();
+        assert_eq!(cfg.vendor_type, VendorType::OpenAiCompatible);
+        assert_eq!(cfg.effective_base_url(), "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn test_vendor_config_deser_from_string() {
+        let cfg: VendorConfig = serde_json::from_str(r#""openai""#).unwrap();
+        assert_eq!(cfg.vendor_type, VendorType::OpenAiCompatible);
+
+        let cfg: VendorConfig = serde_json::from_str(r#""anthropic""#).unwrap();
+        assert_eq!(cfg.vendor_type, VendorType::AnthropicCompatible);
+
+        let cfg: VendorConfig = serde_json::from_str(r#""ollama""#).unwrap();
+        assert_eq!(cfg.vendor_type, VendorType::OpenAiCompatible);
+    }
+
+    #[test]
+    fn test_vendor_config_deser_from_object() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"type": "custom", "base_url": "https://llm.internal/v1", "auth_header": "X-API-Key"}"#
+        ).unwrap();
+        assert_eq!(cfg.vendor_type, VendorType::Custom);
+        assert_eq!(cfg.base_url.as_deref(), Some("https://llm.internal/v1"));
+        assert_eq!(cfg.auth_header.as_deref(), Some("X-API-Key"));
     }
 }
