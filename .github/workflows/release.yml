@@ -97,8 +97,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish clausura-core
-        run: cargo publish -p clausura-core
+      - name: Publish clausura-core (skip if already published)
+        run: cargo publish -p clausura-core || true
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_PUBLISH_KEY }}
       - name: Wait for registry index
