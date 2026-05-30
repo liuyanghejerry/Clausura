@@ -7,6 +7,7 @@ use crate::sarif::SarifFormatter;
 use crate::snapshot::SnapshotManager;
 use crate::tools::default_tools;
 use crate::types::{ExecutionReport, Message, ProviderError, Role, Usage};
+use std::path::Path;
 use std::time::Instant;
 
 /// Execute a full task lifecycle.
@@ -116,6 +117,10 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         eprintln!("Warning: Failed to write SARIF: {}", e);
     }
 
+    if gate_result.exit_code == 0 {
+        cleanup_archives(&config.workspace, &task_id);
+    }
+
     ExecutionReport {
         task_id,
         exit_code: gate_result.exit_code,
@@ -124,6 +129,25 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         duration_ms: agent_result.duration_ms,
         snapshot_id,
         errors: vec![],
+    }
+}
+
+/// Delete archive files for the given task_id after successful execution.
+/// Silently ignores errors — this is best-effort cleanup.
+pub fn cleanup_archives(workspace: &Path, task_id: &str) {
+    let archives_dir = workspace.join(".clausura").join("archives");
+    if !archives_dir.exists() {
+        return;
+    }
+    let prefix = format!("context-dump-{}-", task_id);
+    if let Ok(entries) = std::fs::read_dir(&archives_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(&prefix) && name_str.ends_with(".log") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 }
 
@@ -181,5 +205,36 @@ mod tests {
         assert!(path.exists());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("warning"));
+    }
+
+    #[test]
+    fn test_archives_cleaned_on_exit_zero() {
+        let tmp = TempDir::new().unwrap();
+        let archives_dir = tmp.path().join(".clausura").join("archives");
+        std::fs::create_dir_all(&archives_dir).unwrap();
+
+        std::fs::write(archives_dir.join("context-dump-test-task-1.log"), "data1").unwrap();
+        std::fs::write(archives_dir.join("context-dump-test-task-2.log"), "data2").unwrap();
+        std::fs::write(archives_dir.join("some-other-file.txt"), "other").unwrap();
+
+        cleanup_archives(tmp.path(), "test-task");
+
+        assert!(!archives_dir.join("context-dump-test-task-1.log").exists());
+        assert!(!archives_dir.join("context-dump-test-task-2.log").exists());
+        assert!(archives_dir.join("some-other-file.txt").exists());
+        assert!(archives_dir.exists());
+    }
+
+    #[test]
+    fn test_archives_preserved_on_exit_one() {
+        let tmp = TempDir::new().unwrap();
+        let archives_dir = tmp.path().join(".clausura").join("archives");
+        std::fs::create_dir_all(&archives_dir).unwrap();
+
+        std::fs::write(archives_dir.join("context-dump-other-task-1.log"), "data").unwrap();
+
+        cleanup_archives(tmp.path(), "different-task-id");
+
+        assert!(archives_dir.join("context-dump-other-task-1.log").exists());
     }
 }
