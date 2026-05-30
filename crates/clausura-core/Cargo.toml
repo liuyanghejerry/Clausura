@@ -5,6 +5,7 @@ edition = "2021"
 description = "Core library for Clausura — a CI-native agent for deterministic pipeline gating"
 license = "MIT"
 repository = "https://github.com/liuyanghejerry/Clausura"
+readme = "../../README.md"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -5,6 +5,7 @@ edition = "2021"
 description = "CI-native agent CLI for deterministic pipeline gating"
 license = "MIT"
 repository = "https://github.com/liuyanghejerry/Clausura"
+readme = "../../README.md"
 
 [dependencies]
 clausura-core = { path = "../clausura-core", version = "1.0.0" }
