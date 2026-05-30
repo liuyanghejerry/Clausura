@@ -32,7 +32,7 @@ cargo fmt --all -- --check
 ### 3. Commit & Tag
 
 ```bash
-git add crates/*/Cargo.toml
+git add crates/*/Cargo.toml Cargo.lock
 git commit -m "release: bump to X.Y.Z"
 git tag -a vX.Y.Z -m "vX.Y.Z - <summary>"
 git push origin main
@@ -101,6 +101,7 @@ curl -s https://crates.io/api/v1/crates/clausura-cli | jq '.crate.max_stable_ver
 - [ ] Formatted: `cargo fmt --all -- --check`
 - [ ] Versions bumped in both `Cargo.toml` files + dependency version
 - [ ] `readme = "../../README.md"` present in both `Cargo.toml`
+- [ ] `Cargo.lock` updated: `cargo check` regenerates it
 - [ ] CI green: https://github.com/liuyanghejerry/Clausura/actions
 - [ ] crates.io: both crates show correct version + README renders
 - [ ] GitHub Release: binaries attached, release notes generated
