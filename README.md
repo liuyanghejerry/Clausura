@@ -2,9 +2,8 @@
 
 CI-native agent CLI tool for deterministic pipeline gating.
 
-[![Build](https://img.shields.io/github/actions/workflow/status/liuyanghejerry/Clausura/ci.yml?branch=main)](https://github.com/liuyanghejerry/Clausura/actions)
+[![Build](https://img.shields.io/github/actions/workflow/status/liuyanghejerry/Clausura/main.yml?branch=main)](https://github.com/liuyanghejerry/Clausura/actions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Crates.io](https://img.shields.io/crates/v/clausura-cli)](https://crates.io/crates/clausura-cli)
 
 ## Overview
 
@@ -412,7 +411,7 @@ cargo build --release --package clausura-cli
 ### Run tests
 
 ```bash
-cargo test
+cargo test --workspace
 ```
 
 ### Project structure
