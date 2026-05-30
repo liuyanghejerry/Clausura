@@ -416,6 +416,16 @@ cargo build --release --package clausura-cli
 cargo test --workspace
 ```
 
+### Pre-commit hook
+
+A `cargo fmt` pre-commit hook is included. Enable it after cloning:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Commits with misformatted Rust code will be rejected. Run `cargo fmt --all` to auto-fix.
+
 ### Project structure
 
 ```

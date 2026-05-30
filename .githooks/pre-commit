@@ -1,0 +1,24 @@
+#!/bin/sh
+# Pre-commit hook: enforce cargo fmt before committing Rust changes.
+# If formatting is wrong, prints the diff and aborts the commit.
+
+set -e
+
+# Only check if Rust files are staged
+if ! git diff --cached --name-only | grep -q '\.rs$'; then
+    exit 0
+fi
+
+echo "🔍 Checking cargo fmt..."
+
+if ! cargo fmt --all -- --check; then
+    echo ""
+    echo "❌ cargo fmt failed. Run 'cargo fmt --all' to fix, then re-stage and commit."
+    echo ""
+    echo "   cargo fmt --all"
+    echo "   git add -u"
+    echo "   git commit ..."
+    exit 1
+fi
+
+echo "✅ cargo fmt passed"
