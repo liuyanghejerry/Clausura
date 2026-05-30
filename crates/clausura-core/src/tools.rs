@@ -352,13 +352,197 @@ impl Tool for ShellExecTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ListFilesTool
+// ---------------------------------------------------------------------------
+
+/// List files and directories within the workspace.
+pub struct ListFilesTool {
+    workspace_root: PathBuf,
+}
+
+/// Simple glob-like filename matching.
+fn matches_glob(filename: &str, glob: &str) -> bool {
+    if let Some(inner) = glob.strip_prefix('*').and_then(|s| s.strip_suffix('*')) {
+        filename.contains(inner)
+    } else if let Some(suffix) = glob.strip_prefix('*') {
+        filename.ends_with(suffix)
+    } else if let Some(prefix) = glob.strip_suffix('*') {
+        filename.starts_with(prefix)
+    } else {
+        filename == glob
+    }
+}
+
+/// Recursively list directory contents.
+fn list_directory(
+    root: &Path,
+    dir: &Path,
+    depth: u32,
+    max_depth: u32,
+    glob: Option<&str>,
+    include_size: bool,
+) -> Vec<String> {
+    let mut result = Vec::new();
+
+    let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(reader) => reader.filter_map(|e| e.ok()).collect(),
+        Err(e) => {
+            let rel = dir.strip_prefix(root).unwrap_or(dir);
+            result.push(format!("! {} ({})", rel.display(), e));
+            return result;
+        }
+    };
+
+    entries.sort_by_key(|a| a.file_name());
+
+    for entry in &entries {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let file_name_str = file_name.to_string_lossy();
+
+        if file_name_str == ".clausura" {
+            continue;
+        }
+
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                result.push(format!("! {} ({})", rel.display(), e));
+                continue;
+            }
+        };
+
+        if file_type.is_dir() {
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            result.push(format!("{}/", rel.display()));
+
+            if depth < max_depth {
+                result.extend(list_directory(
+                    root,
+                    &path,
+                    depth + 1,
+                    max_depth,
+                    glob,
+                    include_size,
+                ));
+            }
+        } else {
+            if let Some(g) = glob {
+                if !g.is_empty() && !matches_glob(&file_name_str, g) {
+                    continue;
+                }
+            }
+
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            if include_size {
+                match std::fs::metadata(&path) {
+                    Ok(meta) => {
+                        result.push(format!("{} ({} B)", rel.display(), meta.len()));
+                    }
+                    Err(e) => {
+                        result.push(format!("! {} ({})", rel.display(), e));
+                    }
+                }
+            } else {
+                result.push(rel.display().to_string());
+            }
+        }
+    }
+
+    result
+}
+
+impl ListFilesTool {
+    pub fn new(workspace_root: PathBuf) -> Self {
+        let canonical_root = workspace_root.canonicalize().unwrap_or(workspace_root);
+        Self {
+            workspace_root: canonical_root,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ListFilesTool {
+    fn name(&self) -> &str {
+        "list_files"
+    }
+
+    fn description(&self) -> &str {
+        "List files and directories. Path is relative to the workspace root."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Relative path to list"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Recursively list subdirectories"
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Max recursion depth"
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Filename filter pattern"
+                },
+                "include_size": {
+                    "type": "boolean",
+                    "description": "Show file sizes"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let path_str = args["path"]
+            .as_str()
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'path' argument".into()))?;
+
+        let resolved = resolve_sandboxed_path(&self.workspace_root, path_str)?;
+
+        if !resolved.is_dir() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "Not a directory: {}",
+                path_str
+            )));
+        }
+
+        let recursive = args["recursive"].as_bool().unwrap_or(true);
+        let max_depth_raw = args["max_depth"].as_u64().unwrap_or(3) as u32;
+        let max_depth = if recursive { max_depth_raw.min(3) } else { 0 };
+        let glob = args["glob"].as_str();
+        let include_size = args["include_size"].as_bool().unwrap_or(false);
+
+        let lines = list_directory(
+            &self.workspace_root,
+            &resolved,
+            0,
+            max_depth,
+            glob,
+            include_size,
+        );
+
+        Ok(lines.join("\n"))
+    }
+}
+
 /// Create the default set of tools for the given workspace root.
 /// If allowlist is empty, shell_exec is disabled (no commands allowed).
 pub fn default_tools(workspace_root: PathBuf, allowlist: &[String]) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(ReadFileTool::new(workspace_root.clone()));
     registry.register(GitDiffTool::new(workspace_root.clone()));
-    registry.register(ShellExecTool::new(workspace_root, allowlist.to_vec()));
+    registry.register(ShellExecTool::new(workspace_root.clone(), allowlist.to_vec()));
+    registry.register(ListFilesTool::new(workspace_root));
     registry
 }
 
@@ -704,6 +888,157 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // ListFilesTool tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_files_basic() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        std::fs::write(root.join("b.txt"), "").unwrap();
+
+        let tool = ListFilesTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": ".", "recursive": false}))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.contains(&"a.txt"));
+        assert!(lines.contains(&"b.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_list_files_recursive() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::create_dir_all(root.join("sub/nested")).unwrap();
+        std::fs::write(root.join("top.txt"), "").unwrap();
+        std::fs::write(root.join("sub/inner.txt"), "").unwrap();
+        std::fs::write(root.join("sub/nested/deep.txt"), "").unwrap();
+
+        let tool = ListFilesTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": ".", "max_depth": 2}))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+        assert!(lines.contains(&"top.txt"));
+        assert!(lines.contains(&"sub/"));
+        assert!(lines.contains(&"sub/inner.txt"));
+        assert!(lines.contains(&"sub/nested/"));
+        assert!(lines.contains(&"sub/nested/deep.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_list_files_glob_filter() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::write(root.join("main.rs"), "").unwrap();
+        std::fs::write(root.join("lib.rs"), "").unwrap();
+        std::fs::write(root.join("README.md"), "").unwrap();
+
+        let tool = ListFilesTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": ".", "glob": "*.rs", "recursive": false}))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.contains(&"main.rs"));
+        assert!(lines.contains(&"lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_list_files_include_size() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::write(root.join("data.bin"), "hello").unwrap();
+
+        let tool = ListFilesTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": ".", "include_size": true, "recursive": false}))
+            .await
+            .unwrap();
+        assert!(result.contains(" B"), "Expected size suffix, got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_list_files_rejects_absolute() {
+        let (_tmp, root) = setup_workspace();
+        let tool = ListFilesTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "/etc"}))
+            .await;
+        assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
+    }
+
+    #[tokio::test]
+    async fn test_list_files_rejects_traversal() {
+        let (_tmp, root) = setup_workspace();
+        let tool = ListFilesTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "../outside"}))
+            .await;
+        assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
+    }
+
+    #[tokio::test]
+    async fn test_list_files_empty_directory() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::create_dir(root.join("empty")).unwrap();
+
+        let tool = ListFilesTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "empty"}))
+            .await
+            .unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn test_list_files_excludes_clausura_dir() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::create_dir(root.join(".clausura")).unwrap();
+        std::fs::write(root.join(".clausura/config.yaml"), "").unwrap();
+        std::fs::write(root.join("visible.txt"), "").unwrap();
+
+        let tool = ListFilesTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": ".", "recursive": true}))
+            .await
+            .unwrap();
+        assert!(!result.contains(".clausura"), "Output should not contain .clausura:\n{}", result);
+        assert!(result.contains("visible.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_list_files_max_depth() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::create_dir_all(root.join("a/b/c/d")).unwrap();
+        std::fs::write(root.join("a/b/c/d/deep.txt"), "").unwrap();
+        std::fs::write(root.join("a/top.txt"), "").unwrap();
+
+        let tool = ListFilesTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": ".", "max_depth": 5}))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("a/top.txt"),
+            "Expected a/top.txt in output:\n{}",
+            result
+        );
+        assert!(
+            result.contains("a/b/c/d/"),
+            "Expected a/b/c/d/ (level 3) in output:\n{}",
+            result
+        );
+        assert!(
+            !result.contains("a/b/c/d/deep.txt"),
+            "Did not expect a/b/c/d/deep.txt (depth > 3) in output:\n{}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // ToolRegistry tests
     // -----------------------------------------------------------------------
 
@@ -748,11 +1083,12 @@ mod tests {
         let (_tmp, root) = setup_workspace();
         let registry = default_tools(root, &[]);
         let defs = registry.list_definitions();
-        assert_eq!(defs.len(), 3);
+        assert_eq!(defs.len(), 4);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"git_diff"));
         assert!(names.contains(&"shell_exec"));
+        assert!(names.contains(&"list_files"));
     }
 
     #[test]
