@@ -226,11 +226,33 @@ impl Config {
             )
         };
 
-        // ---- Layer 2: CLI overrides ----
-        let model = cli_model.unwrap_or(&yaml_task.model).to_string();
-        let vendor = VendorConfig::from_name(cli_vendor.unwrap_or(&yaml_task.vendor));
-        let token_budget = cli_token_budget.unwrap_or(yaml_task.token_budget);
-        let timeout = cli_timeout.unwrap_or(yaml_task.timeout_secs);
+        // ---- Layer 2: CLI + environment variable overrides ----
+        let model = cli_model
+            .map(|m| m.to_string())
+            .or_else(|| std::env::var("CLAUSURA_MODEL").ok())
+            .unwrap_or_else(|| yaml_task.model.clone());
+
+        let vendor_input = cli_vendor
+            .map(|v| v.to_string())
+            .or_else(|| std::env::var("CLAUSURA_VENDOR").ok())
+            .unwrap_or_else(|| yaml_task.vendor.clone());
+        let vendor = VendorConfig::from_name(&vendor_input);
+
+        let token_budget = cli_token_budget
+            .or_else(|| {
+                std::env::var("CLAUSURA_TOKEN_BUDGET")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(yaml_task.token_budget);
+
+        let timeout = cli_timeout
+            .or_else(|| {
+                std::env::var("CLAUSURA_TIMEOUT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(yaml_task.timeout_secs);
 
         // ---- Layer 3: Environment variable overrides ----
         let api_key = cli_api_key

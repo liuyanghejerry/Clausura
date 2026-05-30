@@ -32,6 +32,8 @@ runs:
         CLAUSURA_API_KEY: ${{ inputs.api_key }}
         CLAUSURA_MODEL: ${{ inputs.model }}
         CLAUSURA_VENDOR: ${{ inputs.vendor }}
+        CLAUSURA_TOKEN_BUDGET: ${{ inputs.token_budget }}
+        CLAUSURA_TIMEOUT: ${{ inputs.timeout }}
 
 branding:
   icon: 'check-circle'

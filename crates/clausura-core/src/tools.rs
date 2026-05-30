@@ -318,15 +318,13 @@ impl Tool for ShellExecTool {
     }
 }
 
-/// Create a default set of tools for the given workspace root.
-pub fn default_tools(workspace_root: PathBuf) -> ToolRegistry {
+/// Create the default set of tools for the given workspace root.
+/// If allowlist is empty, shell_exec is disabled (no commands allowed).
+pub fn default_tools(workspace_root: PathBuf, allowlist: &[String]) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(ReadFileTool::new(workspace_root.clone()));
     registry.register(GitDiffTool::new(workspace_root.clone()));
-    registry.register(ShellExecTool::new(
-        workspace_root,
-        vec!["git".into(), "grep".into(), "find".into(), "wc".into()],
-    ));
+    registry.register(ShellExecTool::new(workspace_root, allowlist.to_vec()));
     registry
 }
 
@@ -614,7 +612,7 @@ mod tests {
     #[test]
     fn test_default_tools_contains_all() {
         let (_tmp, root) = setup_workspace();
-        let registry = default_tools(root);
+        let registry = default_tools(root, &[]);
         let defs = registry.list_definitions();
         assert_eq!(defs.len(), 3);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();

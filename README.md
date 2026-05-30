@@ -116,7 +116,7 @@ Uses the OpenAI-compatible API format (`/chat/completions`) with configurable ba
 
 ### 1. Create a configuration file
 
-Create `.clausura.yaml` in your project root:
+Create `.clausura.yaml` (or `.clausura.yml`) in your project root:
 
 ```yaml
 version: "1"
@@ -261,10 +261,10 @@ clausura run [OPTIONS]
 Checkpoint management:
 
 ```
-clausura snapshot list               List checkpoints for a thread
-clausura snapshot show               Show the latest checkpoint
-clausura snapshot show --id <UUID>   Show a specific checkpoint
-clausura snapshot delete --thread X  Delete all checkpoints for a thread
+clausura snapshot list [--thread <ID>] [--limit <N>]    List checkpoints (default: all threads, 10 max)
+clausura snapshot show [--thread <ID>]                  Show the latest checkpoint
+clausura snapshot show --id <UUID> [--thread <ID>]     Show a specific checkpoint
+clausura snapshot delete --thread <ID>                  Delete all checkpoints for a thread
 ```
 
 ## CI Integration
@@ -422,6 +422,7 @@ clausura/
   crates/
     clausura-core/              # Core library
       src/
+        lib.rs                  # Crate root (module re-exports)
         agent.rs                # Agent loop (reason -> act -> observe)
         build_info.rs           # Version and commit metadata
         checkpoint.rs           # SQLite checkpoint store
@@ -440,6 +441,7 @@ clausura/
       src/
         main.rs                 # CLI entry point (clap)
         commands/
+          mod.rs                # Commands module
           run.rs                # clausura run command
           snapshot.rs           # clausura snapshot command
   action.yml                    # GitHub Action definition

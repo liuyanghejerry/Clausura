@@ -38,7 +38,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         }
     };
 
-    let tools = default_tools(config.workspace.clone());
+    let tools = default_tools(config.workspace.clone(), &config.task.tool_allowlist);
 
     let checkpoint_store = match CheckpointStore::new() {
         Ok(cs) => cs,
