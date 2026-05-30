@@ -144,6 +144,14 @@ impl Tool for ReadFileTool {
                 "path": {
                     "type": "string",
                     "description": "Path relative to workspace root"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based starting line (default: 1, read from start)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max lines to read (default: read to end)"
                 }
             },
             "required": ["path"]
@@ -158,7 +166,24 @@ impl Tool for ReadFileTool {
         let content = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Read error: {}", e)))?;
-        Ok(content)
+
+        let offset = args["offset"].as_u64().unwrap_or(1) as usize;
+        let limit = args["limit"].as_u64().map(|l| l as usize);
+
+        // offset is 1-based: offset=1 means no skip
+        let lines: Vec<&str> = content.lines().skip(offset.saturating_sub(1)).collect();
+
+        let result = if let Some(limit) = limit {
+            if limit == 0 {
+                String::new()
+            } else {
+                lines.into_iter().take(limit).collect::<Vec<_>>().join("\n")
+            }
+        } else {
+            lines.join("\n")
+        };
+
+        Ok(result)
     }
 }
 
@@ -402,6 +427,76 @@ mod tests {
             .execute(serde_json::json!({"path": "nonexistent.txt"}))
             .await;
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_with_offset() {
+        let (_tmp, root) = setup_workspace();
+        let test_file = root.join("test.txt");
+        std::fs::write(&test_file, "line1\nline2\nline3\nline4\nline5").unwrap();
+
+        let tool = ReadFileTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt", "offset": 3}))
+            .await
+            .unwrap();
+        assert_eq!(result, "line3\nline4\nline5");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_with_limit() {
+        let (_tmp, root) = setup_workspace();
+        let test_file = root.join("test.txt");
+        std::fs::write(&test_file, "line1\nline2\nline3\nline4\nline5").unwrap();
+
+        let tool = ReadFileTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt", "limit": 2}))
+            .await
+            .unwrap();
+        assert_eq!(result, "line1\nline2");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_offset_and_limit() {
+        let (_tmp, root) = setup_workspace();
+        let test_file = root.join("test.txt");
+        std::fs::write(&test_file, "line1\nline2\nline3\nline4\nline5").unwrap();
+
+        let tool = ReadFileTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt", "offset": 2, "limit": 2}))
+            .await
+            .unwrap();
+        assert_eq!(result, "line2\nline3");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_offset_exceeds_file() {
+        let (_tmp, root) = setup_workspace();
+        let test_file = root.join("test.txt");
+        std::fs::write(&test_file, "line1\nline2\nline3").unwrap();
+
+        let tool = ReadFileTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt", "offset": 10}))
+            .await
+            .unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_limit_zero() {
+        let (_tmp, root) = setup_workspace();
+        let test_file = root.join("test.txt");
+        std::fs::write(&test_file, "line1\nline2\nline3").unwrap();
+
+        let tool = ReadFileTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt", "limit": 0}))
+            .await
+            .unwrap();
+        assert_eq!(result, "");
     }
 
     // -----------------------------------------------------------------------
