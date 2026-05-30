@@ -82,10 +82,7 @@ pub struct ReadFileTool {
 
 /// Resolve a path relative to the workspace root, enforcing sandbox restrictions.
 /// Returns the canonicalized absolute path, or a ToolError.
-pub fn resolve_sandboxed_path(
-    workspace_root: &Path,
-    path_str: &str,
-) -> Result<PathBuf, ToolError> {
+pub fn resolve_sandboxed_path(workspace_root: &Path, path_str: &str) -> Result<PathBuf, ToolError> {
     let requested = Path::new(path_str);
     // Reject absolute paths
     if requested.is_absolute() {
@@ -591,12 +588,7 @@ fn search_file(
         };
         if matched {
             let truncated = if line.len() > 200 { &line[..200] } else { line };
-            results.push(format!(
-                "{}:{}: {}",
-                rel.display(),
-                line_num + 1,
-                truncated
-            ));
+            results.push(format!("{}:{}: {}", rel.display(), line_num + 1, truncated));
         }
     }
     true
@@ -633,29 +625,18 @@ fn grep_directory(
         };
 
         if file_type.is_dir() {
-            grep_directory(
-                cfg,
-                &path,
-                max_results,
-                remaining,
-                results,
-            );
+            grep_directory(cfg, &path, max_results, remaining, results);
         } else {
             if !cfg.file_types.is_empty() {
-                let matches_ext = cfg.file_types.iter().any(|ext| {
-                    file_name_str.ends_with(ext.as_str())
-                });
+                let matches_ext = cfg
+                    .file_types
+                    .iter()
+                    .any(|ext| file_name_str.ends_with(ext.as_str()));
                 if !matches_ext {
                     continue;
                 }
             }
-            let more = search_file(
-                &path,
-                cfg,
-                max_results,
-                remaining,
-                results,
-            );
+            let more = search_file(&path, cfg, max_results, remaining, results);
             if !more {
                 break;
             }
@@ -799,7 +780,10 @@ pub fn default_tools(workspace_root: PathBuf, allowlist: &[String]) -> ToolRegis
     let mut registry = ToolRegistry::new();
     registry.register(ReadFileTool::new(workspace_root.clone()));
     registry.register(GitDiffTool::new(workspace_root.clone()));
-    registry.register(ShellExecTool::new(workspace_root.clone(), allowlist.to_vec()));
+    registry.register(ShellExecTool::new(
+        workspace_root.clone(),
+        allowlist.to_vec(),
+    ));
     registry.register(ListFilesTool::new(workspace_root.clone()));
     registry.register(GrepTool::new(workspace_root));
     registry
@@ -1216,16 +1200,18 @@ mod tests {
             .execute(serde_json::json!({"path": ".", "include_size": true, "recursive": false}))
             .await
             .unwrap();
-        assert!(result.contains(" B"), "Expected size suffix, got: {}", result);
+        assert!(
+            result.contains(" B"),
+            "Expected size suffix, got: {}",
+            result
+        );
     }
 
     #[tokio::test]
     async fn test_list_files_rejects_absolute() {
         let (_tmp, root) = setup_workspace();
         let tool = ListFilesTool::new(root);
-        let result = tool
-            .execute(serde_json::json!({"path": "/etc"}))
-            .await;
+        let result = tool.execute(serde_json::json!({"path": "/etc"})).await;
         assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
     }
 
@@ -1264,7 +1250,11 @@ mod tests {
             .execute(serde_json::json!({"path": ".", "recursive": true}))
             .await
             .unwrap();
-        assert!(!result.contains(".clausura"), "Output should not contain .clausura:\n{}", result);
+        assert!(
+            !result.contains(".clausura"),
+            "Output should not contain .clausura:\n{}",
+            result
+        );
         assert!(result.contains("visible.txt"));
     }
 
@@ -1393,7 +1383,11 @@ mod tests {
     #[tokio::test]
     async fn test_grep_regex_basic() {
         let (_tmp, root) = setup_workspace();
-        std::fs::write(root.join("test.txt"), "line1 alpha\nline2 beta\nother gamma").unwrap();
+        std::fs::write(
+            root.join("test.txt"),
+            "line1 alpha\nline2 beta\nother gamma",
+        )
+        .unwrap();
 
         let tool = GrepTool::new(root);
         let result = tool
@@ -1456,10 +1450,26 @@ mod tests {
             .execute(serde_json::json!({"path": ".", "pattern": "hello"}))
             .await
             .unwrap();
-        assert!(result.contains("src.txt"), "Should find src.txt, got: {}", result);
-        assert!(!result.contains(".git"), "Should exclude .git, got: {}", result);
-        assert!(!result.contains("target"), "Should exclude target, got: {}", result);
-        assert!(!result.contains("node_modules"), "Should exclude node_modules, got: {}", result);
+        assert!(
+            result.contains("src.txt"),
+            "Should find src.txt, got: {}",
+            result
+        );
+        assert!(
+            !result.contains(".git"),
+            "Should exclude .git, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("target"),
+            "Should exclude target, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("node_modules"),
+            "Should exclude node_modules, got: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -1474,8 +1484,16 @@ mod tests {
             .execute(serde_json::json!({"path": ".", "pattern": "hello"}))
             .await
             .unwrap();
-        assert!(result.contains("text.txt"), "Should find text.txt, got: {}", result);
-        assert!(!result.contains("data.bin"), "Should skip binary data.bin, got: {}", result);
+        assert!(
+            result.contains("text.txt"),
+            "Should find text.txt, got: {}",
+            result
+        );
+        assert!(
+            !result.contains("data.bin"),
+            "Should skip binary data.bin, got: {}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -1496,7 +1514,11 @@ mod tests {
         let match_lines = lines.iter().filter(|l| l.contains(":")).count();
         let truncation_line = lines.iter().find(|l| l.starts_with("... and "));
         assert_eq!(match_lines, 20, "Expected 20 match lines, got: {}", result);
-        assert!(truncation_line.is_some(), "Expected truncation notice, got: {}", result);
+        assert!(
+            truncation_line.is_some(),
+            "Expected truncation notice, got: {}",
+            result
+        );
     }
 
     #[tokio::test]
