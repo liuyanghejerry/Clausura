@@ -1,8 +1,8 @@
 # Stage 1: Build
 FROM rust:alpine AS build
 
-# Install musl toolchain and add the musl target
-RUN apk add --no-cache musl-dev
+# Install build dependencies
+RUN apk add --no-cache musl-dev git
 RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /app

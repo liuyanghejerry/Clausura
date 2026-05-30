@@ -68,6 +68,8 @@ jobs:
   docker:
     name: Build Docker Image
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
