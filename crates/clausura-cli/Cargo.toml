@@ -2,6 +2,9 @@
 name = "clausura-cli"
 version = "1.0.0"
 edition = "2021"
+description = "CI-native agent CLI for deterministic pipeline gating"
+license = "MIT"
+repository = "https://github.com/liuyanghejerry/Clausura"
 
 [dependencies]
 clausura-core = { path = "../clausura-core" }
