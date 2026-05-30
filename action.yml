@@ -1,6 +1,6 @@
 name: 'Clausura Code Review'
 description: 'AI-powered code review agent for CI pipelines'
-author: 'Clausura'
+author: 'liuyanghejerry'
 
 inputs:
   config:
