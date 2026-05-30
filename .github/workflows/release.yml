@@ -76,5 +76,5 @@ jobs:
         with:
           push: true
           tags: |
-            ghcr.io/clausura/clausura:${{ github.ref_name }}
-            ghcr.io/clausura/clausura:latest
+            ghcr.io/liuyanghejerry/clausura:${{ github.ref_name }}
+            ghcr.io/liuyanghejerry/clausura:latest
