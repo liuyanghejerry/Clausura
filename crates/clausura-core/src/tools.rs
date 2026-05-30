@@ -307,7 +307,7 @@ impl Tool for ShellExecTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command from the allowed list (git, grep, find, wc)."
+        "Execute a shell command from the allowed list."
     }
 
     fn parameters(&self) -> Value {
