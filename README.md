@@ -205,7 +205,6 @@ task:
   # Optional tool allowlist
   tool_allowlist:                    # Restrict shell commands to these binaries.
     - git
-    - grep
 
   # Gating rules
   gating:                            # Optional. Evaluated in order.
@@ -376,11 +375,13 @@ Three vendor categories: OpenAI-compatible (works with OpenAI, DeepSeek, Groq, O
 
 ### Tool sandboxing
 
-Three built-in tools:
+Five built-in tools:
 
 | Tool          | Description                                      | Restrictions                           |
 |---------------|--------------------------------------------------|----------------------------------------|
-| `read_file`   | Read a file relative to workspace root           | Blocks absolute paths, `..` traversal, symlink escapes |
+| `read_file`   | Read a file relative to workspace root, with optional `offset`/`limit` for line-range reading | Blocks absolute paths, `..` traversal, symlink escapes |
+| `list_files`  | List directory contents, with recursive depth, glob filtering, and optional file sizes | Sandboxed to workspace; skips `.clausura/` |
+| `grep`        | Search text patterns across files with literal or regex mode, extension filtering, and binary-skip | Auto-excludes `.git`, `target`, `.clausura`, `node_modules` |
 | `git_diff`    | Run `git diff` with optional base ref or staged  | Operates inside workspace only         |
 | `shell_exec`  | Execute allowed shell commands                   | Restricted to `tool_allowlist` entries |
 
@@ -435,7 +436,7 @@ clausura/
         rules.rs                # Deterministic rule engine for gating
         sarif.rs                # SARIF v2.1.0 output formatter
         snapshot.rs             # Snapshot manager (save/restore)
-        tools.rs                # Tool sandbox (read_file, git_diff, shell_exec)
+        tools.rs                # Tool sandbox (read_file, git_diff, shell_exec, list_files, grep)
         types.rs                # Core type definitions
     clausura-cli/               # CLI binary
       src/
@@ -452,7 +453,7 @@ clausura/
 ### Dependencies
 
 - **CLI**: clap (arg parsing), colored + atty (terminal output)
-- **Core**: tokio (async), serde/serde_json/serde_yaml (serialization), reqwest (HTTP), tiktoken-rs (token counting), rusqlite (checkpoints), rmp-serde (binary serialization)
+- **Core**: tokio (async), serde/serde_json/serde_yaml (serialization), reqwest (HTTP), tiktoken-rs (token counting), rusqlite (checkpoints), rmp-serde (binary serialization), regex-lite (grep pattern matching)
 - **LLM**: OpenAI-compatible chat completions API (works with OpenAI, DeepSeek, Groq, Ollama, etc.)
 
 ## License
