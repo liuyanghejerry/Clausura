@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_NAME="clausura"
 APP_VERSION="${1:-latest}"
-GITHUB_REPO="clausura/clausura"
+GITHUB_REPO="liuyanghejerry/Clausura"
 
 # Detect OS and arch
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"

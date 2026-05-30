@@ -2,7 +2,7 @@
 
 CI-native agent CLI tool for deterministic pipeline gating.
 
-[![Build](https://img.shields.io/github/actions/workflow/status/clausura/clausura/ci.yml?branch=main)](https://github.com/clausura/clausura/actions)
+[![Build](https://img.shields.io/github/actions/workflow/status/liuyanghejerry/Clausura/ci.yml?branch=main)](https://github.com/liuyanghejerry/Clausura/actions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/clausura-cli)](https://crates.io/crates/clausura-cli)
 
@@ -25,7 +25,7 @@ Clausura is a platform-agnostic agent CLI tool built for CI/CD pipelines. It run
 ### Shell script (Linux, macOS, WSL)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/clausura/clausura/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/liuyanghejerry/Clausura/main/install.sh | bash
 ```
 
 The script detects your OS and architecture, downloads the latest release from GitHub, and installs it to `/usr/local/bin` or `~/.local/bin`.
@@ -39,14 +39,14 @@ cargo install clausura-cli
 ### Docker
 
 ```bash
-docker pull ghcr.io/clausura/clausura
-docker run --rm -v $(pwd):/workspace ghcr.io/clausura/clausura run
+docker pull ghcr.io/liuyanghejerry/clausura
+docker run --rm -v $(pwd):/workspace ghcr.io/liuyanghejerry/clausura run
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/clausura/clausura.git
+git clone https://github.com/liuyanghejerry/Clausura.git
 cd clausura
 cargo build --release --package clausura-cli
 # binary at target/release/clausura
@@ -285,7 +285,7 @@ Clausura auto-detects your CI environment using well-known environment variables
 Use the composite action directly:
 
 ```yaml
-- uses: clausura/clausura@v1
+- uses: liuyanghejerry/Clausura@v1
   with:
     config: .clausura.yaml
     api_key: ${{ secrets.LLM_API_KEY }}
@@ -308,7 +308,7 @@ Or run via the binary:
 
 ```yaml
 clausura-review:
-  image: ghcr.io/clausura/clausura:latest
+  image: ghcr.io/liuyanghejerry/clausura:latest
   script:
     - clausura run
   variables:
@@ -353,6 +353,12 @@ Clausura runs a bounded agent loop of up to 10 iterations. Each iteration:
 4. The loop also ends on token budget exhaustion, timeout, or content filter
 
 The system prompt is built from `prompt_template` plus available tool definitions. The LLM is instructed to respond in JSON with a `findings` array.
+
+### Context truncation and archiving
+
+When the conversation exceeds the configured `token_budget`, Clausura automatically truncates older messages to stay within limits. Dropped messages are not silently discarded — they are archived to `.clausura/archives/context-dump-{task_id}-{seq}.log` inside the workspace as JSON lines. A hint message is injected into the conversation telling the LLM where to find the archived context, so it can retrieve earlier findings via the `read_file` tool if needed.
+
+On successful completion (exit code 0), archive files are automatically cleaned up. On failure (exit code 1-3), they are preserved for debugging and audit.
 
 ### Deterministic rule engine
 
@@ -422,7 +428,7 @@ clausura/
         checkpoint.rs           # SQLite checkpoint store
         ci.rs                   # CI environment detection
         config.rs               # Layered config loader (YAML + CLI + env)
-        context.rs              # Token budget tracking and context truncation
+        context.rs              # Token budget tracking, context truncation, and archiving
         executor.rs             # Task lifecycle orchestrator
         logging.rs              # Structured logging (JSON or pretty)
         provider.rs             # LLM provider (OpenAI/Anthropic/Custom + factory)
@@ -454,7 +460,7 @@ MIT. See [LICENSE](LICENSE).
 
 ## Links
 
-- [GitHub](https://github.com/clausura/clausura)
-- [Issues](https://github.com/clausura/clausura/issues)
-- [Releases](https://github.com/clausura/clausura/releases)
-- [Docker images](https://github.com/clausura/clausura/pkgs/container/clausura)
+- [GitHub](https://github.com/liuyanghejerry/Clausura)
+- [Issues](https://github.com/liuyanghejerry/Clausura/issues)
+- [Releases](https://github.com/liuyanghejerry/Clausura/releases)
+- [Docker images](https://github.com/liuyanghejerry/Clausura/pkgs/container/clausura)

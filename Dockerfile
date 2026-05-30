@@ -19,7 +19,7 @@ FROM alpine:latest
 
 RUN apk add --no-cache ca-certificates git
 
-LABEL org.opencontainers.image.source="https://github.com/clausura/clausura"
+LABEL org.opencontainers.image.source="https://github.com/liuyanghejerry/Clausura"
 
 COPY --from=build /app/target/x86_64-unknown-linux-musl/release/clausura /usr/local/bin/clausura
 
