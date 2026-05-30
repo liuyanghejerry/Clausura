@@ -1,8 +1,10 @@
 use crate::types::ToolDef;
 use crate::types::ToolError;
 use async_trait::async_trait;
+use regex_lite::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -535,6 +537,262 @@ impl Tool for ListFilesTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GrepTool
+// ---------------------------------------------------------------------------
+
+/// Returns true if the first 8 KB of the file contains a null byte.
+fn is_binary_file(path: &Path) -> bool {
+    let mut buf = [0u8; 8192];
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false, // can't read → treat as non-binary (will fail later)
+    };
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf[..n].contains(&0)
+}
+
+/// Configuration for grep search operations, bundling the parameters shared
+/// across search_file and grep_directory.
+struct GrepCfg<'a> {
+    root: &'a Path,
+    pattern: &'a str,
+    is_regex: bool,
+    file_types: &'a [String],
+    regex: Option<&'a Regex>,
+}
+
+/// Search a single file for pattern matches, returning false when max_results
+/// is reached.
+fn search_file(
+    path: &Path,
+    cfg: &GrepCfg,
+    max_results: &mut usize,
+    remaining: &mut usize,
+    results: &mut Vec<String>,
+) -> bool {
+    if is_binary_file(path) {
+        return true;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return true,
+    };
+    let rel = path.strip_prefix(cfg.root).unwrap_or(path);
+    for (line_num, line) in content.lines().enumerate() {
+        if *max_results > 0 && results.len() >= *max_results {
+            *remaining += 1;
+            continue;
+        }
+        let matched = if cfg.is_regex {
+            cfg.regex.is_some_and(|re| re.is_match(line))
+        } else {
+            line.contains(cfg.pattern)
+        };
+        if matched {
+            let truncated = if line.len() > 200 { &line[..200] } else { line };
+            results.push(format!(
+                "{}:{}: {}",
+                rel.display(),
+                line_num + 1,
+                truncated
+            ));
+        }
+    }
+    true
+}
+
+fn grep_directory(
+    cfg: &GrepCfg,
+    dir: &Path,
+    max_results: &mut usize,
+    remaining: &mut usize,
+    results: &mut Vec<String>,
+) {
+    let to_skip = [".git", "target", ".clausura", "node_modules"];
+
+    let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(reader) => reader.filter_map(|e| e.ok()).collect(),
+        Err(_) => return,
+    };
+
+    entries.sort_by_key(|a| a.file_name());
+
+    for entry in &entries {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let file_name_str = file_name.to_string_lossy();
+
+        if to_skip.contains(&file_name_str.as_ref()) {
+            continue;
+        }
+
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if file_type.is_dir() {
+            grep_directory(
+                cfg,
+                &path,
+                max_results,
+                remaining,
+                results,
+            );
+        } else {
+            if !cfg.file_types.is_empty() {
+                let matches_ext = cfg.file_types.iter().any(|ext| {
+                    file_name_str.ends_with(ext.as_str())
+                });
+                if !matches_ext {
+                    continue;
+                }
+            }
+            let more = search_file(
+                &path,
+                cfg,
+                max_results,
+                remaining,
+                results,
+            );
+            if !more {
+                break;
+            }
+        }
+    }
+}
+
+/// Searches for text patterns across files in the workspace, supporting both
+/// literal and regex matching.
+pub struct GrepTool {
+    workspace_root: PathBuf,
+}
+
+impl GrepTool {
+    pub fn new(workspace_root: PathBuf) -> Self {
+        let canonical_root = workspace_root.canonicalize().unwrap_or(workspace_root);
+        Self {
+            workspace_root: canonical_root,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GrepTool {
+    fn name(&self) -> &str {
+        "grep"
+    }
+
+    fn description(&self) -> &str {
+        "Search for text patterns in files. Supports literal (default) and regex matching. Path is relative to the workspace root. Note: regex mode uses a simplified engine without lookahead, lookbehind, backreferences, or Unicode property escapes."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to search (relative path)"
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Text pattern to search for"
+                },
+                "regex": {
+                    "type": "boolean",
+                    "description": "Use regex search via regex-lite (default: false)"
+                },
+                "file_types": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Only search files with these extensions, e.g., [\".rs\", \".toml\"]"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return (default: 50, max: 200)"
+                }
+            },
+            "required": ["path", "pattern"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let path_str = args["path"]
+            .as_str()
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'path' argument".into()))?;
+        let pattern = args["pattern"]
+            .as_str()
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'pattern' argument".into()))?;
+        let is_regex = args["regex"].as_bool().unwrap_or(false);
+
+        let file_types: Vec<String> = args["file_types"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let max_results_raw = args["max_results"].as_u64().unwrap_or(50) as usize;
+        let max_results = max_results_raw.min(200);
+
+        let resolved = resolve_sandboxed_path(&self.workspace_root, path_str)?;
+
+        let regex = if is_regex {
+            match Regex::new(pattern) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Invalid regex pattern: {pattern} — {e}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut remaining = 0usize;
+        let mut max = max_results;
+
+        let cfg = GrepCfg {
+            root: &self.workspace_root,
+            pattern,
+            is_regex,
+            file_types: &file_types,
+            regex: regex.as_ref(),
+        };
+
+        let mut results = Vec::new();
+        if resolved.is_file() {
+            search_file(&resolved, &cfg, &mut max, &mut remaining, &mut results);
+        } else if resolved.is_dir() {
+            grep_directory(&cfg, &resolved, &mut max, &mut remaining, &mut results);
+        } else {
+            return Err(ToolError::ExecutionFailed(format!(
+                "Not a file or directory: {}",
+                path_str
+            )));
+        };
+
+        let mut output = results.join("\n");
+
+        if remaining > 0 {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&format!(
+                "... and {} more matches (use more specific pattern or narrower path)",
+                remaining
+            ));
+        }
+
+        Ok(output)
+    }
+}
+
 /// Create the default set of tools for the given workspace root.
 /// If allowlist is empty, shell_exec is disabled (no commands allowed).
 pub fn default_tools(workspace_root: PathBuf, allowlist: &[String]) -> ToolRegistry {
@@ -542,7 +800,8 @@ pub fn default_tools(workspace_root: PathBuf, allowlist: &[String]) -> ToolRegis
     registry.register(ReadFileTool::new(workspace_root.clone()));
     registry.register(GitDiffTool::new(workspace_root.clone()));
     registry.register(ShellExecTool::new(workspace_root.clone(), allowlist.to_vec()));
-    registry.register(ListFilesTool::new(workspace_root));
+    registry.register(ListFilesTool::new(workspace_root.clone()));
+    registry.register(GrepTool::new(workspace_root));
     registry
 }
 
@@ -1083,12 +1342,13 @@ mod tests {
         let (_tmp, root) = setup_workspace();
         let registry = default_tools(root, &[]);
         let defs = registry.list_definitions();
-        assert_eq!(defs.len(), 4);
+        assert_eq!(defs.len(), 5);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"git_diff"));
         assert!(names.contains(&"shell_exec"));
         assert!(names.contains(&"list_files"));
+        assert!(names.contains(&"grep"));
     }
 
     #[test]
@@ -1096,5 +1356,172 @@ mod tests {
         let registry: ToolRegistry = Default::default();
         let defs = registry.list_definitions();
         assert!(defs.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // GrepTool tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_grep_literal_basic() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::write(root.join("test.txt"), "hello world\nfoo bar\nhello again").unwrap();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt", "pattern": "hello"}))
+            .await
+            .unwrap();
+        assert!(result.contains("test.txt:1: hello world"));
+        assert!(result.contains("test.txt:3: hello again"));
+        assert!(!result.contains("foo bar"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_literal_no_matches() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::write(root.join("test.txt"), "hello world\nfoo bar").unwrap();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt", "pattern": "nonexistent"}))
+            .await
+            .unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn test_grep_regex_basic() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::write(root.join("test.txt"), "line1 alpha\nline2 beta\nother gamma").unwrap();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt", "pattern": "line\\d+", "regex": true}))
+            .await
+            .unwrap();
+        assert!(result.contains("test.txt:1: line1 alpha"));
+        assert!(result.contains("test.txt:2: line2 beta"));
+        assert!(!result.contains("other gamma"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_regex_invalid() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::write(root.join("test.txt"), "content").unwrap();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "test.txt", "pattern": "[invalid", "regex": true}))
+            .await;
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Invalid regex pattern"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_file_types_filter() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::write(root.join("main.rs"), "fn main() {}\nhello fn").unwrap();
+        std::fs::write(root.join("README.md"), "hello readme").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "hello cargo").unwrap();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({
+                "path": ".",
+                "pattern": "hello",
+                "file_types": [".rs", ".toml"]
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("main.rs"));
+        assert!(result.contains("Cargo.toml"));
+        assert!(!result.contains("README.md"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_excludes_dirs() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "hello git").unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("target/debug/output"), "hello target").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), "hello node").unwrap();
+        std::fs::write(root.join("src.txt"), "hello src").unwrap();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": ".", "pattern": "hello"}))
+            .await
+            .unwrap();
+        assert!(result.contains("src.txt"), "Should find src.txt, got: {}", result);
+        assert!(!result.contains(".git"), "Should exclude .git, got: {}", result);
+        assert!(!result.contains("target"), "Should exclude target, got: {}", result);
+        assert!(!result.contains("node_modules"), "Should exclude node_modules, got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_grep_skips_binary() {
+        let (_tmp, root) = setup_workspace();
+        let binary_content: Vec<u8> = vec![0x00, 0x01, 0x02, 0x68, 0x65, 0x6c, 0x6c, 0x6f]; // null + "hello"
+        std::fs::write(root.join("data.bin"), binary_content).unwrap();
+        std::fs::write(root.join("text.txt"), "hello world").unwrap();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": ".", "pattern": "hello"}))
+            .await
+            .unwrap();
+        assert!(result.contains("text.txt"), "Should find text.txt, got: {}", result);
+        assert!(!result.contains("data.bin"), "Should skip binary data.bin, got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_grep_max_results_truncation() {
+        let (_tmp, root) = setup_workspace();
+        let mut content = String::new();
+        for i in 1..=100 {
+            content.push_str(&format!("line {} match\n", i));
+        }
+        std::fs::write(root.join("big.txt"), content).unwrap();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "big.txt", "pattern": "match", "max_results": 20}))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+        let match_lines = lines.iter().filter(|l| l.contains(":")).count();
+        let truncation_line = lines.iter().find(|l| l.starts_with("... and "));
+        assert_eq!(match_lines, 20, "Expected 20 match lines, got: {}", result);
+        assert!(truncation_line.is_some(), "Expected truncation notice, got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_grep_rejects_traversal() {
+        let (_tmp, root) = setup_workspace();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "../outside", "pattern": "test"}))
+            .await;
+        assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
+    }
+
+    #[tokio::test]
+    async fn test_grep_single_file() {
+        let (_tmp, root) = setup_workspace();
+        std::fs::write(root.join("a.rs"), "hello a").unwrap();
+        std::fs::write(root.join("b.rs"), "hello b").unwrap();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "a.rs", "pattern": "hello"}))
+            .await
+            .unwrap();
+        assert!(result.contains("a.rs:1: hello a"));
+        assert!(!result.contains("b.rs"));
     }
 }
