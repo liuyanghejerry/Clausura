@@ -358,7 +358,10 @@ mod tests {
             },
         ];
         let path = cm.archive(&messages, "test-task").await.unwrap();
-        assert_eq!(path, PathBuf::from(".clausura/archives/context-dump-test-task-1.log"));
+        assert_eq!(
+            path,
+            PathBuf::from(".clausura/archives/context-dump-test-task-1.log")
+        );
 
         let full_path = root.path().join(&path);
         assert!(full_path.exists());
@@ -394,10 +397,16 @@ mod tests {
         }];
 
         let path1 = cm.archive(&messages, "seq-test").await.unwrap();
-        assert_eq!(path1, PathBuf::from(".clausura/archives/context-dump-seq-test-1.log"));
+        assert_eq!(
+            path1,
+            PathBuf::from(".clausura/archives/context-dump-seq-test-1.log")
+        );
 
         let path2 = cm.archive(&messages, "seq-test").await.unwrap();
-        assert_eq!(path2, PathBuf::from(".clausura/archives/context-dump-seq-test-2.log"));
+        assert_eq!(
+            path2,
+            PathBuf::from(".clausura/archives/context-dump-seq-test-2.log")
+        );
 
         let full1 = root.path().join(&path1);
         let full2 = root.path().join(&path2);
@@ -426,6 +435,9 @@ mod tests {
         let result = cm.archive(&messages, "fail-test").await;
         assert!(result.is_err());
         // Restore permissions so TempDir can clean up
-        let _ = std::fs::set_permissions(&readonly_for_cleanup, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(
+            &readonly_for_cleanup,
+            std::fs::Permissions::from_mode(0o755),
+        );
     }
 }

@@ -390,7 +390,10 @@ mod tests {
             !result.truncated,
             "Expected truncation to succeed (truncated=false), got truncated=true"
         );
-        assert!(!result.findings.is_empty(), "Expected findings after truncation");
+        assert!(
+            !result.findings.is_empty(),
+            "Expected findings after truncation"
+        );
 
         let archive_dir = root.join(".clausura").join("archives");
         assert!(archive_dir.exists(), "Archive directory should exist");
@@ -511,6 +514,9 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.role == Role::User && m.content.contains("archived at"));
-        assert!(hint, "Expected a hint message about archiving after truncation");
+        assert!(
+            hint,
+            "Expected a hint message about archiving after truncation"
+        );
     }
 }
