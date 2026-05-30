@@ -77,6 +77,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         provider: provider.as_ref(),
         tools: &tools,
         initial_messages,
+        workspace_root: config.workspace.clone(),
     };
 
     let agent_result = match run_agent_loop(agent_config).await {

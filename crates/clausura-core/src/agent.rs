@@ -1,6 +1,8 @@
+use crate::context::ContextManager;
 use crate::provider::Provider;
 use crate::tools::ToolRegistry;
 use crate::types::{Finding, FinishReason, Message, ProviderError, Role, TaskContract, Usage};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Result from the agent loop
@@ -19,6 +21,7 @@ pub struct AgentConfig<'a> {
     pub provider: &'a dyn Provider,
     pub tools: &'a ToolRegistry,
     pub initial_messages: Vec<Message>,
+    pub workspace_root: PathBuf,
 }
 
 /// Run the bounded agent loop.
@@ -45,14 +48,62 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         },
     );
 
+    let cm = ContextManager::new(
+        config.provider,
+        config.contract.token_budget,
+        config.workspace_root.clone(),
+    );
+
     for _iteration in 0..max_iterations {
         if start.elapsed() > Duration::from_secs(config.contract.timeout_secs) {
             return Err(ProviderError::Timeout("Task timeout exceeded".into()));
         }
 
-        if running_tokens >= config.contract.token_budget {
-            truncated = true;
-            break;
+        if running_tokens >= config.contract.token_budget || cm.should_truncate(&messages) {
+            let snapshot = messages.clone();
+            let (was_truncated, count) = cm.truncate_to_budget(&mut messages);
+            if was_truncated && count > 0 {
+                let dropped_end = 1 + (snapshot.len() - messages.len());
+                let dropped: Vec<Message> = snapshot[1..dropped_end].to_vec();
+
+                let archive_result = cm.archive(&dropped, &config.contract.id).await;
+
+                match archive_result {
+                    Ok(path) => {
+                        messages.push(Message {
+                            role: Role::User,
+                            content: format!(
+                                "⚠️ Context was trimmed to stay within token budget.\n\
+                                 {} earlier messages are archived at:\n  {}\n\
+                                 Use read_file to inspect if you need context from earlier iterations.",
+                                dropped.len(),
+                                path.display(),
+                            ),
+                        });
+                    }
+                    Err(_) => {
+                        messages.push(Message {
+                            role: Role::User,
+                            content: format!(
+                                "⚠️ Context was trimmed to stay within token budget.\n\
+                                 {} earlier messages were dropped (archive unavailable).",
+                                dropped.len(),
+                            ),
+                        });
+                    }
+                }
+
+                running_tokens = cm.count_tokens(&messages);
+
+                if cm.should_truncate(&messages) || running_tokens >= config.contract.token_budget {
+                    truncated = true;
+                    break;
+                }
+                continue;
+            } else {
+                truncated = true;
+                break;
+            }
         }
 
         let response = config
@@ -197,7 +248,7 @@ mod tests {
     async fn test_agent_loop_with_tool_calls() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root);
+        let tools = default_tools(root.clone());
 
         let mut mock = MockProvider::new("gpt-4o");
         mock.add_response(ChatResponse {
@@ -240,6 +291,7 @@ mod tests {
                 role: Role::User,
                 content: "Review the diff".into(),
             }],
+            workspace_root: root.clone(),
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -266,9 +318,199 @@ mod tests {
                 role: Role::User,
                 content: "Hi".into(),
             }],
+            workspace_root: tmp.path().to_path_buf(),
         };
 
         let result = run_agent_loop(config).await;
         assert!(result.is_err());
+    }
+
+    fn setup_agent_env() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        (tmp, root)
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_truncates_on_budget_exceeded() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone());
+
+        let mut contract = test_contract();
+        contract.token_budget = 10000;
+
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            name: "git_diff".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_response(ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: "Running tool...".into(),
+            },
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![tool_call.clone()]),
+        });
+        mock.add_response(ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "test finding", "evidence": "test"}]}"#.into(),
+            },
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let huge_content = "x".repeat(40000);
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message {
+                role: Role::User,
+                content: huge_content,
+            }],
+            workspace_root: root.clone(),
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(
+            !result.truncated,
+            "Expected truncation to succeed (truncated=false), got truncated=true"
+        );
+        assert!(!result.findings.is_empty(), "Expected findings after truncation");
+
+        let archive_dir = root.join(".clausura").join("archives");
+        assert!(archive_dir.exists(), "Archive directory should exist");
+        let mut found = false;
+        if let Ok(entries) = std::fs::read_dir(&archive_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("context-dump-test-") {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "Archive file should exist after truncation");
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_breaks_when_cannot_truncate() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone());
+
+        let mut contract = test_contract();
+        contract.token_budget = 1;
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_response(ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: "Running tool...".into(),
+            },
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                name: "git_diff".into(),
+                arguments: serde_json::json!({}),
+            }]),
+        });
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message {
+                role: Role::User,
+                content: "Review".into(),
+            }],
+            workspace_root: root.clone(),
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(
+            result.truncated,
+            "Expected truncated=true when context cannot be reduced further"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hint_message_injected_after_truncation() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone());
+
+        let mut contract = test_contract();
+        contract.token_budget = 10000;
+
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            name: "git_diff".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_response(ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: "Running tool...".into(),
+            },
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![tool_call.clone()]),
+        });
+        mock.add_response(ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "test finding", "evidence": "test"}]}"#.into(),
+            },
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let huge_content = "x".repeat(40000);
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message {
+                role: Role::User,
+                content: huge_content,
+            }],
+            workspace_root: root.clone(),
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        let hint = result
+            .messages
+            .iter()
+            .any(|m| m.role == Role::User && m.content.contains("archived at"));
+        assert!(hint, "Expected a hint message about archiving after truncation");
     }
 }
