@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/liuyanghejerry/Clausura"
 
 [dependencies]
-clausura-core = { path = "../clausura-core" }
+clausura-core = { path = "../clausura-core", version = "1.0.0" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
