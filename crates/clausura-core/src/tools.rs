@@ -78,6 +78,41 @@ pub struct ReadFileTool {
     workspace_root: PathBuf,
 }
 
+/// Resolve a path relative to the workspace root, enforcing sandbox restrictions.
+/// Returns the canonicalized absolute path, or a ToolError.
+pub fn resolve_sandboxed_path(
+    workspace_root: &Path,
+    path_str: &str,
+) -> Result<PathBuf, ToolError> {
+    let requested = Path::new(path_str);
+    // Reject absolute paths
+    if requested.is_absolute() {
+        return Err(ToolError::SandboxViolation(format!(
+            "Absolute paths not allowed: {}",
+            path_str
+        )));
+    }
+    // Reject paths with ..
+    if requested.components().any(|c| c.as_os_str() == "..") {
+        return Err(ToolError::SandboxViolation(format!(
+            "Path traversal not allowed: {}",
+            path_str
+        )));
+    }
+    // Canonicalize to prevent symlink-based escapes
+    let full_path = workspace_root.join(requested);
+    let canonical = full_path
+        .canonicalize()
+        .map_err(|_| ToolError::ExecutionFailed(format!("File not found: {}", path_str)))?;
+    // Verify we're still inside workspace root
+    if !canonical.starts_with(workspace_root) {
+        return Err(ToolError::SandboxViolation(
+            "Path escapes workspace root".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
 impl ReadFileTool {
     pub fn new(workspace_root: PathBuf) -> Self {
         // Canonicalize workspace root once so symlinks are resolved consistently
@@ -88,33 +123,7 @@ impl ReadFileTool {
     }
 
     fn resolve_path(&self, path_str: &str) -> Result<PathBuf, ToolError> {
-        let requested = Path::new(path_str);
-        // Reject absolute paths
-        if requested.is_absolute() {
-            return Err(ToolError::SandboxViolation(format!(
-                "Absolute paths not allowed: {}",
-                path_str
-            )));
-        }
-        // Reject paths with ..
-        if requested.components().any(|c| c.as_os_str() == "..") {
-            return Err(ToolError::SandboxViolation(format!(
-                "Path traversal not allowed: {}",
-                path_str
-            )));
-        }
-        // Canonicalize to prevent symlink-based escapes
-        let full_path = self.workspace_root.join(requested);
-        let canonical = full_path
-            .canonicalize()
-            .map_err(|_| ToolError::ExecutionFailed(format!("File not found: {}", path_str)))?;
-        // Verify we're still inside workspace root
-        if !canonical.starts_with(&self.workspace_root) {
-            return Err(ToolError::SandboxViolation(
-                "Path escapes workspace root".into(),
-            ));
-        }
-        Ok(canonical)
+        resolve_sandboxed_path(&self.workspace_root, path_str)
     }
 }
 
@@ -393,6 +402,36 @@ mod tests {
             .execute(serde_json::json!({"path": "nonexistent.txt"}))
             .await;
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_sandboxed_path tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_resolve_sandboxed_accepts_valid() {
+        let (_tmp, root) = setup_workspace();
+        let root = root.canonicalize().unwrap();
+        let test_file = root.join("test.txt");
+        std::fs::write(&test_file, "hello").unwrap();
+
+        let result = resolve_sandboxed_path(&root, "test.txt");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), test_file.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_sandboxed_rejects_absolute() {
+        let (_tmp, root) = setup_workspace();
+        let result = resolve_sandboxed_path(&root, "/etc/passwd");
+        assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_sandboxed_rejects_traversal() {
+        let (_tmp, root) = setup_workspace();
+        let result = resolve_sandboxed_path(&root, "../outside");
+        assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
     }
 
     // -----------------------------------------------------------------------
