@@ -3,3 +3,4 @@ target/
 *.db
 *.sarif
 .sisyphus/
+.env
