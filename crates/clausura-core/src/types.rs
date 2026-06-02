@@ -20,6 +20,26 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl Message {
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn with_tool_call(role: Role, content: impl Into<String>, tool_call_id: String) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: Some(tool_call_id),
+        }
+    }
 }
 
 /// Provider-agnostic finish reason
@@ -462,6 +482,7 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: "Hello".to_string(),
+            tool_call_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: Message = serde_json::from_str(&json).unwrap();

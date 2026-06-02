@@ -217,19 +217,19 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_messages(count: usize) -> Vec<Message> {
-        let mut msgs = vec![Message {
-            role: Role::System,
-            content: "You are a helpful assistant.".to_string(),
-        }];
+        let mut msgs = vec![Message::new(
+            Role::System,
+            "You are a helpful assistant.".to_string(),
+        )];
         for i in 0..count - 1 {
-            msgs.push(Message {
-                role: if i % 2 == 0 {
+            msgs.push(Message::new(
+                if i % 2 == 0 {
                     Role::User
                 } else {
                     Role::Assistant
                 },
-                content: format!("Message {}", i),
-            });
+                format!("Message {}", i),
+            ));
         }
         msgs
     }
@@ -303,26 +303,11 @@ mod tests {
         let root = TempDir::new().unwrap();
         let manager = ContextManager::new(&mock, 50, root.path().to_path_buf());
         let msgs = vec![
-            Message {
-                role: Role::System,
-                content: "System prompt".to_string(),
-            },
-            Message {
-                role: Role::User,
-                content: "Run git diff".to_string(),
-            },
-            Message {
-                role: Role::Assistant,
-                content: "calling tool".to_string(),
-            },
-            Message {
-                role: Role::Tool,
-                content: "diff output".to_string(),
-            },
-            Message {
-                role: Role::User,
-                content: "What does that mean?".to_string(),
-            },
+            Message::new(Role::System, "System prompt".to_string()),
+            Message::new(Role::User, "Run git diff".to_string()),
+            Message::new(Role::Assistant, "calling tool".to_string()),
+            Message::new(Role::Tool, "diff output".to_string()),
+            Message::new(Role::User, "What does that mean?".to_string()),
         ];
         let mut msgs = msgs;
         let _dropped = manager.truncate(&mut msgs);
@@ -344,18 +329,9 @@ mod tests {
         let root = TempDir::new().unwrap();
         let cm = ContextManager::new(&mock, 1000, root.path().to_path_buf());
         let messages = vec![
-            Message {
-                role: Role::User,
-                content: "Hello".to_string(),
-            },
-            Message {
-                role: Role::Assistant,
-                content: "Hi there".to_string(),
-            },
-            Message {
-                role: Role::Tool,
-                content: "tool result".to_string(),
-            },
+            Message::new(Role::User, "Hello".to_string()),
+            Message::new(Role::Assistant, "Hi there".to_string()),
+            Message::new(Role::Tool, "tool result".to_string()),
         ];
         let path = cm.archive(&messages, "test-task").await.unwrap();
         assert_eq!(
@@ -391,10 +367,7 @@ mod tests {
         let mock = MockProvider::new("test");
         let root = TempDir::new().unwrap();
         let cm = ContextManager::new(&mock, 1000, root.path().to_path_buf());
-        let messages = vec![Message {
-            role: Role::User,
-            content: "test".to_string(),
-        }];
+        let messages = vec![Message::new(Role::User, "test".to_string())];
 
         let path1 = cm.archive(&messages, "seq-test").await.unwrap();
         assert_eq!(
@@ -428,10 +401,7 @@ mod tests {
         let readonly_for_cleanup = readonly.clone();
 
         let cm = ContextManager::new(&mock, 1000, readonly);
-        let messages = vec![Message {
-            role: Role::User,
-            content: "test".to_string(),
-        }];
+        let messages = vec![Message::new(Role::User, "test".to_string())];
         let result = cm.archive(&messages, "fail-test").await;
         assert!(result.is_err());
         // Restore permissions so TempDir can clean up

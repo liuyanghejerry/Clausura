@@ -236,7 +236,7 @@ impl OpenAICompatibleProvider {
             .unwrap_or_default();
 
         Ok(ChatResponse {
-            message: Message { role, content },
+            message: Message::new(role, content),
             usage,
             finish_reason,
             tool_calls,
@@ -519,10 +519,7 @@ impl AnthropicProvider {
         };
 
         Ok(ChatResponse {
-            message: Message {
-                role: Role::Assistant,
-                content,
-            },
+            message: Message::new(Role::Assistant, content),
             usage: total_usage,
             finish_reason,
             tool_calls: if tool_calls.is_empty() {
@@ -874,10 +871,7 @@ pub mod tests {
         .unwrap();
 
         let response = provider
-            .chat(&[Message {
-                role: Role::User,
-                content: "Hi".into(),
-            }])
+            .chat(&[Message::new(Role::User, "Hi")])
             .await
             .unwrap();
 
@@ -938,13 +932,7 @@ pub mod tests {
         }];
 
         let response = provider
-            .chat_with_tools(
-                &[Message {
-                    role: Role::User,
-                    content: "Review diff".into(),
-                }],
-                &tools,
-            )
+            .chat_with_tools(&[Message::new(Role::User, "Review diff")], &tools)
             .await
             .unwrap();
 
@@ -988,10 +976,7 @@ pub mod tests {
         .unwrap();
 
         let response = provider
-            .chat(&[Message {
-                role: Role::User,
-                content: "Hi".into(),
-            }])
+            .chat(&[Message::new(Role::User, "Hi")])
             .await
             .unwrap();
 
@@ -1015,12 +1000,7 @@ pub mod tests {
         })
         .unwrap();
 
-        let result = provider
-            .chat(&[Message {
-                role: Role::User,
-                content: "Hi".into(),
-            }])
-            .await;
+        let result = provider.chat(&[Message::new(Role::User, "Hi")]).await;
 
         assert!(matches!(result, Err(ProviderError::AuthError(_))));
     }
@@ -1066,10 +1046,7 @@ pub mod tests {
         .unwrap();
 
         let response = provider
-            .chat(&[Message {
-                role: Role::User,
-                content: "Hi".into(),
-            }])
+            .chat(&[Message::new(Role::User, "Hi")])
             .await
             .unwrap();
 
@@ -1116,13 +1093,7 @@ pub mod tests {
         }];
 
         let response = provider
-            .chat_with_tools(
-                &[Message {
-                    role: Role::User,
-                    content: "Read main.rs".into(),
-                }],
-                &tools,
-            )
+            .chat_with_tools(&[Message::new(Role::User, "Read main.rs")], &tools)
             .await
             .unwrap();
 

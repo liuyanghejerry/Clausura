@@ -60,17 +60,17 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         match snapshot_mgr.restore_snapshot(&task_id, true) {
             Ok(Some(snapshot)) => snapshot.messages,
             _ => {
-                vec![Message {
-                    role: Role::User,
-                    content: config.task.prompt_template.clone(),
-                }]
+                vec![Message::new(
+                    Role::User,
+                    config.task.prompt_template.clone(),
+                )]
             }
         }
     } else {
-        vec![Message {
-            role: Role::User,
-            content: config.task.prompt_template.clone(),
-        }]
+        vec![Message::new(
+            Role::User,
+            config.task.prompt_template.clone(),
+        )]
     };
 
     let agent_config = AgentConfig {
