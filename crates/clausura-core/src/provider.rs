@@ -259,14 +259,11 @@ impl Provider for OpenAICompatibleProvider {
     }
 
     fn count_tokens(&self, text: &str) -> u64 {
-        // Use tiktoken for OpenAI models, fallback to approximation
-        match tiktoken_rs::cl100k_base() {
-            Ok(bpe) => bpe.encode_with_special_tokens(text).len() as u64,
-            Err(_) => {
-                // Fallback: ~4 chars per token for English text
-                (text.len() / 4).max(1) as u64
-            }
-        }
+        // Use character-based heuristic (~3 chars/token for mixed text).
+        // tiktoken (cl100k_base) is only accurate for OpenAI models;
+        // other OpenAI-compatible providers (DeepSeek, Groq, Ollama) use
+        // different tokenizers, making cl100k unreliable for budget enforcement.
+        ((text.len() as f64 / 3.0).ceil() as u64).max(1)
     }
 
     fn model(&self) -> &str {
