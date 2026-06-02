@@ -60,6 +60,13 @@ jobs:
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          find artifacts -name '*.tar.gz' -exec mv {} . \;
+          rm -rf artifacts
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
