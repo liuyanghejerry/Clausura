@@ -45,11 +45,10 @@ impl SnapshotManager {
         match result {
             Some((checkpoint_id, mut messages, truncated)) => {
                 if resume {
-                    messages.push(Message {
-                        role: Role::User,
-                        content: "You were interrupted. Continue from where you left off."
-                            .to_string(),
-                    });
+                    messages.push(Message::new(
+                        Role::User,
+                        "You were interrupted. Continue from where you left off.".to_string(),
+                    ));
                 }
                 let meta = SnapshotMeta {
                     thread_id: thread_id.to_string(),
@@ -130,18 +129,9 @@ mod tests {
 
     fn make_messages() -> Vec<Message> {
         vec![
-            Message {
-                role: Role::System,
-                content: "System prompt".into(),
-            },
-            Message {
-                role: Role::User,
-                content: "Review this code".into(),
-            },
-            Message {
-                role: Role::Assistant,
-                content: "I found issues".into(),
-            },
+            Message::new(Role::System, "System prompt"),
+            Message::new(Role::User, "Review this code"),
+            Message::new(Role::Assistant, "I found issues"),
         ]
     }
 

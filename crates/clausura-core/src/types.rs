@@ -20,6 +20,26 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl Message {
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn with_tool_call(role: Role, content: impl Into<String>, tool_call_id: String) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: Some(tool_call_id),
+        }
+    }
 }
 
 /// Provider-agnostic finish reason
@@ -462,10 +482,60 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: "Hello".to_string(),
+            tool_call_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_message_new_sets_tool_call_id_none() {
+        let msg = Message::new(Role::System, "prompt");
+        assert_eq!(msg.role, Role::System);
+        assert_eq!(msg.content, "prompt");
+        assert!(msg.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn test_message_with_tool_call_sets_id() {
+        let msg = Message::with_tool_call(Role::Tool, "result", "call_123".into());
+        assert_eq!(msg.role, Role::Tool);
+        assert_eq!(msg.content, "result");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_123"));
+    }
+
+    #[test]
+    fn test_tool_message_serializes_tool_call_id() {
+        let msg = Message::with_tool_call(Role::Tool, "tool output", "call_abc".into());
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("tool_call_id"));
+        assert!(json.contains("call_abc"));
+    }
+
+    #[test]
+    fn test_non_tool_message_omits_tool_call_id() {
+        let msg = Message::new(Role::User, "hello");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("tool_call_id"));
+    }
+
+    #[test]
+    fn test_deserialize_tool_message_with_tool_call_id() {
+        let json = r#"{"role":"tool","content":"result","tool_call_id":"call_xyz"}"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.role, Role::Tool);
+        assert_eq!(msg.content, "result");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_xyz"));
+    }
+
+    #[test]
+    fn test_deserialize_message_without_tool_call_id() {
+        let json = r#"{"role":"user","content":"hello"}"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.role, Role::User);
+        assert_eq!(msg.content, "hello");
+        assert!(msg.tool_call_id.is_none());
     }
 
     #[test]

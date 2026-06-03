@@ -218,18 +218,9 @@ mod tests {
 
     fn make_messages() -> Vec<Message> {
         vec![
-            Message {
-                role: Role::System,
-                content: "You are a code reviewer.".into(),
-            },
-            Message {
-                role: Role::User,
-                content: "Review this code.".into(),
-            },
-            Message {
-                role: Role::Assistant,
-                content: "I found 3 issues.".into(),
-            },
+            Message::new(Role::System, "You are a code reviewer."),
+            Message::new(Role::User, "Review this code."),
+            Message::new(Role::Assistant, "I found 3 issues."),
         ]
     }
 

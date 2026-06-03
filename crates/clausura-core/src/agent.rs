@@ -40,13 +40,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         config.contract.prompt_template, tools_json,
     );
 
-    messages.insert(
-        0,
-        Message {
-            role: Role::System,
-            content: system_prompt,
-        },
-    );
+    messages.insert(0, Message::new(Role::System, system_prompt));
 
     let cm = ContextManager::new(
         config.provider,
@@ -70,26 +64,26 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 
                 match archive_result {
                     Ok(path) => {
-                        messages.push(Message {
-                            role: Role::User,
-                            content: format!(
+                        messages.push(Message::new(
+                            Role::User,
+                            format!(
                                 "⚠️ Context was trimmed to stay within token budget.\n\
-                                 {} earlier messages are archived at:\n  {}\n\
-                                 Use read_file to inspect if you need context from earlier iterations.",
+                             {} earlier messages are archived at:\n  {}\n\
+                             Use read_file to inspect if you need context from earlier iterations.",
                                 dropped.len(),
                                 path.display(),
                             ),
-                        });
+                        ));
                     }
                     Err(_) => {
-                        messages.push(Message {
-                            role: Role::User,
-                            content: format!(
+                        messages.push(Message::new(
+                            Role::User,
+                            format!(
                                 "⚠️ Context was trimmed to stay within token budget.\n\
-                                 {} earlier messages were dropped (archive unavailable).",
+                             {} earlier messages were dropped (archive unavailable).",
                                 dropped.len(),
                             ),
-                        });
+                        ));
                     }
                 }
 
@@ -118,10 +112,10 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 
         match response.finish_reason {
             FinishReason::Stop => {
-                messages.push(Message {
-                    role: Role::Assistant,
-                    content: response.message.content.clone(),
-                });
+                messages.push(Message::new(
+                    Role::Assistant,
+                    response.message.content.clone(),
+                ));
 
                 let findings = extract_findings(&response.message.content);
                 return Ok(AgentResult {
@@ -135,10 +129,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
             FinishReason::ToolCalls => {
                 if let Some(tool_calls) = response.tool_calls {
                     let tool_call_content = serde_json::to_string(&tool_calls).unwrap_or_default();
-                    messages.push(Message {
-                        role: Role::Assistant,
-                        content: tool_call_content,
-                    });
+                    messages.push(Message::new(Role::Assistant, tool_call_content));
 
                     for tc in &tool_calls {
                         match config.tools.get(&tc.name) {
@@ -146,24 +137,27 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                                 let result = tool.execute(tc.arguments.clone()).await;
                                 match result {
                                     Ok(output) => {
-                                        messages.push(Message {
-                                            role: Role::Tool,
-                                            content: output,
-                                        });
+                                        messages.push(Message::with_tool_call(
+                                            Role::Tool,
+                                            output,
+                                            tc.id.clone(),
+                                        ));
                                     }
                                     Err(e) => {
-                                        messages.push(Message {
-                                            role: Role::Tool,
-                                            content: format!("Error: {}", e),
-                                        });
+                                        messages.push(Message::with_tool_call(
+                                            Role::Tool,
+                                            format!("Error: {}", e),
+                                            tc.id.clone(),
+                                        ));
                                     }
                                 }
                             }
                             None => {
-                                messages.push(Message {
-                                    role: Role::Tool,
-                                    content: format!("Error: Tool '{}' not found", tc.name),
-                                });
+                                messages.push(Message::with_tool_call(
+                                    Role::Tool,
+                                    format!("Error: Tool '{}' not found", tc.name),
+                                    tc.id.clone(),
+                                ));
                             }
                         }
                     }
@@ -252,10 +246,7 @@ mod tests {
 
         let mut mock = MockProvider::new("gpt-4o");
         mock.add_response(ChatResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: "Checking code...".into(),
-            },
+            message: Message::new(Role::Assistant, "Checking code..."),
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -269,10 +260,7 @@ mod tests {
             }]),
         });
         mock.add_response(ChatResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "test finding", "evidence": "test"}]}"#.into(),
-            },
+            message: Message::new(Role::Assistant, r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "test finding", "evidence": "test"}]}"#),
             usage: Usage {
                 input_tokens: 20,
                 output_tokens: 10,
@@ -287,10 +275,7 @@ mod tests {
             contract: &contract,
             provider: &mock,
             tools: &tools,
-            initial_messages: vec![Message {
-                role: Role::User,
-                content: "Review the diff".into(),
-            }],
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
             workspace_root: root.clone(),
         };
 
@@ -314,10 +299,7 @@ mod tests {
             contract: &contract,
             provider: &mock,
             tools: &tools,
-            initial_messages: vec![Message {
-                role: Role::User,
-                content: "Hi".into(),
-            }],
+            initial_messages: vec![Message::new(Role::User, "Hi")],
             workspace_root: tmp.path().to_path_buf(),
         };
 
@@ -347,10 +329,7 @@ mod tests {
 
         let mut mock = MockProvider::new("test-model");
         mock.add_response(ChatResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: "Running tool...".into(),
-            },
+            message: Message::new(Role::Assistant, "Running tool..."),
             usage: Usage {
                 input_tokens: 5,
                 output_tokens: 5,
@@ -360,10 +339,7 @@ mod tests {
             tool_calls: Some(vec![tool_call.clone()]),
         });
         mock.add_response(ChatResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "test finding", "evidence": "test"}]}"#.into(),
-            },
+            message: Message::new(Role::Assistant, r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "test finding", "evidence": "test"}]}"#),
             usage: Usage {
                 input_tokens: 5,
                 output_tokens: 5,
@@ -378,10 +354,7 @@ mod tests {
             contract: &contract,
             provider: &mock,
             tools: &tools,
-            initial_messages: vec![Message {
-                role: Role::User,
-                content: huge_content,
-            }],
+            initial_messages: vec![Message::new(Role::User, huge_content)],
             workspace_root: root.clone(),
         };
 
@@ -420,10 +393,7 @@ mod tests {
 
         let mut mock = MockProvider::new("test-model");
         mock.add_response(ChatResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: "Running tool...".into(),
-            },
+            message: Message::new(Role::Assistant, "Running tool..."),
             usage: Usage {
                 input_tokens: 5,
                 output_tokens: 5,
@@ -441,10 +411,7 @@ mod tests {
             contract: &contract,
             provider: &mock,
             tools: &tools,
-            initial_messages: vec![Message {
-                role: Role::User,
-                content: "Review".into(),
-            }],
+            initial_messages: vec![Message::new(Role::User, "Review")],
             workspace_root: root.clone(),
         };
 
@@ -471,10 +438,7 @@ mod tests {
 
         let mut mock = MockProvider::new("test-model");
         mock.add_response(ChatResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: "Running tool...".into(),
-            },
+            message: Message::new(Role::Assistant, "Running tool..."),
             usage: Usage {
                 input_tokens: 5,
                 output_tokens: 5,
@@ -484,10 +448,7 @@ mod tests {
             tool_calls: Some(vec![tool_call.clone()]),
         });
         mock.add_response(ChatResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "test finding", "evidence": "test"}]}"#.into(),
-            },
+            message: Message::new(Role::Assistant, r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "test finding", "evidence": "test"}]}"#),
             usage: Usage {
                 input_tokens: 5,
                 output_tokens: 5,
@@ -502,10 +463,7 @@ mod tests {
             contract: &contract,
             provider: &mock,
             tools: &tools,
-            initial_messages: vec![Message {
-                role: Role::User,
-                content: huge_content,
-            }],
+            initial_messages: vec![Message::new(Role::User, huge_content)],
             workspace_root: root.clone(),
         };
 
@@ -518,5 +476,76 @@ mod tests {
             hint,
             "Expected a hint message about archiving after truncation"
         );
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_propagates_tool_call_id() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[]);
+
+        let mut mock = MockProvider::new("gpt-4o");
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, "calling tool".to_string()),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_verify_tcid".into(),
+                name: "git_diff".into(),
+                arguments: serde_json::json!({}),
+            }]),
+        });
+        mock.add_response(ChatResponse {
+            message: Message::new(
+                Role::Assistant,
+                r#"{"findings":[],"stop":true}"#.to_string(),
+            ),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let contract = test_contract();
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Run git diff")],
+            workspace_root: root,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+
+        let tool_messages: Vec<&Message> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+
+        assert!(
+            !tool_messages.is_empty(),
+            "expected at least one tool message"
+        );
+        for tm in &tool_messages {
+            assert!(
+                tm.tool_call_id.is_some(),
+                "tool message must carry tool_call_id: role={:?}, content={}",
+                tm.role,
+                tm.content
+            );
+            assert_eq!(
+                tm.tool_call_id.as_deref(),
+                Some("call_verify_tcid"),
+                "tool_call_id should match the assistant's tool call id"
+            );
+        }
     }
 }
