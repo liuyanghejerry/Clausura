@@ -87,8 +87,30 @@ impl OpenAICompatibleProvider {
             .map(|m| {
                 let mut obj = serde_json::json!({
                     "role": serde_json::to_value(&m.role).unwrap_or_default(),
-                    "content": m.content,
                 });
+                if m.role == Role::Assistant {
+                    if let Some(ref tc_vec) = m.tool_calls {
+                        obj["content"] = serde_json::Value::Null;
+                        let tool_calls_json: Vec<serde_json::Value> = tc_vec
+                            .iter()
+                            .map(|tc| {
+                                serde_json::json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                                    }
+                                })
+                            })
+                            .collect();
+                        obj["tool_calls"] = serde_json::json!(tool_calls_json);
+                    } else {
+                        obj["content"] = serde_json::json!(m.content);
+                    }
+                } else {
+                    obj["content"] = serde_json::json!(m.content);
+                }
                 if m.role == Role::Tool {
                     if let Some(ref tcid) = m.tool_call_id {
                         obj["tool_call_id"] = serde_json::json!(tcid);

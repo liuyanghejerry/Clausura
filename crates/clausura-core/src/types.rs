@@ -22,6 +22,8 @@ pub struct Message {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl Message {
@@ -30,6 +32,7 @@ impl Message {
             role,
             content: content.into(),
             tool_call_id: None,
+            tool_calls: None,
         }
     }
 
@@ -38,6 +41,7 @@ impl Message {
             role,
             content: content.into(),
             tool_call_id: Some(tool_call_id),
+            tool_calls: None,
         }
     }
 }
@@ -483,6 +487,7 @@ mod tests {
             role: Role::User,
             content: "Hello".to_string(),
             tool_call_id: None,
+            tool_calls: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: Message = serde_json::from_str(&json).unwrap();

@@ -128,8 +128,12 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
             }
             FinishReason::ToolCalls => {
                 if let Some(tool_calls) = response.tool_calls {
-                    let tool_call_content = serde_json::to_string(&tool_calls).unwrap_or_default();
-                    messages.push(Message::new(Role::Assistant, tool_call_content));
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: String::new(),
+                        tool_call_id: None,
+                        tool_calls: Some(tool_calls.clone()),
+                    });
 
                     for tc in &tool_calls {
                         match config.tools.get(&tc.name) {
