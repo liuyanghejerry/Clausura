@@ -88,25 +88,26 @@ impl OpenAICompatibleProvider {
                 let mut obj = serde_json::json!({
                     "role": serde_json::to_value(&m.role).unwrap_or_default(),
                 });
-                if m.role == Role::Assistant && m.tool_calls.is_some() {
-                    obj["content"] = serde_json::Value::Null;
-                    let tool_calls_json: Vec<serde_json::Value> = m
-                        .tool_calls
-                        .as_ref()
-                        .unwrap()
-                        .iter()
-                        .map(|tc| {
-                            serde_json::json!({
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                                }
+                if m.role == Role::Assistant {
+                    if let Some(ref tc_vec) = m.tool_calls {
+                        obj["content"] = serde_json::Value::Null;
+                        let tool_calls_json: Vec<serde_json::Value> = tc_vec
+                            .iter()
+                            .map(|tc| {
+                                serde_json::json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                                    }
+                                })
                             })
-                        })
-                        .collect();
-                    obj["tool_calls"] = serde_json::json!(tool_calls_json);
+                            .collect();
+                        obj["tool_calls"] = serde_json::json!(tool_calls_json);
+                    } else {
+                        obj["content"] = serde_json::json!(m.content);
+                    }
                 } else {
                     obj["content"] = serde_json::json!(m.content);
                 }
