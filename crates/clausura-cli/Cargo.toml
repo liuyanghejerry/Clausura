@@ -1,6 +1,6 @@
 [package]
 name = "clausura-cli"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "CI-native agent CLI for deterministic pipeline gating"
 license = "MIT"
@@ -8,7 +8,7 @@ repository = "https://github.com/liuyanghejerry/Clausura"
 readme = "../../README.md"
 
 [dependencies]
-clausura-core = { path = "../clausura-core", version = "1.0.2" }
+clausura-core = { path = "../clausura-core", version = "1.0.3" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
