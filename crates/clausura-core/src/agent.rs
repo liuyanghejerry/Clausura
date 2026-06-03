@@ -477,4 +477,75 @@ mod tests {
             "Expected a hint message about archiving after truncation"
         );
     }
+
+    #[tokio::test]
+    async fn test_agent_loop_propagates_tool_call_id() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[]);
+
+        let mut mock = MockProvider::new("gpt-4o");
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, "calling tool".to_string()),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_verify_tcid".into(),
+                name: "git_diff".into(),
+                arguments: serde_json::json!({}),
+            }]),
+        });
+        mock.add_response(ChatResponse {
+            message: Message::new(
+                Role::Assistant,
+                r#"{"findings":[],"stop":true}"#.to_string(),
+            ),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let contract = test_contract();
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Run git diff")],
+            workspace_root: root,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+
+        let tool_messages: Vec<&Message> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+
+        assert!(
+            !tool_messages.is_empty(),
+            "expected at least one tool message"
+        );
+        for tm in &tool_messages {
+            assert!(
+                tm.tool_call_id.is_some(),
+                "tool message must carry tool_call_id: role={:?}, content={}",
+                tm.role,
+                tm.content
+            );
+            assert_eq!(
+                tm.tool_call_id.as_deref(),
+                Some("call_verify_tcid"),
+                "tool_call_id should match the assistant's tool call id"
+            );
+        }
+    }
 }

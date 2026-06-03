@@ -82,12 +82,25 @@ impl OpenAICompatibleProvider {
         messages: &[Message],
         tools: Option<&[ToolDef]>,
     ) -> serde_json::Value {
+        let serialized_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| {
+                let mut obj = serde_json::json!({
+                    "role": serde_json::to_value(&m.role).unwrap_or_default(),
+                    "content": m.content,
+                });
+                if m.role == Role::Tool {
+                    if let Some(ref tcid) = m.tool_call_id {
+                        obj["tool_call_id"] = serde_json::json!(tcid);
+                    }
+                }
+                obj
+            })
+            .collect();
+
         let mut body = serde_json::json!({
             "model": self.config.model,
-            "messages": messages.iter().map(|m| serde_json::json!({
-                "role": serde_json::to_value(&m.role).unwrap_or_default(),
-                "content": m.content,
-            })).collect::<Vec<_>>(),
+            "messages": serialized_messages,
         });
 
         if let Some(tools) = tools {
@@ -1131,5 +1144,84 @@ pub mod tests {
         let provider = create_provider(&vendor, "internal-model", "my-key", 60).unwrap();
         assert_eq!(provider.model(), "internal-model");
         assert_eq!(provider.vendor(), "custom");
+    }
+
+    // --- build_request_body tests ---
+
+    fn make_provider() -> OpenAICompatibleProvider {
+        OpenAICompatibleProvider::new(OpenAIProviderConfig {
+            base_url: "https://api.example.com/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_build_body_includes_tool_call_id_for_tool_messages() {
+        let provider = make_provider();
+        let messages = vec![
+            Message::new(Role::User, "run the tool"),
+            Message::new(Role::Assistant, "calling tool"),
+            Message::with_tool_call(Role::Tool, "tool result", "call_abc123".into()),
+        ];
+        let body = provider.build_request_body(&messages, None);
+        let body_str = serde_json::to_string(&body).unwrap();
+        assert!(
+            body_str.contains("call_abc123"),
+            "tool_call_id should be in request: {body_str}"
+        );
+        assert!(
+            body_str.contains("tool_call_id"),
+            "missing tool_call_id field"
+        );
+    }
+
+    #[test]
+    fn test_build_body_omits_tool_call_id_for_non_tool_messages() {
+        let provider = make_provider();
+        let messages = vec![
+            Message::new(Role::System, "You are a helpful assistant."),
+            Message::new(Role::User, "Hello"),
+        ];
+        let body = provider.build_request_body(&messages, None);
+        let body_str = serde_json::to_string(&body).unwrap();
+        assert!(
+            !body_str.contains("tool_call_id"),
+            "non-tool messages should not have tool_call_id"
+        );
+    }
+
+    #[test]
+    fn test_build_body_multi_turn_tool_call_round_trip() {
+        let provider = make_provider();
+        let messages = vec![
+            Message::new(Role::System, "You have tools."),
+            Message::new(Role::User, "Check the code"),
+            Message::new(Role::Assistant, "Let me check"),
+            Message::with_tool_call(Role::Tool, "diff output here", "call_1".into()),
+            Message::new(Role::Assistant, "I see changes"),
+            Message::with_tool_call(Role::Tool, "grep results", "call_2".into()),
+            Message::new(Role::Assistant, "All done"),
+        ];
+        let body = provider.build_request_body(&messages, None);
+        let body_str = serde_json::to_string(&body).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        let msgs = parsed["messages"].as_array().unwrap();
+
+        // Check tool messages have tool_call_id
+        let tool_msg_1 = &msgs[3];
+        assert_eq!(tool_msg_1["tool_call_id"], "call_1");
+        assert_eq!(tool_msg_1["role"], "tool");
+
+        let tool_msg_2 = &msgs[5];
+        assert_eq!(tool_msg_2["tool_call_id"], "call_2");
+        assert_eq!(tool_msg_2["role"], "tool");
+
+        // Check non-tool messages do NOT have tool_call_id
+        let user_msg = &msgs[1];
+        assert_eq!(user_msg["role"], "user");
+        assert!(user_msg.get("tool_call_id").is_none());
     }
 }
