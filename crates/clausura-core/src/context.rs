@@ -148,48 +148,22 @@ impl<'a> ContextManager<'a> {
             return messages.to_vec();
         }
 
-        let system = messages[0].clone(); // System message is always first
+        let system = messages[0].clone();
 
-        // Collect the last n-1 messages (don't count system)
-        let mut tail: Vec<Message> = messages[1..]
-            .iter()
-            .rev()
-            .take(n - 1)
-            .cloned()
-            .collect::<Vec<_>>();
-        tail.reverse();
+        // Take the last n-1 messages (excluding system)
+        let tail_count = n - 1;
+        let tail_start = messages.len().saturating_sub(tail_count);
+        let tail: Vec<Message> = messages[tail_start..].to_vec();
 
-        // Ensure we don't orphan tool calls — if the tail starts with a Tool
-        // message without its paired Assistant, expand to include the Assistant.
+        // If tail starts with a Tool message, ensure its Assistant is included
         if !tail.is_empty() && tail[0].role == Role::Tool {
-            // Find the index in the original messages of this tool message,
-            // then walk back to include the preceding Assistant.
-            let first_tail_content = &tail[0].content;
-            if let Some(pos) = messages[1..]
-                .iter()
-                .position(|m| m.role == Role::Tool && &m.content == first_tail_content)
-            {
-                let orig_idx = pos + 1;
-                if orig_idx > 0 && messages[orig_idx - 1].role == Role::Assistant {
-                    // The Assistant is already right before the Tool in the slice before tail.
-                    // Check if it would have been omitted.
-                    let tail_count = n - 1;
-                    let before_tail_start = messages.len().saturating_sub(tail_count);
-                    if orig_idx > 0 && (orig_idx - 1) < before_tail_start {
-                        // The preceding Assistant was omitted; include one more message
-                        let expanded: Vec<Message> = messages[1..]
-                            .iter()
-                            .rev()
-                            .take(tail_count + 1)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect();
-                        let mut result = vec![system];
-                        result.extend(expanded);
-                        return result;
-                    }
+            // Walk backwards from tail_start to find the Assistant with tool_calls
+            for i in (1..tail_start).rev() {
+                if messages[i].role == Role::Assistant && messages[i].tool_calls.is_some() {
+                    // Include everything from i to the end
+                    let mut result = vec![system];
+                    result.extend_from_slice(&messages[i..]);
+                    return result;
                 }
             }
         }
