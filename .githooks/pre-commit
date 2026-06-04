@@ -22,3 +22,13 @@ if ! cargo fmt --all -- --check; then
 fi
 
 echo "✅ cargo fmt passed"
+echo ""
+echo "🔍 Checking cargo clippy..."
+
+if ! cargo clippy --all-targets -- -D warnings; then
+    echo ""
+    echo "❌ clippy failed. Fix the warnings above, then re-stage and commit."
+    exit 1
+fi
+
+echo "✅ cargo clippy passed"
