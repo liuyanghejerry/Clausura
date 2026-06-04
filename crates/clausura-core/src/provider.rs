@@ -59,6 +59,62 @@ impl Default for OpenAIProviderConfig {
     }
 }
 
+/// Serialize messages in OpenAI-compatible format, including tool_call_id and tool_calls.
+pub(crate) fn serialize_messages_openai(messages: &[Message]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|m| {
+            let mut obj = serde_json::json!({
+                "role": serde_json::to_value(&m.role).unwrap_or_default(),
+            });
+            if m.role == Role::Assistant {
+                if let Some(ref tc_vec) = m.tool_calls {
+                    obj["content"] = serde_json::Value::Null;
+                    let tool_calls_json: Vec<serde_json::Value> = tc_vec
+                        .iter()
+                        .map(|tc| {
+                            serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                                }
+                            })
+                        })
+                        .collect();
+                    obj["tool_calls"] = serde_json::json!(tool_calls_json);
+                } else {
+                    obj["content"] = serde_json::json!(m.content);
+                }
+            } else {
+                obj["content"] = serde_json::json!(m.content);
+            }
+            if m.role == Role::Tool {
+                if let Some(ref tcid) = m.tool_call_id {
+                    obj["tool_call_id"] = serde_json::json!(tcid);
+                }
+            }
+            obj
+        })
+        .collect()
+}
+
+/// Serialize tool definitions in OpenAI function-calling format.
+pub(crate) fn serialize_tool_defs(tools: &[ToolDef]) -> serde_json::Value {
+    serde_json::json!(tools
+        .iter()
+        .map(|t| serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            }
+        }))
+        .collect::<Vec<_>>())
+}
+
 /// Provider that calls any OpenAI-compatible chat completions API.
 ///
 /// Works with OpenAI, DeepSeek, Groq, Ollama (via openai proxy), etc.
@@ -75,68 +131,18 @@ impl OpenAICompatibleProvider {
             .map_err(ProviderError::NetworkError)?;
         Ok(Self { config, client })
     }
-
-    /// Internal helper: build the JSON request body.
     fn build_request_body(
         &self,
         messages: &[Message],
         tools: Option<&[ToolDef]>,
     ) -> serde_json::Value {
-        let serialized_messages: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|m| {
-                let mut obj = serde_json::json!({
-                    "role": serde_json::to_value(&m.role).unwrap_or_default(),
-                });
-                if m.role == Role::Assistant {
-                    if let Some(ref tc_vec) = m.tool_calls {
-                        obj["content"] = serde_json::Value::Null;
-                        let tool_calls_json: Vec<serde_json::Value> = tc_vec
-                            .iter()
-                            .map(|tc| {
-                                serde_json::json!({
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.name,
-                                        "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                                    }
-                                })
-                            })
-                            .collect();
-                        obj["tool_calls"] = serde_json::json!(tool_calls_json);
-                    } else {
-                        obj["content"] = serde_json::json!(m.content);
-                    }
-                } else {
-                    obj["content"] = serde_json::json!(m.content);
-                }
-                if m.role == Role::Tool {
-                    if let Some(ref tcid) = m.tool_call_id {
-                        obj["tool_call_id"] = serde_json::json!(tcid);
-                    }
-                }
-                obj
-            })
-            .collect();
-
         let mut body = serde_json::json!({
             "model": self.config.model,
-            "messages": serialized_messages,
+            "messages": serialize_messages_openai(messages),
         });
 
         if let Some(tools) = tools {
-            body["tools"] = serde_json::json!(tools
-                .iter()
-                .map(|t| serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
-                }))
-                .collect::<Vec<_>>());
+            body["tools"] = serialize_tool_defs(tools);
         }
 
         body
@@ -656,24 +662,11 @@ impl Provider for CustomProvider {
 
         let mut body = serde_json::json!({
             "model": self.config.model,
-            "messages": messages.iter().map(|m| serde_json::json!({
-                "role": serde_json::to_value(&m.role).unwrap_or_default(),
-                "content": m.content,
-            })).collect::<Vec<_>>(),
+            "messages": serialize_messages_openai(messages),
         });
 
         if !tools.is_empty() {
-            body["tools"] = serde_json::json!(tools
-                .iter()
-                .map(|t| serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
-                }))
-                .collect::<Vec<_>>());
+            body["tools"] = serialize_tool_defs(tools);
         }
 
         let mut last_error = None;

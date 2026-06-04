@@ -175,8 +175,8 @@ impl<'a> ContextManager<'a> {
                     // Check if it would have been omitted.
                     let tail_count = n - 1;
                     let before_tail_start = messages.len().saturating_sub(tail_count);
-                    if orig_idx < before_tail_start {
-                        // The Assistant was omitted; include one more message
+                    if orig_idx > 0 && (orig_idx - 1) < before_tail_start {
+                        // The preceding Assistant was omitted; include one more message
                         let expanded: Vec<Message> = messages[1..]
                             .iter()
                             .rev()
