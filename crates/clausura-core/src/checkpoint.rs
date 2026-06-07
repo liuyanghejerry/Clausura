@@ -75,14 +75,15 @@ impl CheckpointStore {
     }
 
     /// Load the most recent checkpoint for a thread.
+    #[allow(clippy::type_complexity)]
     pub fn load(
         &self,
         thread_id: &str,
-    ) -> Result<Option<(uuid::Uuid, Vec<Message>, bool)>, CheckpointError> {
+    ) -> Result<Option<(uuid::Uuid, Vec<Message>, bool, u32)>, CheckpointError> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT checkpoint_id, state, truncated FROM checkpoints
+                "SELECT checkpoint_id, state, truncated, version FROM checkpoints
                  WHERE thread_id = ?1
                  ORDER BY created_at DESC, rowid DESC
                  LIMIT 1",
@@ -93,12 +94,13 @@ impl CheckpointStore {
             let id_str: String = row.get(0)?;
             let state_blob: Vec<u8> = row.get(1)?;
             let truncated: i32 = row.get(2)?;
+            let version: i32 = row.get(3)?;
             let checkpoint_id = uuid::Uuid::parse_str(&id_str)
                 .map_err(|_| rusqlite::Error::InvalidParameterName("Invalid UUID".into()))?;
             let messages: Vec<Message> = rmp_serde::from_slice(&state_blob).map_err(|e| {
                 rusqlite::Error::InvalidParameterName(format!("Deserialize failed: {}", e))
             })?;
-            Ok((checkpoint_id, messages, truncated != 0))
+            Ok((checkpoint_id, messages, truncated != 0, version as u32))
         });
 
         match result {
@@ -109,15 +111,16 @@ impl CheckpointStore {
     }
 
     /// Load a specific checkpoint by ID.
+    #[allow(clippy::type_complexity)]
     pub fn load_at(
         &self,
         thread_id: &str,
         checkpoint_id: &uuid::Uuid,
-    ) -> Result<Option<(Vec<Message>, bool)>, CheckpointError> {
+    ) -> Result<Option<(Vec<Message>, bool, u32)>, CheckpointError> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT state, truncated FROM checkpoints
+                "SELECT state, truncated, version FROM checkpoints
                  WHERE thread_id = ?1 AND checkpoint_id = ?2",
             )
             .map_err(|e| CheckpointError::DbError(e.to_string()))?;
@@ -125,10 +128,11 @@ impl CheckpointStore {
         let result = stmt.query_row(params![thread_id, checkpoint_id.to_string()], |row| {
             let state_blob: Vec<u8> = row.get(0)?;
             let truncated: i32 = row.get(1)?;
+            let version: i32 = row.get(2)?;
             let messages: Vec<Message> = rmp_serde::from_slice(&state_blob).map_err(|e| {
                 rusqlite::Error::InvalidParameterName(format!("Deserialize failed: {}", e))
             })?;
-            Ok((messages, truncated != 0))
+            Ok((messages, truncated != 0, version as u32))
         });
 
         match result {
@@ -186,6 +190,64 @@ impl CheckpointStore {
         Ok(result)
     }
 
+    /// List all checkpoints across all threads (most recent first).
+    pub fn list_all(&self, limit: u32) -> Result<Vec<SnapshotMeta>, CheckpointError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT checkpoint_id, thread_id, created_at, version, truncated FROM checkpoints
+                  ORDER BY created_at DESC, rowid DESC
+                  LIMIT ?1",
+            )
+            .map_err(|e| CheckpointError::DbError(e.to_string()))?;
+
+        let metas = stmt
+            .query_map(params![limit], |row| {
+                let id_str: String = row.get(0)?;
+                let thread_str: String = row.get(1)?;
+                let created_str: String = row.get(2)?;
+                let version: i32 = row.get(3)?;
+                let truncated: i32 = row.get(4)?;
+
+                let checkpoint_id = uuid::Uuid::parse_str(&id_str).unwrap_or(uuid::Uuid::nil());
+                let created_at =
+                    chrono::NaiveDateTime::parse_from_str(&created_str, "%Y-%m-%d %H:%M:%S")
+                        .map(|naive| {
+                            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                                naive,
+                                chrono::Utc,
+                            )
+                        })
+                        .unwrap_or_else(|_| chrono::Utc::now());
+
+                Ok(SnapshotMeta {
+                    thread_id: thread_str,
+                    checkpoint_id,
+                    created_at,
+                    version: version as u32,
+                    truncated: truncated != 0,
+                })
+            })
+            .map_err(|e| CheckpointError::DbError(e.to_string()))?;
+
+        let mut result = Vec::new();
+        for meta in metas {
+            result.push(meta.map_err(|e| CheckpointError::DbError(e.to_string()))?);
+        }
+        Ok(result)
+    }
+
+    /// Delete a specific checkpoint by ID.
+    pub fn delete_checkpoint(&self, checkpoint_id: &uuid::Uuid) -> Result<(), CheckpointError> {
+        self.conn
+            .execute(
+                "DELETE FROM checkpoints WHERE checkpoint_id = ?1",
+                params![checkpoint_id.to_string()],
+            )
+            .map_err(|e| CheckpointError::DbError(e.to_string()))?;
+        Ok(())
+    }
+
     /// Delete all checkpoints for a thread.
     pub fn delete_thread(&self, thread_id: &str) -> Result<(), CheckpointError> {
         self.conn
@@ -231,7 +293,8 @@ mod tests {
         let cid = store.save("test-thread", &msgs, false).unwrap();
         let loaded = store.load("test-thread").unwrap();
         assert!(loaded.is_some());
-        let (loaded_cid, loaded_msgs, truncated) = loaded.unwrap();
+        let (loaded_cid, loaded_msgs, truncated, version) = loaded.unwrap();
+        assert_eq!(version, 1);
         assert_eq!(cid, loaded_cid);
         assert_eq!(msgs, loaded_msgs);
         assert!(!truncated);
@@ -251,7 +314,8 @@ mod tests {
         let cid = store.save("test", &msgs, false).unwrap();
         let loaded = store.load_at("test", &cid).unwrap();
         assert!(loaded.is_some());
-        let (loaded_msgs, _) = loaded.unwrap();
+        let (loaded_msgs, _, version) = loaded.unwrap();
+        assert_eq!(version, 1);
         assert_eq!(msgs, loaded_msgs);
     }
 
@@ -284,5 +348,72 @@ mod tests {
         let encoded = rmp_serde::to_vec(&msgs).unwrap();
         let decoded: Vec<Message> = rmp_serde::from_slice(&encoded).unwrap();
         assert_eq!(msgs, decoded);
+    }
+
+    #[test]
+    fn test_delete_checkpoint() {
+        let (store, _tmp) = create_test_store();
+        let cid = store.save("del-test", &make_messages(), false).unwrap();
+        store.delete_checkpoint(&cid).unwrap();
+        // Checkpoint should no longer exist
+        let loaded = store.load_at("del-test", &cid).unwrap();
+        assert!(loaded.is_none());
+        // Thread should still have no checkpoints
+        let list = store.list("del-test", 10).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_delete_checkpoint_does_not_affect_other_threads() {
+        let (store, _tmp) = create_test_store();
+        let cid_a = store.save("thread-a", &make_messages(), false).unwrap();
+        store.save("thread-b", &make_messages(), false).unwrap();
+        store.delete_checkpoint(&cid_a).unwrap();
+        // thread-a should be empty
+        let list_a = store.list("thread-a", 10).unwrap();
+        assert!(list_a.is_empty());
+        // thread-b should still have its checkpoint
+        let list_b = store.list("thread-b", 10).unwrap();
+        assert_eq!(list_b.len(), 1);
+    }
+
+    #[test]
+    fn test_list_all() {
+        let (store, _tmp) = create_test_store();
+        store.save("alpha", &make_messages(), false).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.save("beta", &make_messages(), true).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.save("alpha", &make_messages(), false).unwrap();
+
+        let all = store.list_all(10).unwrap();
+        assert_eq!(all.len(), 3);
+        // Most recent first
+        assert_eq!(all[0].thread_id, "alpha");
+        assert_eq!(all[1].thread_id, "beta");
+        assert_eq!(all[2].thread_id, "alpha");
+    }
+
+    #[test]
+    fn test_list_all_respects_limit() {
+        let (store, _tmp) = create_test_store();
+        for i in 0..5 {
+            store
+                .save(&format!("t{}", i), &make_messages(), false)
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let all = store.list_all(3).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_version_round_trip() {
+        let (store, _tmp) = create_test_store();
+        let cid = store.save("ver-test", &make_messages(), false).unwrap();
+        let loaded = store.load("ver-test").unwrap().unwrap();
+        assert_eq!(loaded.3, 1); // version field
+        let loaded_at = store.load_at("ver-test", &cid).unwrap().unwrap();
+        assert_eq!(loaded_at.2, 1); // version field from load_at
     }
 }

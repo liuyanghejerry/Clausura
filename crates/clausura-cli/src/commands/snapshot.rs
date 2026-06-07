@@ -11,9 +11,9 @@ pub struct SnapshotArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum SnapshotAction {
-    /// List checkpoints
+    /// List checkpoints (all threads if --thread omitted)
     List {
-        /// Thread ID to list (defaults to "default")
+        /// Thread ID to list (default: all threads)
         #[arg(long)]
         thread: Option<String>,
         /// Max results
@@ -50,10 +50,13 @@ pub fn execute(args: SnapshotArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     match args.action {
         SnapshotAction::List { thread, limit } => {
-            let thread_id = thread.unwrap_or_else(|| "default".to_string());
-            let snapshots = manager.list_snapshots(&thread_id, limit)?;
+            let snapshots = if let Some(tid) = thread {
+                manager.list_snapshots(&tid, limit)?
+            } else {
+                manager.list_all_snapshots(limit)?
+            };
             if snapshots.is_empty() {
-                println!("No checkpoints found for thread '{}'", thread_id);
+                println!("No checkpoints found");
                 return Ok(());
             }
             println!(
@@ -121,14 +124,13 @@ pub fn execute(args: SnapshotArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         SnapshotAction::Delete { thread, id } => {
-            if id.is_some() {
-                eprintln!(
-                    "Note: Per-checkpoint deletion not yet supported; deleting all checkpoints for thread '{}'",
-                    thread
-                );
+            if let Some(checkpoint_id) = id {
+                manager.delete_checkpoint(&checkpoint_id)?;
+                println!("Deleted checkpoint '{}'", checkpoint_id);
+            } else {
+                manager.delete_thread(&thread)?;
+                println!("Deleted all checkpoints for thread '{}'", thread);
             }
-            manager.delete_thread(&thread)?;
-            println!("Deleted all checkpoints for thread '{}'", thread);
         }
     }
     Ok(())
