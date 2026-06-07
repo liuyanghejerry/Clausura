@@ -376,6 +376,12 @@ pub struct TaskContract {
     pub ambiguity_policy: AmbiguityPolicy,
     #[serde(default)]
     pub gating_rules: Vec<GateRule>,
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+}
+
+fn default_max_iterations() -> u32 {
+    10
 }
 
 fn default_ambiguity_policy() -> AmbiguityPolicy {
@@ -596,6 +602,7 @@ mod tests {
             timeout_secs: 300,
             ambiguity_policy: AmbiguityPolicy::FailClosed,
             gating_rules: vec![],
+            max_iterations: 10,
         };
         assert_eq!(contract.ambiguity_policy, AmbiguityPolicy::FailClosed);
         assert!(contract.gating_rules.is_empty());

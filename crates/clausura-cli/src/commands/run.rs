@@ -31,6 +31,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub timeout: Option<u64>,
 
+    /// Max agent loop iterations
+    #[arg(long)]
+    pub max_iterations: Option<u32>,
+
     /// Workspace root
     #[arg(long)]
     pub workspace: Option<PathBuf>,
@@ -92,6 +96,7 @@ pub async fn execute(args: RunArgs) -> i32 {
         args.api_key.as_deref(),
         args.token_budget,
         args.timeout,
+        args.max_iterations,
         workspace,
         output,
         args.resume,
@@ -129,6 +134,11 @@ pub async fn execute(args: RunArgs) -> i32 {
         );
         eprintln!("  {} {}", "Token budget:".bold(), config.task.token_budget);
         eprintln!("  {} {}s", "Timeout:".bold(), config.task.timeout_secs);
+        eprintln!(
+            "  {} {}",
+            "Max iterations:".bold(),
+            config.task.max_iterations
+        );
         eprintln!(
             "  {} {}",
             "Gating rules:".bold(),

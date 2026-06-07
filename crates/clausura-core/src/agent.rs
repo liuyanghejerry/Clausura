@@ -29,7 +29,7 @@ pub struct AgentConfig<'a> {
 /// Run the bounded agent loop.
 pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, ProviderError> {
     let start = Instant::now();
-    let max_iterations: u32 = 10;
+    let max_iterations: u32 = config.contract.max_iterations;
     let mut messages = config.initial_messages;
     let mut total_usage = Usage::default();
     let mut truncated = false;
@@ -249,6 +249,7 @@ mod tests {
             timeout_secs: 60,
             ambiguity_policy: AmbiguityPolicy::FailClosed,
             gating_rules: vec![],
+            max_iterations: 10,
         }
     }
 
