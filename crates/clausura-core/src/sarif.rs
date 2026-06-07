@@ -33,7 +33,7 @@ impl SarifFormatter {
                 "tool": {
                     "driver": {
                         "name": "Clausura",
-                        "informationUri": "https://github.com/clausura/clausura"
+                        "informationUri": "https://github.com/liuyanghejerry/Clausura"
                     }
                 },
                 "results": results
