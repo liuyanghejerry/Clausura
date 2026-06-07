@@ -386,7 +386,7 @@ Five built-in tools:
 | `git_diff`    | Run `git diff` with optional base ref or staged  | Operates inside workspace only         |
 | `shell_exec`  | Execute allowed shell commands                   | Restricted to `tool_allowlist` entries |
 
-The `shell_exec` tool is locked by default (empty allowlist = no commands). Explicitly list allowed binaries to enable it. All file access is sandboxed to the workspace root.
+The `shell_exec` tool is locked by default (empty allowlist = no commands). Explicitly list allowed binaries to enable it. Commands run with `current_dir` set to the workspace root, but allowed commands can access paths outside the workspace via arguments.
 
 ### Memory snapshots (SQLite checkpoints)
 
