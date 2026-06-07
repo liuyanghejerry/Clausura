@@ -1,5 +1,6 @@
 use crate::context::ContextManager;
 use crate::provider::Provider;
+use crate::snapshot::SnapshotManager;
 use crate::tools::ToolRegistry;
 use crate::types::{Finding, FinishReason, Message, ProviderError, Role, TaskContract, Usage};
 use std::path::PathBuf;
@@ -22,12 +23,13 @@ pub struct AgentConfig<'a> {
     pub tools: &'a ToolRegistry,
     pub initial_messages: Vec<Message>,
     pub workspace_root: PathBuf,
+    pub snapshot_mgr: Option<&'a SnapshotManager>,
 }
 
 /// Run the bounded agent loop.
 pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, ProviderError> {
     let start = Instant::now();
-    let max_iterations: u32 = 10;
+    let max_iterations: u32 = config.contract.max_iterations;
     let mut messages = config.initial_messages;
     let mut total_usage = Usage::default();
     let mut truncated = false;
@@ -177,6 +179,14 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                 break;
             }
         }
+
+        // Auto-save checkpoint every N iterations for crash recovery
+        if let Some(mgr) = config.snapshot_mgr {
+            let iteration = _iteration + 1;
+            if mgr.should_auto_save(iteration) {
+                let _ = mgr.save_snapshot(&config.contract.id, &messages, truncated);
+            }
+        }
     }
 
     let last_content = messages
@@ -239,6 +249,7 @@ mod tests {
             timeout_secs: 60,
             ambiguity_policy: AmbiguityPolicy::FailClosed,
             gating_rules: vec![],
+            max_iterations: 10,
         }
     }
 
@@ -281,6 +292,7 @@ mod tests {
             tools: &tools,
             initial_messages: vec![Message::new(Role::User, "Review the diff")],
             workspace_root: root.clone(),
+            snapshot_mgr: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -305,6 +317,7 @@ mod tests {
             tools: &tools,
             initial_messages: vec![Message::new(Role::User, "Hi")],
             workspace_root: tmp.path().to_path_buf(),
+            snapshot_mgr: None,
         };
 
         let result = run_agent_loop(config).await;
@@ -360,6 +373,7 @@ mod tests {
             tools: &tools,
             initial_messages: vec![Message::new(Role::User, huge_content)],
             workspace_root: root.clone(),
+            snapshot_mgr: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -417,6 +431,7 @@ mod tests {
             tools: &tools,
             initial_messages: vec![Message::new(Role::User, "Review")],
             workspace_root: root.clone(),
+            snapshot_mgr: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -469,6 +484,7 @@ mod tests {
             tools: &tools,
             initial_messages: vec![Message::new(Role::User, huge_content)],
             workspace_root: root.clone(),
+            snapshot_mgr: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -524,6 +540,7 @@ mod tests {
             tools: &tools,
             initial_messages: vec![Message::new(Role::User, "Run git diff")],
             workspace_root: root,
+            snapshot_mgr: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();

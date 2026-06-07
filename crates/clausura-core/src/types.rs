@@ -376,6 +376,12 @@ pub struct TaskContract {
     pub ambiguity_policy: AmbiguityPolicy,
     #[serde(default)]
     pub gating_rules: Vec<GateRule>,
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+}
+
+fn default_max_iterations() -> u32 {
+    10
 }
 
 fn default_ambiguity_policy() -> AmbiguityPolicy {
@@ -412,6 +418,8 @@ pub struct ExecutionReport {
     pub snapshot_id: Option<uuid::Uuid>,
     #[serde(default)]
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub violations: Vec<RuleViolation>,
 }
 
 /// Context about the CI environment
@@ -594,6 +602,7 @@ mod tests {
             timeout_secs: 300,
             ambiguity_policy: AmbiguityPolicy::FailClosed,
             gating_rules: vec![],
+            max_iterations: 10,
         };
         assert_eq!(contract.ambiguity_policy, AmbiguityPolicy::FailClosed);
         assert!(contract.gating_rules.is_empty());
@@ -613,6 +622,7 @@ mod tests {
             duration_ms: 5000,
             snapshot_id: None,
             errors: vec![],
+            violations: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
         let deserialized: ExecutionReport = serde_json::from_str(&json).unwrap();

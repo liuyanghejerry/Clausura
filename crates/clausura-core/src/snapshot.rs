@@ -43,7 +43,7 @@ impl SnapshotManager {
     ) -> Result<Option<Snapshot>, CheckpointError> {
         let result = self.store.load(thread_id)?;
         match result {
-            Some((checkpoint_id, mut messages, truncated)) => {
+            Some((checkpoint_id, mut messages, truncated, version)) => {
                 if resume {
                     messages.push(Message::new(
                         Role::User,
@@ -54,7 +54,7 @@ impl SnapshotManager {
                     thread_id: thread_id.to_string(),
                     checkpoint_id,
                     created_at: chrono::Utc::now(),
-                    version: 1,
+                    version,
                     truncated,
                 };
                 Ok(Some(Snapshot {
@@ -75,12 +75,12 @@ impl SnapshotManager {
     ) -> Result<Option<Snapshot>, CheckpointError> {
         let result = self.store.load_at(thread_id, checkpoint_id)?;
         match result {
-            Some((messages, truncated)) => {
+            Some((messages, truncated, version)) => {
                 let meta = SnapshotMeta {
                     thread_id: thread_id.to_string(),
                     checkpoint_id: *checkpoint_id,
                     created_at: chrono::Utc::now(),
-                    version: 1,
+                    version,
                     truncated,
                 };
                 Ok(Some(Snapshot {
@@ -100,6 +100,16 @@ impl SnapshotManager {
         limit: u32,
     ) -> Result<Vec<SnapshotMeta>, CheckpointError> {
         self.store.list(thread_id, limit)
+    }
+
+    /// List snapshots across all threads.
+    pub fn list_all_snapshots(&self, limit: u32) -> Result<Vec<SnapshotMeta>, CheckpointError> {
+        self.store.list_all(limit)
+    }
+
+    /// Delete a specific checkpoint by ID.
+    pub fn delete_checkpoint(&self, checkpoint_id: &uuid::Uuid) -> Result<(), CheckpointError> {
+        self.store.delete_checkpoint(checkpoint_id)
     }
 
     /// Delete all snapshots for a thread.
@@ -238,5 +248,53 @@ mod tests {
 
         let list = manager.list_snapshots("thread-7", 10).unwrap();
         assert!(list[0].truncated);
+    }
+
+    #[test]
+    fn test_restore_propagates_version_from_db() {
+        let (manager, _tmp) = setup_manager();
+        let msgs = make_messages();
+        let cid = manager.save_snapshot("ver-thread", &msgs, false).unwrap();
+
+        let restored = manager
+            .restore_snapshot("ver-thread", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.meta.version, 1);
+
+        let restored_at = manager.restore_at("ver-thread", &cid).unwrap().unwrap();
+        assert_eq!(restored_at.meta.version, 1);
+    }
+
+    #[test]
+    fn test_delete_single_checkpoint() {
+        let (manager, _tmp) = setup_manager();
+        let cid = manager
+            .save_snapshot("del-thread", &make_messages(), false)
+            .unwrap();
+        manager.delete_checkpoint(&cid).unwrap();
+        // Should no longer be listed
+        let list = manager.list_snapshots("del-thread", 10).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_list_all_snapshots_across_threads() {
+        let (manager, _tmp) = setup_manager();
+        manager
+            .save_snapshot("t1", &make_messages(), false)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        manager.save_snapshot("t2", &make_messages(), true).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        manager
+            .save_snapshot("t1", &make_messages(), false)
+            .unwrap();
+
+        let all = manager.list_all_snapshots(10).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].thread_id, "t1");
+        assert_eq!(all[1].thread_id, "t2");
+        assert_eq!(all[2].thread_id, "t1");
     }
 }

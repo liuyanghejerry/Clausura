@@ -75,6 +75,8 @@ struct YamlTaskConfig {
     ambiguity_policy: String,
     #[serde(default)]
     gating: Vec<YamlGateRule>,
+    #[serde(default = "default_max_iterations")]
+    max_iterations: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +102,10 @@ fn default_token_budget() -> u64 {
 
 fn default_timeout() -> u64 {
     300
+}
+
+fn default_max_iterations() -> u32 {
+    10
 }
 
 fn default_ambiguity() -> String {
@@ -136,6 +142,12 @@ fn parse_gate_action(s: &str) -> GateAction {
 fn validate_yaml(yaml: &YamlConfig) -> Result<(), ConfigError> {
     if yaml.version.is_empty() {
         return Err(ConfigError::ValidationError("version is required".into()));
+    }
+    if yaml.version != "1" {
+        return Err(ConfigError::ValidationError(format!(
+            "Unsupported schema version '{}'. Expected '1'",
+            yaml.version
+        )));
     }
     if yaml.task.model.is_empty() && std::env::var("CLAUSURA_MODEL").is_err() {
         return Err(ConfigError::ValidationError(
@@ -190,6 +202,7 @@ impl Config {
         cli_api_key: Option<&str>,
         cli_token_budget: Option<u64>,
         cli_timeout: Option<u64>,
+        cli_max_iterations: Option<u32>,
         workspace: PathBuf,
         output: PathBuf,
         resume: bool,
@@ -221,43 +234,46 @@ impl Config {
                     timeout_secs: default_timeout(),
                     ambiguity_policy: default_ambiguity(),
                     gating: vec![],
+                    max_iterations: default_max_iterations(),
                 },
                 None,
             )
         };
 
-        // ---- Layer 2: CLI + environment variable overrides ----
-        let model = cli_model
-            .map(|m| m.to_string())
-            .or_else(|| std::env::var("CLAUSURA_MODEL").ok())
+        // ---- Layer 2: Environment variable + CLI overrides ----
+        let model = std::env::var("CLAUSURA_MODEL")
+            .ok()
+            .or_else(|| cli_model.map(|m| m.to_string()))
             .unwrap_or_else(|| yaml_task.model.clone());
 
-        let vendor_input = cli_vendor
-            .map(|v| v.to_string())
-            .or_else(|| std::env::var("CLAUSURA_VENDOR").ok())
+        let vendor_input = std::env::var("CLAUSURA_VENDOR")
+            .ok()
+            .or_else(|| cli_vendor.map(|v| v.to_string()))
             .unwrap_or_else(|| yaml_task.vendor.clone());
         let vendor = VendorConfig::from_name(&vendor_input);
 
-        let token_budget = cli_token_budget
-            .or_else(|| {
-                std::env::var("CLAUSURA_TOKEN_BUDGET")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-            })
+        let token_budget = std::env::var("CLAUSURA_TOKEN_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(cli_token_budget)
             .unwrap_or(yaml_task.token_budget);
 
-        let timeout = cli_timeout
-            .or_else(|| {
-                std::env::var("CLAUSURA_TIMEOUT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-            })
+        let timeout = std::env::var("CLAUSURA_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(cli_timeout)
             .unwrap_or(yaml_task.timeout_secs);
 
+        let max_iterations = std::env::var("CLAUSURA_MAX_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(cli_max_iterations)
+            .unwrap_or(yaml_task.max_iterations);
+
         // ---- Layer 3: Environment variable overrides ----
-        let api_key = cli_api_key
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("CLAUSURA_API_KEY").ok());
+        let api_key = std::env::var("CLAUSURA_API_KEY")
+            .ok()
+            .or_else(|| cli_api_key.map(|s| s.to_string()));
 
         let ambiguity_str =
             std::env::var("CLAUSURA_AMBIGUITY_POLICY").unwrap_or(yaml_task.ambiguity_policy);
@@ -293,6 +309,7 @@ impl Config {
                 timeout_secs: timeout,
                 ambiguity_policy,
                 gating_rules,
+                max_iterations,
             },
             api_key,
             workspace,
@@ -310,8 +327,12 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::VendorType;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::NamedTempFile;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn write_yaml(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -321,6 +342,8 @@ mod tests {
 
     #[test]
     fn test_valid_config_with_gating() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
         let yaml = r#"
 version: "1"
 task:
@@ -346,6 +369,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -366,6 +390,7 @@ task:
 
     #[test]
     fn test_cli_overrides_model() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let yaml = r#"
 version: "1"
 task:
@@ -384,6 +409,7 @@ task:
             None,
             Some(32000), // CLI overrides token budget
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -398,9 +424,110 @@ task:
     }
 
     #[test]
+    fn test_env_overrides_cli_model() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        unsafe { std::env::set_var("CLAUSURA_MODEL", "claude-sonnet") };
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-3.5-turbo
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            Some("gpt-4o"), // CLI model — env should override this
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.model, "claude-sonnet"); // env wins over CLI
+        unsafe { std::env::remove_var("CLAUSURA_MODEL") };
+    }
+
+    #[test]
+    fn test_env_overrides_cli_all_fields() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        unsafe {
+            std::env::set_var("CLAUSURA_MODEL", "env-model");
+            std::env::set_var("CLAUSURA_VENDOR", "deepseek");
+            std::env::set_var("CLAUSURA_TOKEN_BUDGET", "99000");
+            std::env::set_var("CLAUSURA_TIMEOUT", "600");
+            std::env::set_var("CLAUSURA_API_KEY", "sk-env-key");
+        }
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: yaml-model
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            Some("cli-model"),
+            Some("ollama"),
+            Some("sk-cli-key"),
+            Some(16000),
+            None,
+            Some(120),
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.model, "env-model");
+        assert!(matches!(
+            config.task.vendor.vendor_type,
+            VendorType::OpenAiCompatible
+        ));
+        assert_eq!(config.task.token_budget, 99000);
+        assert_eq!(config.task.timeout_secs, 600);
+        assert_eq!(config.api_key, Some("sk-env-key".to_string()));
+        unsafe {
+            std::env::remove_var("CLAUSURA_MODEL");
+            std::env::remove_var("CLAUSURA_VENDOR");
+            std::env::remove_var("CLAUSURA_TOKEN_BUDGET");
+            std::env::remove_var("CLAUSURA_TIMEOUT");
+            std::env::remove_var("CLAUSURA_API_KEY");
+        }
+    }
+
+    fn clean_env_vars() {
+        unsafe {
+            std::env::remove_var("CLAUSURA_API_KEY");
+            std::env::remove_var("CLAUSURA_MODEL");
+            std::env::remove_var("CLAUSURA_VENDOR");
+            std::env::remove_var("CLAUSURA_TOKEN_BUDGET");
+            std::env::remove_var("CLAUSURA_TIMEOUT");
+            std::env::remove_var("CLAUSURA_AMBIGUITY_POLICY");
+        }
+    }
+
+    #[test]
     fn test_env_override_api_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
         unsafe { std::env::set_var("CLAUSURA_API_KEY", "sk-test-key") };
         let config = Config::load(
+            None,
             None,
             None,
             None,
@@ -419,6 +546,8 @@ task:
 
     #[test]
     fn test_valid_config_minimal() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
         let yaml = r#"
 version: "1"
 task:
@@ -432,6 +561,7 @@ task:
         let file = write_yaml(yaml);
         let config = Config::load(
             Some(file.path()),
+            None,
             None,
             None,
             None,
@@ -456,6 +586,8 @@ task:
 
     #[test]
     fn test_missing_model_is_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
         let yaml = r#"
 version: "1"
 task:
@@ -469,6 +601,7 @@ task:
         // CLAUSURA_MODEL is also not set
         let result = Config::load(
             Some(file.path()),
+            None,
             None,
             None,
             None,
@@ -509,6 +642,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -537,6 +671,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -546,13 +681,18 @@ task:
     }
 
     #[test]
-    fn test_cli_api_key_takes_precedence_over_env() {
-        unsafe { std::env::set_var("CLAUSURA_API_KEY", "sk-env-key") };
+    fn test_env_api_key_takes_precedence_over_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        unsafe {
+            std::env::set_var("CLAUSURA_API_KEY", "sk-env-key");
+        };
         let config = Config::load(
             None,
             None,
             None,
             Some("sk-cli-key"),
+            None,
             None,
             None,
             std::env::current_dir().unwrap(),
@@ -561,7 +701,7 @@ task:
             LogFormat::Json,
         )
         .unwrap();
-        assert_eq!(config.api_key, Some("sk-cli-key".to_string()));
+        assert_eq!(config.api_key, Some("sk-env-key".to_string()));
         unsafe { std::env::remove_var("CLAUSURA_API_KEY") };
     }
 
@@ -585,12 +725,74 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
             LogFormat::Json,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_max_iterations_from_yaml() {
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  max_iterations: 5
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.max_iterations, 5);
+    }
+
+    #[test]
+    fn test_max_iterations_default_is_10() {
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.max_iterations, 10);
     }
 
     #[test]
@@ -602,6 +804,7 @@ task:
             Some("sk-test"),
             Some(16000),
             Some(120),
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -653,6 +856,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -692,6 +896,7 @@ task:
         let file = write_yaml(yaml);
         let config = Config::load(
             Some(file.path()),
+            None,
             None,
             None,
             None,
