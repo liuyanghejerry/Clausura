@@ -559,6 +559,8 @@ task:
 
     #[test]
     fn test_missing_model_is_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
         let yaml = r#"
 version: "1"
 task:
