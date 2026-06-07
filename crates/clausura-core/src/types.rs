@@ -412,6 +412,8 @@ pub struct ExecutionReport {
     pub snapshot_id: Option<uuid::Uuid>,
     #[serde(default)]
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub violations: Vec<RuleViolation>,
 }
 
 /// Context about the CI environment
@@ -613,6 +615,7 @@ mod tests {
             duration_ms: 5000,
             snapshot_id: None,
             errors: vec![],
+            violations: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
         let deserialized: ExecutionReport = serde_json::from_str(&json).unwrap();

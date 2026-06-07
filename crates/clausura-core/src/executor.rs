@@ -34,6 +34,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
                 duration_ms: start.elapsed().as_millis() as u64,
                 snapshot_id: None,
                 errors: vec![format!("Provider init error: {}", e)],
+                violations: vec![],
             };
         }
     };
@@ -51,6 +52,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
                 duration_ms: start.elapsed().as_millis() as u64,
                 snapshot_id: None,
                 errors: vec![format!("Checkpoint init error: {}", e)],
+                violations: vec![],
             };
         }
     };
@@ -79,6 +81,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         tools: &tools,
         initial_messages,
         workspace_root: config.workspace.clone(),
+        snapshot_mgr: Some(&snapshot_mgr),
     };
 
     let agent_result = match run_agent_loop(agent_config).await {
@@ -92,6 +95,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
                 duration_ms: start.elapsed().as_millis() as u64,
                 snapshot_id: None,
                 errors: vec![format!("Timeout: {}", msg)],
+                violations: vec![],
             };
         }
         Err(e) => {
@@ -103,6 +107,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
                 duration_ms: start.elapsed().as_millis() as u64,
                 snapshot_id: None,
                 errors: vec![format!("Agent error: {}", e)],
+                violations: vec![],
             };
         }
     };
@@ -121,6 +126,15 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         cleanup_archives(&config.workspace, &task_id);
     }
 
+    for v in &gate_result.violations {
+        if v.action == crate::types::GateAction::Warn {
+            eprintln!(
+                "Warning: rule '{}' violated — {} findings (max {}): {}",
+                v.rule_id, v.actual_count, v.max_allowed, v.description
+            );
+        }
+    }
+
     ExecutionReport {
         task_id,
         exit_code: gate_result.exit_code,
@@ -129,6 +143,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         duration_ms: agent_result.duration_ms,
         snapshot_id,
         errors: vec![],
+        violations: gate_result.violations,
     }
 }
 
