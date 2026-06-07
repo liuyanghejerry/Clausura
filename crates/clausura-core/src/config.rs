@@ -226,38 +226,34 @@ impl Config {
             )
         };
 
-        // ---- Layer 2: CLI + environment variable overrides ----
-        let model = cli_model
-            .map(|m| m.to_string())
-            .or_else(|| std::env::var("CLAUSURA_MODEL").ok())
+        // ---- Layer 2: Environment variable + CLI overrides ----
+        let model = std::env::var("CLAUSURA_MODEL")
+            .ok()
+            .or_else(|| cli_model.map(|m| m.to_string()))
             .unwrap_or_else(|| yaml_task.model.clone());
 
-        let vendor_input = cli_vendor
-            .map(|v| v.to_string())
-            .or_else(|| std::env::var("CLAUSURA_VENDOR").ok())
+        let vendor_input = std::env::var("CLAUSURA_VENDOR")
+            .ok()
+            .or_else(|| cli_vendor.map(|v| v.to_string()))
             .unwrap_or_else(|| yaml_task.vendor.clone());
         let vendor = VendorConfig::from_name(&vendor_input);
 
-        let token_budget = cli_token_budget
-            .or_else(|| {
-                std::env::var("CLAUSURA_TOKEN_BUDGET")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-            })
+        let token_budget = std::env::var("CLAUSURA_TOKEN_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(cli_token_budget)
             .unwrap_or(yaml_task.token_budget);
 
-        let timeout = cli_timeout
-            .or_else(|| {
-                std::env::var("CLAUSURA_TIMEOUT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-            })
+        let timeout = std::env::var("CLAUSURA_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(cli_timeout)
             .unwrap_or(yaml_task.timeout_secs);
 
         // ---- Layer 3: Environment variable overrides ----
-        let api_key = cli_api_key
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("CLAUSURA_API_KEY").ok());
+        let api_key = std::env::var("CLAUSURA_API_KEY")
+            .ok()
+            .or_else(|| cli_api_key.map(|s| s.to_string()));
 
         let ambiguity_str =
             std::env::var("CLAUSURA_AMBIGUITY_POLICY").unwrap_or(yaml_task.ambiguity_policy);
@@ -310,8 +306,12 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::VendorType;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::NamedTempFile;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn write_yaml(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -321,6 +321,8 @@ mod tests {
 
     #[test]
     fn test_valid_config_with_gating() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
         let yaml = r#"
 version: "1"
 task:
@@ -366,6 +368,7 @@ task:
 
     #[test]
     fn test_cli_overrides_model() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let yaml = r#"
 version: "1"
 task:
@@ -398,7 +401,105 @@ task:
     }
 
     #[test]
+    fn test_env_overrides_cli_model() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        unsafe { std::env::set_var("CLAUSURA_MODEL", "claude-sonnet") };
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-3.5-turbo
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            Some("gpt-4o"), // CLI model — env should override this
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.model, "claude-sonnet"); // env wins over CLI
+        unsafe { std::env::remove_var("CLAUSURA_MODEL") };
+    }
+
+    #[test]
+    fn test_env_overrides_cli_all_fields() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        unsafe {
+            std::env::set_var("CLAUSURA_MODEL", "env-model");
+            std::env::set_var("CLAUSURA_VENDOR", "deepseek");
+            std::env::set_var("CLAUSURA_TOKEN_BUDGET", "99000");
+            std::env::set_var("CLAUSURA_TIMEOUT", "600");
+            std::env::set_var("CLAUSURA_API_KEY", "sk-env-key");
+        }
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: yaml-model
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            Some("cli-model"),
+            Some("ollama"),
+            Some("sk-cli-key"),
+            Some(16000),
+            Some(120),
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.model, "env-model");
+        assert!(matches!(
+            config.task.vendor.vendor_type,
+            VendorType::OpenAiCompatible
+        ));
+        assert_eq!(config.task.token_budget, 99000);
+        assert_eq!(config.task.timeout_secs, 600);
+        assert_eq!(config.api_key, Some("sk-env-key".to_string()));
+        unsafe {
+            std::env::remove_var("CLAUSURA_MODEL");
+            std::env::remove_var("CLAUSURA_VENDOR");
+            std::env::remove_var("CLAUSURA_TOKEN_BUDGET");
+            std::env::remove_var("CLAUSURA_TIMEOUT");
+            std::env::remove_var("CLAUSURA_API_KEY");
+        }
+    }
+
+    fn clean_env_vars() {
+        unsafe {
+            std::env::remove_var("CLAUSURA_API_KEY");
+            std::env::remove_var("CLAUSURA_MODEL");
+            std::env::remove_var("CLAUSURA_VENDOR");
+            std::env::remove_var("CLAUSURA_TOKEN_BUDGET");
+            std::env::remove_var("CLAUSURA_TIMEOUT");
+            std::env::remove_var("CLAUSURA_AMBIGUITY_POLICY");
+        }
+    }
+
+    #[test]
     fn test_env_override_api_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
         unsafe { std::env::set_var("CLAUSURA_API_KEY", "sk-test-key") };
         let config = Config::load(
             None,
@@ -419,6 +520,8 @@ task:
 
     #[test]
     fn test_valid_config_minimal() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
         let yaml = r#"
 version: "1"
 task:
@@ -546,8 +649,11 @@ task:
     }
 
     #[test]
-    fn test_cli_api_key_takes_precedence_over_env() {
-        unsafe { std::env::set_var("CLAUSURA_API_KEY", "sk-env-key") };
+    fn test_env_api_key_takes_precedence_over_cli() {
+        unsafe {
+            std::env::remove_var("CLAUSURA_API_KEY");
+            std::env::set_var("CLAUSURA_API_KEY", "sk-env-key");
+        };
         let config = Config::load(
             None,
             None,
@@ -561,7 +667,7 @@ task:
             LogFormat::Json,
         )
         .unwrap();
-        assert_eq!(config.api_key, Some("sk-cli-key".to_string()));
+        assert_eq!(config.api_key, Some("sk-env-key".to_string()));
         unsafe { std::env::remove_var("CLAUSURA_API_KEY") };
     }
 
