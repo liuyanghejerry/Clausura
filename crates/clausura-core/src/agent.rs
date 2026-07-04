@@ -215,16 +215,40 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 /// Extract findings from a completed agent response.
 ///
 /// The response is expected to be a JSON object `{"findings": [...]}` (a bare
-/// top-level JSON array is also tolerated). Every element of the array MUST
-/// deserialize into a `Finding` — if the content isn't valid JSON at all, or
-/// if one or more elements fail schema validation, this returns `Err` with a
-/// diagnostic rather than silently dropping the offending elements. A schema
-/// mismatch between what a task's prompt asks the model to emit and what
-/// `Finding` actually requires must fail loudly: silently treating it as "no
-/// findings" would let a real violation slip through CI gating undetected.
+/// top-level JSON array is also tolerated). If the whole response isn't
+/// valid JSON on its own — e.g. the model prefixed its answer with a
+/// reasoning sentence, or wrapped it in a markdown code fence despite being
+/// told not to — the last top-level balanced `{...}`/`[...]` block in the
+/// text is recovered and parsed instead; models very commonly emit their
+/// real final answer last, after any reasoning prose.
+///
+/// Every element of the resulting array MUST deserialize into a `Finding` —
+/// if no JSON can be recovered at all, or if one or more elements fail
+/// schema validation, this returns `Err` with a diagnostic rather than
+/// silently dropping the offending elements. A schema mismatch between what
+/// a task's prompt asks the model to emit and what `Finding` actually
+/// requires must fail loudly: silently treating it as "no findings" would
+/// let a real violation slip through CI gating undetected. Tolerating
+/// incidental prose/fences around otherwise-valid JSON is a separate,
+/// narrower concession — it does not weaken that guarantee.
 fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
-    let json: serde_json::Value = serde_json::from_str(content)
-        .map_err(|e| format!("agent response is not valid JSON ({e}):\n{content}"))?;
+    let trimmed = content.trim();
+
+    let json: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(first_err) => {
+            let recovered = find_last_balanced_block(trimmed, '{', '}')
+                .or_else(|| find_last_balanced_block(trimmed, '[', ']'))
+                .and_then(|block| serde_json::from_str::<serde_json::Value>(block).ok());
+
+            recovered.ok_or_else(|| {
+                format!(
+                    "agent response is not valid JSON ({first_err}) and no embedded \
+                     JSON object/array could be recovered:\n{content}"
+                )
+            })?
+        }
+    };
 
     // Accept either {"findings": [...]} or a bare top-level [...] array.
     let findings_value = json.get("findings").cloned().unwrap_or(json);
@@ -251,6 +275,50 @@ fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
     }
 
     Ok(parsed)
+}
+
+/// Find the last top-level balanced `open`/`close` delimited block in `s`
+/// (e.g. `'{'`/`'}'` or `'['`/`']'`), respecting JSON string literals so
+/// delimiters inside quoted strings don't confuse the matcher. Used to
+/// recover a JSON value embedded in surrounding prose or markdown fences.
+fn find_last_balanced_block(s: &str, open: char, close: char) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start: Option<usize> = None;
+    let mut last_block: Option<(usize, usize)> = None;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        let c = b as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+        } else if c == open {
+            if depth == 0 {
+                start = Some(i);
+            }
+            depth += 1;
+        } else if c == close && depth > 0 {
+            depth -= 1;
+            if depth == 0 {
+                if let Some(st) = start {
+                    last_block = Some((st, i + 1));
+                }
+            }
+        }
+    }
+
+    last_block.map(|(st, en)| &s[st..en])
 }
 
 /// Best-effort variant of [`extract_findings`] for use when the agent loop
@@ -640,6 +708,61 @@ mod tests {
     fn test_extract_findings_invalid_json_is_error() {
         let err = extract_findings("not json at all").unwrap_err();
         assert!(err.contains("not valid JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn test_extract_findings_recovers_json_after_reasoning_prose() {
+        // Real observed model behavior: an explanation sentence, a blank
+        // line, then the actual JSON answer. The whole response isn't valid
+        // JSON on its own, but the trailing JSON block should be recovered.
+        let content = "Both candidates are pre-existing `as any` casts that \
+             already existed before this diff, so nothing new was introduced.\n\n\
+             {\"findings\": []}";
+        let findings = extract_findings(content).expect("should recover trailing JSON");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_extract_findings_recovers_json_from_markdown_fence() {
+        let content = "```json\n{\"findings\": [{\"id\": \"00000000-0000-0000-0000-000000000000\", \"rule_id\": \"r\", \"severity\": \"error\", \"message\": \"m\", \"evidence\": \"e\"}]}\n```";
+        let findings = extract_findings(content).expect("should recover fenced JSON");
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_findings_recovered_json_still_enforces_schema() {
+        // Recovering JSON from surrounding prose must NOT weaken schema
+        // validation of the findings inside it -- this is the regression
+        // the original fix targeted.
+        let content = "Here is my answer:\n\n\
+             {\"findings\": [{\"rule_id\": \"no-new-any\", \"severity\": \"error\", \"file\": \"a.ts\", \"line\": 1, \"title\": \"t\"}]}";
+        let err = extract_findings(content).unwrap_err();
+        assert!(err.contains("1 of 1 finding(s) failed"), "got: {err}");
+    }
+
+    #[test]
+    fn test_extract_findings_no_recoverable_json_is_still_error() {
+        let err = extract_findings("I looked at the diff and found nothing notable.").unwrap_err();
+        assert!(err.contains("no embedded JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn test_find_last_balanced_block_ignores_braces_in_strings() {
+        let s = r#"prose with a "{not a real block}" quoted aside {"real": "block"}"#;
+        let block = find_last_balanced_block(s, '{', '}').unwrap();
+        assert_eq!(block, r#"{"real": "block"}"#);
+    }
+
+    #[test]
+    fn test_find_last_balanced_block_picks_last_of_several() {
+        let s = r#"{"first": 1} then later {"second": 2}"#;
+        let block = find_last_balanced_block(s, '{', '}').unwrap();
+        assert_eq!(block, r#"{"second": 2}"#);
+    }
+
+    #[test]
+    fn test_find_last_balanced_block_none_when_absent() {
+        assert!(find_last_balanced_block("no braces here", '{', '}').is_none());
     }
 
     #[test]
