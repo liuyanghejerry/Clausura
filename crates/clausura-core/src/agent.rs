@@ -119,7 +119,8 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                     response.message.content.clone(),
                 ));
 
-                let findings = extract_findings(&response.message.content);
+                let findings = extract_findings(&response.message.content)
+                    .map_err(ProviderError::MalformedFindings)?;
                 return Ok(AgentResult {
                     messages,
                     findings,
@@ -196,7 +197,11 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         .map(|m| m.content.clone())
         .unwrap_or_default();
 
-    let findings = extract_findings(&last_content);
+    // The loop exited without a clean `Stop` (timeout/truncation/iteration cap),
+    // so there is no complete final answer to hold to the strict schema below.
+    // Best-effort extraction with a warning is appropriate here; `truncated`
+    // already signals to the caller that this result may be incomplete.
+    let findings = extract_findings_lenient(&last_content);
 
     Ok(AgentResult {
         messages,
@@ -207,25 +212,61 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
     })
 }
 
-/// Extract findings from agent output JSON.
-/// Tries to parse the content as JSON and extract a `findings` array.
-/// If that fails, returns an empty vec.
-fn extract_findings(content: &str) -> Vec<Finding> {
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
-        if let Some(findings) = json.get("findings").and_then(|f| f.as_array()) {
-            let parsed: Vec<Finding> = findings
-                .iter()
-                .filter_map(|f| serde_json::from_value(f.clone()).ok())
-                .collect();
-            if !parsed.is_empty() {
-                return parsed;
-            }
-        }
-        if let Ok(findings) = serde_json::from_value::<Vec<Finding>>(json) {
-            return findings;
+/// Extract findings from a completed agent response.
+///
+/// The response is expected to be a JSON object `{"findings": [...]}` (a bare
+/// top-level JSON array is also tolerated). Every element of the array MUST
+/// deserialize into a `Finding` — if the content isn't valid JSON at all, or
+/// if one or more elements fail schema validation, this returns `Err` with a
+/// diagnostic rather than silently dropping the offending elements. A schema
+/// mismatch between what a task's prompt asks the model to emit and what
+/// `Finding` actually requires must fail loudly: silently treating it as "no
+/// findings" would let a real violation slip through CI gating undetected.
+fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
+    let json: serde_json::Value = serde_json::from_str(content)
+        .map_err(|e| format!("agent response is not valid JSON ({e}):\n{content}"))?;
+
+    // Accept either {"findings": [...]} or a bare top-level [...] array.
+    let findings_value = json.get("findings").cloned().unwrap_or(json);
+    let elements = findings_value
+        .as_array()
+        .ok_or_else(|| format!("expected a `findings` array, got: {findings_value}"))?;
+
+    let mut parsed = Vec::with_capacity(elements.len());
+    let mut errors = Vec::new();
+    for (i, el) in elements.iter().enumerate() {
+        match serde_json::from_value::<Finding>(el.clone()) {
+            Ok(f) => parsed.push(f),
+            Err(e) => errors.push(format!("findings[{i}]: {e} (raw: {el})")),
         }
     }
-    Vec::new()
+
+    if !errors.is_empty() {
+        return Err(format!(
+            "{} of {} finding(s) failed to match the Finding schema:\n{}",
+            errors.len(),
+            elements.len(),
+            errors.join("\n")
+        ));
+    }
+
+    Ok(parsed)
+}
+
+/// Best-effort variant of [`extract_findings`] for use when the agent loop
+/// did not reach a clean `Stop` response. Logs a warning instead of failing
+/// the task, since there is no complete final answer here to hold to the
+/// strict schema.
+fn extract_findings_lenient(content: &str) -> Vec<Finding> {
+    match extract_findings(content) {
+        Ok(findings) => findings,
+        Err(e) => {
+            if !content.trim().is_empty() {
+                eprintln!("Warning: could not extract findings from incomplete agent output: {e}");
+            }
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -568,5 +609,111 @@ mod tests {
                 "tool_call_id should match the assistant's tool call id"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // extract_findings / extract_findings_lenient
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_extract_findings_valid() {
+        let content = r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "test finding", "evidence": "test"}]}"#;
+        let findings = extract_findings(content).expect("should parse");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "test");
+    }
+
+    #[test]
+    fn test_extract_findings_empty_is_ok() {
+        let findings = extract_findings(r#"{"findings": []}"#).expect("should parse");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_extract_findings_bare_array_fallback() {
+        let content = r#"[{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "error", "message": "m", "evidence": "e"}]"#;
+        let findings = extract_findings(content).expect("should parse");
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_findings_invalid_json_is_error() {
+        let err = extract_findings("not json at all").unwrap_err();
+        assert!(err.contains("not valid JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn test_extract_findings_schema_mismatch_is_error_not_silently_dropped() {
+        // Old field names (file/line/title/description) instead of the real
+        // Finding schema (id/message/evidence/location) -- this is exactly
+        // the painttyServer bug: every element fails to deserialize, and
+        // that must surface as an error, not as an empty, "successful" result.
+        let content = r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t", "description": "d", "recommendation": "r"}]}"#;
+        let err = extract_findings(content).unwrap_err();
+        assert!(err.contains("1 of 1 finding(s) failed"), "got: {err}");
+        assert!(err.contains("findings[0]"), "got: {err}");
+    }
+
+    #[test]
+    fn test_extract_findings_partial_schema_mismatch_is_error() {
+        // One valid finding and one malformed one: the malformed one must
+        // not be silently dropped just because its sibling parsed fine.
+        let content = r#"{"findings": [
+            {"id": "00000000-0000-0000-0000-000000000000", "rule_id": "ok", "severity": "error", "message": "m", "evidence": "e"},
+            {"rule_id": "bad", "severity": "error", "file": "a.ts", "line": 1, "title": "t"}
+        ]}"#;
+        let err = extract_findings(content).unwrap_err();
+        assert!(err.contains("1 of 2 finding(s) failed"), "got: {err}");
+    }
+
+    #[test]
+    fn test_extract_findings_lenient_swallows_errors() {
+        // Used only for the incomplete-loop fallback path: never panics,
+        // never propagates, just returns empty on anything malformed.
+        assert!(extract_findings_lenient("not json").is_empty());
+        assert!(extract_findings_lenient("").is_empty());
+        assert!(
+            extract_findings_lenient(r#"{"findings": [{"rule_id": "bad", "file": "a.ts"}]}"#)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_errors_on_schema_mismatch_instead_of_empty_findings() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[]);
+
+        let mut mock = MockProvider::new("gpt-4o");
+        mock.add_response(ChatResponse {
+            message: Message::new(
+                Role::Assistant,
+                r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t", "description": "d"}]}"#.to_string(),
+            ),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let contract = test_contract();
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root,
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await;
+        let err = result.expect_err(
+            "a Stop response with findings that fail schema validation must error, \
+             not silently succeed with 0 findings",
+        );
+        assert!(matches!(err, ProviderError::MalformedFindings(_)));
     }
 }

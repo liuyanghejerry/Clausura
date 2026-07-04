@@ -448,6 +448,8 @@ pub enum ProviderError {
     NetworkError(#[from] reqwest::Error),
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
+    #[error("Agent response did not match the expected findings schema: {0}")]
+    MalformedFindings(String),
 }
 
 /// Error types for tool operations
