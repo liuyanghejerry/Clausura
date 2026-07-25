@@ -373,6 +373,8 @@ mod tests {
             tool_allowlist: vec!["git".into()],
             token_budget: 100000,
             timeout_secs: 60,
+            shell_timeout_secs: 120,
+            shell_env_passthrough: vec![],
             ambiguity_policy: AmbiguityPolicy::FailClosed,
             gating_rules: vec![],
             max_iterations: 10,
@@ -384,7 +386,7 @@ mod tests {
     async fn test_agent_loop_with_tool_calls() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[]);
 
         let mut mock = MockProvider::new("gpt-4o");
         mock.add_response(ChatResponse {
@@ -430,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn test_agent_loop_halts_on_timeout() {
         let tmp = TempDir::new().unwrap();
-        let tools = default_tools(tmp.path().to_path_buf(), &[]);
+        let tools = default_tools(tmp.path().to_path_buf(), &[], 120, &[]);
 
         let mut mock = MockProvider::new("slow-model");
         mock.add_slow_response(Duration::from_secs(10));
@@ -460,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn test_agent_loop_truncates_on_budget_exceeded() {
         let (_tmp, root) = setup_agent_env();
-        let tools = default_tools(root.clone(), &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[]);
 
         let mut contract = test_contract();
         contract.token_budget = 10000;
@@ -531,7 +533,7 @@ mod tests {
     #[tokio::test]
     async fn test_agent_loop_breaks_when_cannot_truncate() {
         let (_tmp, root) = setup_agent_env();
-        let tools = default_tools(root.clone(), &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[]);
 
         let mut contract = test_contract();
         contract.token_budget = 1;
@@ -571,7 +573,7 @@ mod tests {
     #[tokio::test]
     async fn test_hint_message_injected_after_truncation() {
         let (_tmp, root) = setup_agent_env();
-        let tools = default_tools(root.clone(), &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[]);
 
         let mut contract = test_contract();
         contract.token_budget = 10000;
@@ -685,7 +687,7 @@ mod tests {
     async fn test_agent_loop_propagates_tool_call_id() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[]);
 
         let mut mock = MockProvider::new("gpt-4o");
         mock.add_response(ChatResponse {
@@ -879,7 +881,7 @@ mod tests {
     async fn test_agent_loop_errors_on_schema_mismatch_instead_of_empty_findings() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[]);
 
         let mut mock = MockProvider::new("gpt-4o");
         mock.add_response(ChatResponse {

@@ -35,6 +35,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub max_iterations: Option<u32>,
 
+    /// Per-command timeout for shell_exec in seconds
+    #[arg(long)]
+    pub shell_timeout: Option<u64>,
+
     /// Workspace root
     #[arg(long)]
     pub workspace: Option<PathBuf>,
@@ -97,6 +101,7 @@ pub async fn execute(args: RunArgs) -> i32 {
         args.token_budget,
         args.timeout,
         args.max_iterations,
+        args.shell_timeout,
         workspace,
         output,
         args.resume,

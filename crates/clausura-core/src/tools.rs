@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 // ---------------------------------------------------------------------------
@@ -320,34 +321,160 @@ impl Tool for GitDiffTool {
 pub struct ShellExecTool {
     workspace_root: PathBuf,
     allowlist: Vec<String>,
+    shell_timeout_secs: u64,
+    shell_env_passthrough: Vec<String>,
 }
 
-impl ShellExecTool {
-    pub fn new(workspace_root: PathBuf, allowlist: Vec<String>) -> Self {
-        Self {
-            workspace_root,
-            allowlist,
+/// Per-program dangerous-flag denylist, keyed by the basename of argv[0].
+/// Layered on top of the allowlist: a command must pass both checks.
+const DANGEROUS_FLAGS: &[(&str, &[&str])] = &[
+    ("git", &["-c", "--exec-path", "--git-dir", "--work-tree"]),
+    ("tar", &["--checkpoint-action", "--to-command"]),
+];
+
+/// Environment variable names that must never reach a spawned command.
+fn is_secret_env_name(name: &str) -> bool {
+    name == "CLAUSURA_API_KEY"
+        || ["_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
+/// Build the child process environment from scratch (deny-by-default).
+/// Anything not explicitly added here is dropped via `env_clear` — loader
+/// hijack vars (LD_*, DYLD_*), runtime injection vars (BASH_ENV, RUSTFLAGS),
+/// git attack surface (GIT_SSH_COMMAND, GIT_CONFIG_*), SSH_AUTH_SOCK, etc.
+fn build_child_env(
+    passthrough: &[String],
+    lookup: impl Fn(&str) -> Option<String>,
+    home_cargo_bin_exists: bool,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+
+    // Fixed PATH (no PATH hijacking); rustup installs cargo under ~/.cargo/bin.
+    let mut path = "/usr/local/bin:/usr/bin:/bin".to_string();
+    if home_cargo_bin_exists {
+        if let Some(home) = lookup("HOME") {
+            path = format!("{}:{}/.cargo/bin", path, home);
+        }
+    }
+    env.push(("PATH".to_string(), path));
+
+    // Minimal keep-list forwarded from the parent environment when present.
+    for name in ["HOME", "TERM", "LANG", "TMPDIR", "CI"] {
+        if let Some(value) = lookup(name) {
+            env.push((name.to_string(), value));
         }
     }
 
-    fn check_allowed(&self, program: &str) -> Result<(), ToolError> {
+    // User-requested passthrough: exact names only; secret-shaped names are
+    // refused (fail closed).
+    for name in passthrough {
+        if is_secret_env_name(name) {
+            tracing::warn!(
+                "shell_env_passthrough: refusing secret-looking variable '{}'",
+                name
+            );
+            continue;
+        }
+        if let Some(value) = lookup(name) {
+            env.push((name.clone(), value));
+        }
+    }
+
+    // Safety overrides we always set ourselves.
+    for (name, value) in [
+        ("GIT_PAGER", "cat"),
+        ("PAGER", "cat"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_EDITOR", ":"),
+        ("EDITOR", ":"),
+    ] {
+        env.push((name.to_string(), value.to_string()));
+    }
+
+    env
+}
+
+impl ShellExecTool {
+    pub fn new(
+        workspace_root: PathBuf,
+        allowlist: Vec<String>,
+        shell_timeout_secs: u64,
+        shell_env_passthrough: Vec<String>,
+    ) -> Self {
+        Self {
+            workspace_root,
+            allowlist,
+            shell_timeout_secs,
+            shell_env_passthrough,
+        }
+    }
+
+    /// Allowlist entries are argv prefixes split on whitespace: an invocation
+    /// is allowed when its leading tokens equal a rule's tokens. A bare
+    /// program name is a length-1 prefix. The first token also matches by
+    /// basename, so "/usr/bin/git" satisfies a "git" rule; remaining rule
+    /// tokens compare literally.
+    fn check_allowed(&self, argv: &[String]) -> Result<(), ToolError> {
         if self.allowlist.is_empty() {
             return Err(ToolError::SandboxViolation(
                 "No commands allowed (empty allowlist)".into(),
             ));
         }
-        // Check both the raw token and its basename to support "/usr/bin/git" style
+        let program = &argv[0];
         let basename = Path::new(program)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(program);
-        let allowed = self.allowlist.contains(&program.to_string())
-            || self.allowlist.contains(&basename.to_string());
+        let allowed = self.allowlist.iter().any(|rule| {
+            let tokens: Vec<&str> = rule.split_whitespace().collect();
+            if tokens.is_empty() || argv.len() < tokens.len() {
+                return false;
+            }
+            if tokens[0] != program && tokens[0] != basename {
+                return false;
+            }
+            argv[1..tokens.len()] == tokens[1..]
+        });
         if !allowed {
             return Err(ToolError::SandboxViolation(format!(
                 "Command not in allowlist: {} (basename: {}). Allowed: {:?}",
                 program, basename, self.allowlist
             )));
+        }
+        Ok(())
+    }
+
+    /// Reject known-dangerous flags for known-risky programs. Scanning stops
+    /// at the first `--` token; tokens after it are operands.
+    fn check_dangerous_flags(&self, argv: &[String]) -> Result<(), ToolError> {
+        let basename = Path::new(&argv[0])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&argv[0]);
+        let flags = match DANGEROUS_FLAGS.iter().find(|(name, _)| *name == basename) {
+            Some((_, flags)) => flags,
+            None => return Ok(()),
+        };
+        for token in &argv[1..] {
+            if token == "--" {
+                break;
+            }
+            for flag in *flags {
+                let denied = if flag.starts_with("--") {
+                    token == flag || token.starts_with(&format!("{}=", flag))
+                } else {
+                    token == flag || (token.starts_with(flag) && !token.starts_with("--"))
+                };
+                if denied {
+                    return Err(ToolError::SandboxViolation(format!(
+                        "Flag '{}' is not allowed for '{}' (saw '{}')",
+                        flag, basename, token
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -393,14 +520,48 @@ impl Tool for ShellExecTool {
             .split_first()
             .ok_or_else(|| ToolError::ExecutionFailed("'argv' must not be empty".into()))?;
 
-        self.check_allowed(program)?;
+        self.check_allowed(&argv)?;
+        self.check_dangerous_flags(&argv)?;
 
-        let output = tokio::process::Command::new(program)
+        let home_cargo_bin_exists = std::env::var("HOME")
+            .map(|home| Path::new(&home).join(".cargo/bin").is_dir())
+            .unwrap_or(false);
+        let child_env = build_child_env(
+            &self.shell_env_passthrough,
+            |name| std::env::var(name).ok(),
+            home_cargo_bin_exists,
+        );
+
+        let child = tokio::process::Command::new(program)
             .args(rest)
             .current_dir(&self.workspace_root)
-            .output()
-            .await
+            .env_clear()
+            .envs(child_env)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // Ensures the child is killed if the wait future is dropped on timeout.
+            .kill_on_drop(true)
+            .spawn()
             .map_err(|e| ToolError::ExecutionFailed(format!("Shell error: {}", e)))?;
+
+        let output = match tokio::time::timeout(
+            Duration::from_secs(self.shell_timeout_secs),
+            child.wait_with_output(),
+        )
+        .await
+        {
+            Ok(result) => {
+                result.map_err(|e| ToolError::ExecutionFailed(format!("Shell error: {}", e)))?
+            }
+            Err(_) => {
+                // Timed out: dropping the wait future drops the child handle,
+                // and kill_on_drop(true) kills the process.
+                return Ok(format!(
+                    "Command timed out after {}s and was killed",
+                    self.shell_timeout_secs
+                ));
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -858,13 +1019,20 @@ impl Tool for GrepTool {
 
 /// Create the default set of tools for the given workspace root.
 /// If allowlist is empty, shell_exec is disabled (no commands allowed).
-pub fn default_tools(workspace_root: PathBuf, allowlist: &[String]) -> ToolRegistry {
+pub fn default_tools(
+    workspace_root: PathBuf,
+    allowlist: &[String],
+    shell_timeout_secs: u64,
+    shell_env_passthrough: &[String],
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(ReadFileTool::new(workspace_root.clone()));
     registry.register(GitDiffTool::new(workspace_root.clone()));
     registry.register(ShellExecTool::new(
         workspace_root.clone(),
         allowlist.to_vec(),
+        shell_timeout_secs,
+        shell_env_passthrough.to_vec(),
     ));
     registry.register(ListFilesTool::new(workspace_root.clone()));
     registry.register(GrepTool::new(workspace_root));
@@ -1256,7 +1424,7 @@ mod tests {
     async fn test_shell_exec_allowed_command() {
         let (_tmp, root) = setup_workspace();
         let allowlist = vec!["git".into(), "grep".into()];
-        let tool = ShellExecTool::new(root, allowlist);
+        let tool = ShellExecTool::new(root, allowlist, 120, vec![]);
 
         let result = tool
             .execute(serde_json::json!({"argv": ["git", "status"]}))
@@ -1268,7 +1436,7 @@ mod tests {
     async fn test_shell_exec_denied_command() {
         let (_tmp, root) = setup_workspace();
         let allowlist = vec!["git".into(), "grep".into()];
-        let tool = ShellExecTool::new(root, allowlist);
+        let tool = ShellExecTool::new(root, allowlist, 120, vec![]);
 
         let result = tool
             .execute(serde_json::json!({"argv": ["rm", "-rf", "/"]}))
@@ -1280,7 +1448,7 @@ mod tests {
     async fn test_shell_exec_empty_allowlist() {
         let (_tmp, root) = setup_workspace();
         let allowlist: Vec<String> = vec![];
-        let tool = ShellExecTool::new(root, allowlist);
+        let tool = ShellExecTool::new(root, allowlist, 120, vec![]);
 
         let result = tool.execute(serde_json::json!({"argv": ["ls"]})).await;
         assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
@@ -1290,7 +1458,7 @@ mod tests {
     async fn test_shell_exec_missing_arg() {
         let (_tmp, root) = setup_workspace();
         let allowlist = vec!["git".into()];
-        let tool = ShellExecTool::new(root, allowlist);
+        let tool = ShellExecTool::new(root, allowlist, 120, vec![]);
 
         let result = tool.execute(serde_json::json!({})).await;
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
@@ -1300,7 +1468,7 @@ mod tests {
     async fn test_shell_exec_empty_argv() {
         let (_tmp, root) = setup_workspace();
         let allowlist = vec!["git".into()];
-        let tool = ShellExecTool::new(root, allowlist);
+        let tool = ShellExecTool::new(root, allowlist, 120, vec![]);
 
         let result = tool.execute(serde_json::json!({"argv": []})).await;
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
@@ -1309,17 +1477,18 @@ mod tests {
     #[tokio::test]
     async fn test_shell_exec_no_shell_injection() {
         let (_tmp, root) = setup_workspace();
-        let allowlist = vec!["echo".into()];
-        let tool = ShellExecTool::new(root.clone(), allowlist);
+        let allowlist = vec!["git".into()];
+        let tool = ShellExecTool::new(root.clone(), allowlist, 120, vec![]);
 
         // Metacharacters must be passed through as literal argv elements,
-        // not interpreted by a shell.
+        // not interpreted by a shell. git rejects the whole string as an
+        // unknown subcommand and echoes it back in its error message.
         let result = tool
-            .execute(serde_json::json!({"argv": ["echo", "hello; touch INJECTION_MARKER"]}))
+            .execute(serde_json::json!({"argv": ["git", "status; touch INJECTION_MARKER"]}))
             .await
             .unwrap();
         assert!(
-            result.contains("hello; touch INJECTION_MARKER"),
+            result.contains("status; touch INJECTION_MARKER"),
             "Expected literal metacharacters in output, got: {}",
             result
         );
@@ -1329,11 +1498,13 @@ mod tests {
         );
     }
 
+    // echo is a shell builtin on Windows, not an executable — unix only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_shell_exec_output_truncation() {
         let (_tmp, root) = setup_workspace();
         let allowlist = vec!["echo".into()];
-        let tool = ShellExecTool::new(root, allowlist);
+        let tool = ShellExecTool::new(root, allowlist, 120, vec![]);
 
         // 40 KB single argument → output exceeds the 32KB limit
         let big = "x".repeat(40 * 1024);
@@ -1576,7 +1747,7 @@ mod tests {
     #[test]
     fn test_default_tools_contains_all() {
         let (_tmp, root) = setup_workspace();
-        let registry = default_tools(root, &[]);
+        let registry = default_tools(root, &[], 120, &[]);
         let defs = registry.list_definitions();
         assert_eq!(defs.len(), 5);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
@@ -1895,7 +2066,7 @@ mod tests {
         let (_tmp, root) = setup_workspace();
         // Allowlist has "git", command uses "/usr/bin/git style"
         let allowlist = vec!["git".into()];
-        let tool = ShellExecTool::new(root, allowlist);
+        let tool = ShellExecTool::new(root, allowlist, 120, vec![]);
 
         // /usr/bin/git should match because basename is "git"
         let result = tool
@@ -1908,7 +2079,7 @@ mod tests {
     async fn test_shell_exec_rejects_path_traversal_in_command() {
         let (_tmp, root) = setup_workspace();
         let allowlist = vec!["cat".into()];
-        let tool = ShellExecTool::new(root, allowlist);
+        let tool = ShellExecTool::new(root, allowlist, 120, vec![]);
 
         // Even though "cat" is in allowlist, /etc/passwd access should be blocked
         // by the shell's own sandboxing (workspace root). But the allowlist check
@@ -1919,6 +2090,288 @@ mod tests {
         assert!(
             matches!(result, Err(ToolError::SandboxViolation(_))),
             "Should reject /etc/passwd command"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ShellExecTool prefix-rule tests
+    // -----------------------------------------------------------------------
+
+    fn argv(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_prefix_rule_allows_subcommand_tree() {
+        let (_tmp, root) = setup_workspace();
+        let tool = ShellExecTool::new(root, vec!["git status".into()], 120, vec![]);
+
+        assert!(tool.check_allowed(&argv(&["git", "status"])).is_ok());
+        assert!(tool
+            .check_allowed(&argv(&["git", "status", "--short"]))
+            .is_ok());
+        assert!(matches!(
+            tool.check_allowed(&argv(&["git", "log"])),
+            Err(ToolError::SandboxViolation(_))
+        ));
+        // argv shorter than the rule prefix never matches
+        assert!(matches!(
+            tool.check_allowed(&argv(&["git"])),
+            Err(ToolError::SandboxViolation(_))
+        ));
+    }
+
+    #[test]
+    fn test_prefix_rule_basename_matches_first_token_only() {
+        let (_tmp, root) = setup_workspace();
+        let tool = ShellExecTool::new(root, vec!["git status".into()], 120, vec![]);
+
+        // Basename convenience applies to argv[0]
+        assert!(tool
+            .check_allowed(&argv(&["/usr/bin/git", "status"]))
+            .is_ok());
+        // ...but not to later tokens: argv[0] must match the rule's first token
+        assert!(matches!(
+            tool.check_allowed(&argv(&["echo", "git", "status"])),
+            Err(ToolError::SandboxViolation(_))
+        ));
+    }
+
+    #[test]
+    fn test_bare_program_name_allows_any_subcommand() {
+        let (_tmp, root) = setup_workspace();
+        // Backward compatible: a bare name is a length-1 prefix
+        let tool = ShellExecTool::new(root, vec!["git".into()], 120, vec![]);
+
+        assert!(tool.check_allowed(&argv(&["git"])).is_ok());
+        assert!(tool.check_allowed(&argv(&["git", "log"])).is_ok());
+        assert!(tool
+            .check_allowed(&argv(&["git", "config", "--global", "x", "y"]))
+            .is_ok());
+        assert!(matches!(
+            tool.check_allowed(&argv(&["grep", "foo"])),
+            Err(ToolError::SandboxViolation(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // ShellExecTool dangerous-flag denylist tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_denylist_git_dash_c() {
+        let (_tmp, root) = setup_workspace();
+        let tool = ShellExecTool::new(root, vec!["git".into()], 120, vec![]);
+
+        for tokens in [
+            &["git", "-c", "alias.x=!id", "status"][..],
+            &["git", "-calias.x=!id", "status"][..],
+            &["git", "--exec-path=/tmp", "status"][..],
+            &["git", "--exec-path", "/tmp", "status"][..],
+            &["git", "--git-dir", "/tmp/x", "status"][..],
+            &["git", "--work-tree=/tmp", "status"][..],
+        ] {
+            let result = tool.check_dangerous_flags(&argv(tokens));
+            assert!(
+                matches!(result, Err(ToolError::SandboxViolation(_))),
+                "argv {:?} should be denied",
+                tokens
+            );
+        }
+    }
+
+    #[test]
+    fn test_denylist_stops_at_double_dash() {
+        let (_tmp, root) = setup_workspace();
+        let tool = ShellExecTool::new(root, vec!["git".into()], 120, vec![]);
+
+        // Tokens after `--` are operands, not flags
+        assert!(tool
+            .check_dangerous_flags(&argv(&["git", "log", "--", "-c"]))
+            .is_ok());
+        assert!(tool
+            .check_dangerous_flags(&argv(&["git", "status"]))
+            .is_ok());
+    }
+
+    #[test]
+    fn test_denylist_tar_checkpoint_action() {
+        let (_tmp, root) = setup_workspace();
+        let tool = ShellExecTool::new(root, vec!["tar".into()], 120, vec![]);
+
+        assert!(matches!(
+            tool.check_dangerous_flags(&argv(&[
+                "tar",
+                "--checkpoint-action=exec=sh",
+                "-cf",
+                "x.tar"
+            ])),
+            Err(ToolError::SandboxViolation(_))
+        ));
+        assert!(matches!(
+            tool.check_dangerous_flags(&argv(&["tar", "--to-command", "sh", "-xf", "x.tar"])),
+            Err(ToolError::SandboxViolation(_))
+        ));
+        assert!(tool
+            .check_dangerous_flags(&argv(&["tar", "-cf", "x.tar", "src"]))
+            .is_ok());
+    }
+
+    #[test]
+    fn test_denylist_ignores_other_programs() {
+        let (_tmp, root) = setup_workspace();
+        let tool = ShellExecTool::new(root, vec!["echo".into()], 120, vec![]);
+
+        // No denylist entry for echo — same tokens are fine
+        assert!(tool
+            .check_dangerous_flags(&argv(&["echo", "-c", "--exec-path=/tmp"]))
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_denylist_applies_after_allowlist_match() {
+        let (_tmp, root) = setup_workspace();
+        let tool = ShellExecTool::new(root, vec!["git".into()], 120, vec![]);
+
+        let result = tool
+            .execute(serde_json::json!({"argv": ["git", "-c", "alias.x=!id", "status"]}))
+            .await;
+        match result {
+            Err(ToolError::SandboxViolation(msg)) => assert!(msg.contains("-c")),
+            other => panic!("expected SandboxViolation naming -c, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_child_env tests
+    // -----------------------------------------------------------------------
+
+    fn env_get<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn test_build_child_env_fixed_path() {
+        let env = build_child_env(&[], |_| None, false);
+        assert_eq!(env_get(&env, "PATH"), Some("/usr/local/bin:/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn test_build_child_env_adds_cargo_bin_when_present() {
+        let lookup = |name: &str| (name == "HOME").then(|| "/home/u".to_string());
+        let env = build_child_env(&[], lookup, true);
+        assert_eq!(
+            env_get(&env, "PATH"),
+            Some("/usr/local/bin:/usr/bin:/bin:/home/u/.cargo/bin")
+        );
+        // Not appended when the directory does not exist
+        let env = build_child_env(&[], lookup, false);
+        assert_eq!(env_get(&env, "PATH"), Some("/usr/local/bin:/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn test_build_child_env_forwards_keep_list() {
+        let lookup = |name: &str| match name {
+            "HOME" => Some("/home/u".to_string()),
+            "TERM" => Some("xterm".to_string()),
+            "CI" => Some("true".to_string()),
+            "SECRET_THING" => Some("nope".to_string()),
+            _ => None,
+        };
+        let env = build_child_env(&[], lookup, false);
+        assert_eq!(env_get(&env, "HOME"), Some("/home/u"));
+        assert_eq!(env_get(&env, "TERM"), Some("xterm"));
+        assert_eq!(env_get(&env, "CI"), Some("true"));
+        // Absent keep-list vars are simply not set
+        assert_eq!(env_get(&env, "LANG"), None);
+        assert_eq!(env_get(&env, "TMPDIR"), None);
+        // Anything not in the keep-list is dropped
+        assert_eq!(env_get(&env, "SECRET_THING"), None);
+    }
+
+    #[test]
+    fn test_build_child_env_passthrough_exact_names() {
+        let lookup = |name: &str| match name {
+            "HTTP_PROXY" => Some("http://proxy:8080".to_string()),
+            _ => None,
+        };
+        let passthrough = vec!["HTTP_PROXY".to_string(), "NO_PROXY".to_string()];
+        let env = build_child_env(&passthrough, lookup, false);
+        assert_eq!(env_get(&env, "HTTP_PROXY"), Some("http://proxy:8080"));
+        // Requested but absent in the parent → skipped
+        assert_eq!(env_get(&env, "NO_PROXY"), None);
+    }
+
+    #[test]
+    fn test_build_child_env_refuses_secret_passthrough() {
+        let lookup = |name: &str| Some(format!("value-of-{}", name));
+        let passthrough = vec![
+            "CLAUSURA_API_KEY".to_string(),
+            "AWS_KEY".to_string(),
+            "MY_TOKEN".to_string(),
+            "APP_SECRET".to_string(),
+            "DB_PASSWORD".to_string(),
+            "HTTP_PROXY".to_string(),
+        ];
+        let env = build_child_env(&passthrough, lookup, false);
+        for name in [
+            "CLAUSURA_API_KEY",
+            "AWS_KEY",
+            "MY_TOKEN",
+            "APP_SECRET",
+            "DB_PASSWORD",
+        ] {
+            assert_eq!(env_get(&env, name), None, "{} must be refused", name);
+        }
+        assert_eq!(env_get(&env, "HTTP_PROXY"), Some("value-of-HTTP_PROXY"));
+    }
+
+    #[test]
+    fn test_build_child_env_safety_overrides() {
+        let env = build_child_env(&[], |_| None, false);
+        assert_eq!(env_get(&env, "GIT_PAGER"), Some("cat"));
+        assert_eq!(env_get(&env, "PAGER"), Some("cat"));
+        assert_eq!(env_get(&env, "GIT_CONFIG_NOSYSTEM"), Some("1"));
+        assert_eq!(env_get(&env, "GIT_TERMINAL_PROMPT"), Some("0"));
+        assert_eq!(env_get(&env, "GIT_EDITOR"), Some(":"));
+        assert_eq!(env_get(&env, "EDITOR"), Some(":"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ShellExecTool timeout tests
+    // -----------------------------------------------------------------------
+
+    // sleep is not available on Windows — unix only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_exec_timeout_kills_command() {
+        let (_tmp, root) = setup_workspace();
+        let tool = ShellExecTool::new(root, vec!["sleep".into()], 1, vec![]);
+
+        let result = tool
+            .execute(serde_json::json!({"argv": ["sleep", "5"]}))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("Command timed out after 1s and was killed"),
+            "Expected timeout message, got: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_exec_fast_command_completes() {
+        let (_tmp, root) = setup_workspace();
+        let tool = ShellExecTool::new(root, vec!["git".into()], 120, vec![]);
+
+        let result = tool
+            .execute(serde_json::json!({"argv": ["git", "--version"]}))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("git version"),
+            "Expected git version output, got: {}",
+            result
         );
     }
 }
