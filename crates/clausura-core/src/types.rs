@@ -383,7 +383,13 @@ pub struct TaskContract {
     pub prompt_template: String,
     #[serde(default)]
     pub tool_allowlist: Vec<String>,
+    /// Context-window budget: drives truncation of the conversation.
     pub token_budget: u64,
+    /// Optional cap on cumulative tokens billed across all LLM calls in one
+    /// run. When reached, the agent loop stops and the run is marked
+    /// incomplete. `None` means no cap.
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
     pub timeout_secs: u64,
     #[serde(default = "default_shell_timeout_secs")]
     pub shell_timeout_secs: u64,
@@ -624,6 +630,7 @@ mod tests {
             prompt_template: "Review: {{diff}}".into(),
             tool_allowlist: vec![],
             token_budget: 32000,
+            max_total_tokens: None,
             timeout_secs: 300,
             shell_timeout_secs: 120,
             shell_env_passthrough: vec![],

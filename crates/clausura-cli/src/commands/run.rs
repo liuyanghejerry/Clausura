@@ -138,6 +138,9 @@ pub async fn execute(args: RunArgs) -> i32 {
             config.task.vendor.effective_base_url()
         );
         eprintln!("  {} {}", "Token budget:".bold(), config.task.token_budget);
+        if let Some(max_total) = config.task.max_total_tokens {
+            eprintln!("  {} {}", "Max total tokens:".bold(), max_total);
+        }
         eprintln!("  {} {}s", "Timeout:".bold(), config.task.timeout_secs);
         eprintln!(
             "  {} {}",

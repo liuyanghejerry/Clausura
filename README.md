@@ -197,7 +197,12 @@ task:
   prompt_template: "{{task_description}}"  # Default. The agent's system prompt.
 
   # Limits
-  token_budget: 32000                # Default. Max total tokens across all LLM calls.
+  token_budget: 32000                # Default. Context-window budget: older messages are
+                                     # truncated (and archived) when the conversation
+                                     # approaches this size.
+  max_total_tokens: 200000           # Optional. Cap on cumulative billed tokens across all
+                                     # LLM calls in one run; the run stops (marked incomplete)
+                                     # when reached. Unset means no cap.
   timeout_secs: 300                  # Default. Max wall-clock time in seconds.
   max_iterations: 10                 # Default. Max agent loop iterations.
   shell_timeout_secs: 120            # Default. Per-command timeout for shell_exec.
@@ -246,6 +251,7 @@ task:
 | `CLAUSURA_AMBIGUITY_POLICY` | `task.ambiguity_policy` |
 | `CLAUSURA_ON_INCOMPLETE` | `task.on_incomplete` |
 | `CLAUSURA_TOKEN_BUDGET` | `task.token_budget`  |
+| `CLAUSURA_MAX_TOTAL_TOKENS` | `task.max_total_tokens` |
 | `CLAUSURA_TIMEOUT`      | `task.timeout_secs`  |
 | `CLAUSURA_SHELL_TIMEOUT` | `task.shell_timeout_secs` |
 | `CLAUSURA_MAX_ITERATIONS` | `task.max_iterations` |
@@ -383,7 +389,7 @@ On successful completion (exit code 0), archive files are automatically cleaned 
 
 ### Incomplete runs fail closed
 
-If the agent loop ends without a clean stop — the context could not be truncated further, the model hit a length limit, or `max_iterations` was exhausted — the extracted findings may be partial. By default (`on_incomplete: fail`) Clausura fails closed: the run exits with code 2 and a clear error message, so an incomplete review can never silently pass a `max_findings: 0` gate. With `on_incomplete: pass`, the previous behavior is kept (gating rules evaluate the partial findings), but a warning is logged and the SARIF output is annotated with `"properties": {"incomplete": true}` on the run.
+If the agent loop ends without a clean stop — the context could not be truncated further, the model hit a length limit, the `max_total_tokens` cap was reached, or `max_iterations` was exhausted — the extracted findings may be partial. By default (`on_incomplete: fail`) Clausura fails closed: the run exits with code 2 and a clear error message, so an incomplete review can never silently pass a `max_findings: 0` gate. With `on_incomplete: pass`, the previous behavior is kept (gating rules evaluate the partial findings), but a warning is logged and the SARIF output is annotated with `"properties": {"incomplete": true}` on the run.
 
 ### Deterministic rule engine
 

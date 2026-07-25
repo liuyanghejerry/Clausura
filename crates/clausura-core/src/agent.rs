@@ -59,7 +59,17 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
             return Err(ProviderError::Timeout("Task timeout exceeded".into()));
         }
 
-        if running_tokens >= config.contract.token_budget || cm.should_truncate(&messages) {
+        // Cumulative cost cap (only when configured): total billed tokens
+        // across all LLM calls. Independent of `token_budget`, which governs
+        // context-window truncation only.
+        if let Some(max_total) = config.contract.max_total_tokens {
+            if running_tokens >= max_total {
+                // Fall-through below marks the result truncated.
+                break;
+            }
+        }
+
+        if cm.should_truncate(&messages) {
             let snapshot = messages.clone();
             let (was_truncated, count) = cm.truncate_to_budget(&mut messages);
             if was_truncated && count > 0 {
@@ -104,10 +114,9 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                     }
                 }
 
-                running_tokens = cm.count_tokens(&messages);
-
-                if cm.should_truncate(&messages) || running_tokens >= config.contract.token_budget {
-                    // Fall-through below marks the result truncated.
+                if cm.should_truncate(&messages) {
+                    // Context cannot be reduced far enough to fit the budget;
+                    // fall-through below marks the result truncated.
                     break;
                 }
                 continue;
@@ -372,6 +381,7 @@ mod tests {
             prompt_template: "Review the code and return findings as JSON.".into(),
             tool_allowlist: vec!["git".into()],
             token_budget: 100000,
+            max_total_tokens: None,
             timeout_secs: 60,
             shell_timeout_secs: 120,
             shell_env_passthrough: vec![],
@@ -567,6 +577,117 @@ mod tests {
         assert!(
             result.truncated,
             "Expected truncated=true when context cannot be reduced further"
+        );
+    }
+
+    /// Regression test: cumulative billed tokens may exceed `token_budget`
+    /// (the context-window budget) without the run being marked incomplete.
+    /// Previously the loop conflated the two and broke out as soon as
+    /// cumulative usage crossed `token_budget`, failing otherwise-healthy CI
+    /// runs closed.
+    #[tokio::test]
+    async fn test_agent_loop_ignores_cumulative_tokens_for_context_budget() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut contract = test_contract();
+        contract.token_budget = 100000;
+
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            name: "git_diff".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let mut mock = MockProvider::new("test-model");
+        for _ in 0..2 {
+            mock.add_response(ChatResponse {
+                message: Message::new(Role::Assistant, "Running tool..."),
+                usage: Usage {
+                    input_tokens: 55000,
+                    output_tokens: 5000,
+                    total_tokens: 60000,
+                },
+                finish_reason: FinishReason::ToolCalls,
+                tool_calls: Some(vec![tool_call.clone()]),
+            });
+        }
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "test finding", "evidence": "test"}]}"#),
+            usage: Usage {
+                input_tokens: 55000,
+                output_tokens: 5000,
+                total_tokens: 60000,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        // Cumulative billed tokens (180000) far exceed token_budget (100000),
+        // but the context itself always fit, so the run completes cleanly.
+        assert_eq!(result.usage.total_tokens, 180000);
+        assert!(
+            !result.truncated,
+            "Cumulative token usage must not mark the run incomplete"
+        );
+        assert!(!result.findings.is_empty());
+    }
+
+    /// The optional `max_total_tokens` cap still stops the loop (marked
+    /// incomplete) when cumulative billed tokens reach it.
+    #[tokio::test]
+    async fn test_agent_loop_breaks_on_max_total_tokens() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut contract = test_contract();
+        contract.token_budget = 100000;
+        contract.max_total_tokens = Some(100000);
+
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            name: "git_diff".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let mut mock = MockProvider::new("test-model");
+        for _ in 0..2 {
+            mock.add_response(ChatResponse {
+                message: Message::new(Role::Assistant, "Running tool..."),
+                usage: Usage {
+                    input_tokens: 55000,
+                    output_tokens: 5000,
+                    total_tokens: 60000,
+                },
+                finish_reason: FinishReason::ToolCalls,
+                tool_calls: Some(vec![tool_call.clone()]),
+            });
+        }
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert_eq!(result.usage.total_tokens, 120000);
+        assert!(
+            result.truncated,
+            "Expected truncated=true once cumulative tokens reach max_total_tokens"
         );
     }
 
