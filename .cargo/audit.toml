@@ -1,0 +1,12 @@
+# Configuration for `cargo audit`.
+#
+# To ignore a specific advisory (e.g. one with no fix available yet),
+# add its RUSTSEC id to the list below:
+#
+#   ignore = [
+#       "RUSTSEC-2023-0001",
+#   ]
+#
+# See https://rustsec.org/advisories/ for the advisory database.
+[advisories]
+ignore = []

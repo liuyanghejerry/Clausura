@@ -68,10 +68,15 @@ jobs:
           find artifacts -name '*.tar.gz' -exec mv {} . \;
           rm -rf artifacts
 
+      - name: Generate checksums
+        run: sha256sum clausura-*.tar.gz > checksums.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: clausura-*.tar.gz
+          files: |
+            clausura-*.tar.gz
+            checksums.txt
           generate_release_notes: true
 
   docker:

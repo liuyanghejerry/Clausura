@@ -3,6 +3,10 @@ description: 'AI-powered code review agent for CI pipelines'
 author: 'liuyanghejerry'
 
 inputs:
+  version:
+    description: 'Clausura version to install (e.g. "1.0.8" or "latest")'
+    required: false
+    default: 'latest'
   config:
     description: 'Path to .clausura.yaml config file'
     required: false
@@ -26,6 +30,61 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    - name: Install clausura
+      shell: bash
+      env:
+        CLAUSURA_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        # Map runner OS/arch to release target triple
+        case "${{ runner.os }}" in
+          Linux) os_part="unknown-linux-gnu" ;;
+          macOS) os_part="apple-darwin" ;;
+          *)     echo "::error::Unsupported runner OS: ${{ runner.os }}"; exit 1 ;;
+        esac
+
+        case "${{ runner.arch }}" in
+          X64)   arch_part="x86_64" ;;
+          ARM64) arch_part="aarch64" ;;
+          *)     echo "::error::Unsupported runner arch: ${{ runner.arch }}"; exit 1 ;;
+        esac
+
+        TARGET="${arch_part}-${os_part}"
+        TARBALL="clausura-${TARGET}.tar.gz"
+
+        if [ "$CLAUSURA_VERSION" = "latest" ]; then
+          BASE_URL="https://github.com/liuyanghejerry/Clausura/releases/latest/download"
+        else
+          BASE_URL="https://github.com/liuyanghejerry/Clausura/releases/download/v${CLAUSURA_VERSION}"
+        fi
+
+        TMP_DIR="$(mktemp -d)"
+        echo "Downloading ${TARBALL} from ${BASE_URL}..."
+        curl -fsSL -o "$TMP_DIR/$TARBALL" "$BASE_URL/$TARBALL"
+        curl -fsSL -o "$TMP_DIR/checksums.txt" "$BASE_URL/checksums.txt"
+
+        # Verify SHA256 checksum (Linux has sha256sum, macOS has shasum)
+        cd "$TMP_DIR"
+        if [ "${{ runner.os }}" = "macOS" ]; then
+          grep " $TARBALL\$" checksums.txt | shasum -a 256 --check
+        else
+          grep " $TARBALL\$" checksums.txt | sha256sum --check
+        fi
+        cd - >/dev/null
+
+        BIN_DIR="$RUNNER_TEMP/clausura-bin"
+        mkdir -p "$BIN_DIR"
+        tar xzf "$TMP_DIR/$TARBALL" -C "$BIN_DIR"
+        rm -rf "$TMP_DIR"
+
+        echo "$BIN_DIR" >> "$GITHUB_PATH"
+        echo "Installed clausura $CLAUSURA_VERSION ($TARGET) to $BIN_DIR"
+
+    - name: Verify clausura installation
+      shell: bash
+      run: clausura --version
+
     - run: clausura run --config ${{ inputs.config }}
       shell: bash
       env:

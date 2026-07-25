@@ -8,7 +8,8 @@
 /// The API key is NEVER read from the YAML file — it must come from
 /// a CLI flag or the `CLAUSURA_API_KEY` environment variable.
 use crate::types::{
-    AmbiguityPolicy, ConfigError, GateAction, GateRule, Severity, TaskContract, VendorConfig,
+    AmbiguityPolicy, ConfigError, GateAction, GateRule, OnIncompletePolicy, Severity, TaskContract,
+    VendorConfig,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -77,6 +78,8 @@ struct YamlTaskConfig {
     gating: Vec<YamlGateRule>,
     #[serde(default = "default_max_iterations")]
     max_iterations: u32,
+    #[serde(default = "default_on_incomplete")]
+    on_incomplete: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +115,10 @@ fn default_ambiguity() -> String {
     "fail_closed".to_string()
 }
 
+fn default_on_incomplete() -> String {
+    "fail".to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
@@ -132,6 +139,14 @@ fn parse_gate_action(s: &str) -> GateAction {
         "warn" => GateAction::Warn,
         "ignore" => GateAction::Ignore,
         _ => GateAction::Warn,
+    }
+}
+
+fn parse_on_incomplete(s: &str) -> OnIncompletePolicy {
+    match s.to_lowercase().as_str() {
+        "pass" => OnIncompletePolicy::Pass,
+        // Unknown values fail closed, matching the default.
+        _ => OnIncompletePolicy::Fail,
     }
 }
 
@@ -235,6 +250,7 @@ impl Config {
                     ambiguity_policy: default_ambiguity(),
                     gating: vec![],
                     max_iterations: default_max_iterations(),
+                    on_incomplete: default_on_incomplete(),
                 },
                 None,
             )
@@ -283,6 +299,10 @@ impl Config {
             _ => AmbiguityPolicy::FailClosed,
         };
 
+        let on_incomplete_str =
+            std::env::var("CLAUSURA_ON_INCOMPLETE").unwrap_or(yaml_task.on_incomplete);
+        let on_incomplete = parse_on_incomplete(&on_incomplete_str);
+
         let gating_rules = yaml_task
             .gating
             .iter()
@@ -310,6 +330,7 @@ impl Config {
                 ambiguity_policy,
                 gating_rules,
                 max_iterations,
+                on_incomplete,
             },
             api_key,
             workspace,
@@ -518,6 +539,7 @@ task:
             std::env::remove_var("CLAUSURA_TOKEN_BUDGET");
             std::env::remove_var("CLAUSURA_TIMEOUT");
             std::env::remove_var("CLAUSURA_AMBIGUITY_POLICY");
+            std::env::remove_var("CLAUSURA_ON_INCOMPLETE");
         }
     }
 
@@ -793,6 +815,139 @@ task:
         )
         .unwrap();
         assert_eq!(config.task.max_iterations, 10);
+    }
+
+    #[test]
+    fn test_on_incomplete_default_is_fail() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.on_incomplete, OnIncompletePolicy::Fail);
+    }
+
+    #[test]
+    fn test_on_incomplete_pass_from_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  on_incomplete: pass
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.on_incomplete, OnIncompletePolicy::Pass);
+    }
+
+    #[test]
+    fn test_on_incomplete_unknown_value_fails_closed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  on_incomplete: banana
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.on_incomplete, OnIncompletePolicy::Fail);
+    }
+
+    #[test]
+    fn test_on_incomplete_env_overrides_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        unsafe { std::env::set_var("CLAUSURA_ON_INCOMPLETE", "pass") };
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  on_incomplete: fail
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.on_incomplete, OnIncompletePolicy::Pass);
+        unsafe { std::env::remove_var("CLAUSURA_ON_INCOMPLETE") };
     }
 
     #[test]

@@ -28,7 +28,7 @@ Clausura is a platform-agnostic agent CLI tool built for CI/CD pipelines. It run
 curl -fsSL https://raw.githubusercontent.com/liuyanghejerry/Clausura/main/install.sh | bash
 ```
 
-The script detects your OS and architecture, downloads the latest release from GitHub, and installs it to `/usr/local/bin` or `~/.local/bin`.
+The script detects your OS and architecture, downloads the latest release from GitHub, verifies the tarball against the release's `checksums.txt` (SHA256), and installs it to `/usr/local/bin` or `~/.local/bin`.
 
 ### Cargo
 
@@ -169,7 +169,7 @@ clausura run --dry-run  # show the execution plan
 |------|---------------|------------------------------------------|
 | 0    | Pass          | All gating rules satisfied               |
 | 1    | Fail          | A rule with `action: fail` was violated  |
-| 2    | Error         | Runtime error (provider, timeout, etc.)  |
+| 2    | Error         | Runtime error (provider, timeout, etc.), or an incomplete agent run with `on_incomplete: fail` |
 | 3    | Config error  | Invalid configuration                    |
 
 ## Configuration Reference
@@ -199,9 +199,14 @@ task:
   # Limits
   token_budget: 32000                # Default. Max total tokens across all LLM calls.
   timeout_secs: 300                  # Default. Max wall-clock time in seconds.
+  max_iterations: 10                 # Default. Max agent loop iterations.
 
   # Safety
   ambiguity_policy: fail_closed      # "fail_closed" or "proceed_with_caution".
+  on_incomplete: fail                # "fail" (exit 2, default) or "pass" (continue with
+                                     # partial results, marked incomplete in logs and SARIF).
+                                     # Applies when the agent loop ends without a clean stop
+                                     # (context truncated or iteration limit reached).
 
   # Optional tool allowlist
   tool_allowlist:                    # Restrict shell commands to these binaries.
@@ -234,8 +239,10 @@ task:
 | `CLAUSURA_MODEL`        | `task.model`         |
 | `CLAUSURA_VENDOR`       | `task.vendor`        |
 | `CLAUSURA_AMBIGUITY_POLICY` | `task.ambiguity_policy` |
+| `CLAUSURA_ON_INCOMPLETE` | `task.on_incomplete` |
 | `CLAUSURA_TOKEN_BUDGET` | `task.token_budget`  |
 | `CLAUSURA_TIMEOUT`      | `task.timeout_secs`  |
+| `CLAUSURA_MAX_ITERATIONS` | `task.max_iterations` |
 
 Config loading priority: YAML file < CLI flags < environment variables.
 
@@ -250,6 +257,7 @@ clausura run [OPTIONS]
       --api-key <KEY>       API key
       --token-budget <N>    Token budget override
       --timeout <SECS>      Timeout override
+      --max-iterations <N>  Max agent loop iterations  [default: 10]
       --workspace <PATH>    Workspace root            [default: cwd]
       --output <PATH>       SARIF output path          [default: clausura-output.sarif]
       --resume              Resume from last checkpoint
@@ -292,7 +300,10 @@ Use the composite action directly:
     vendor: openai
     token_budget: 32000
     timeout: 300
+    version: latest        # optional: release version to install (e.g. "1.0.8", default "latest")
 ```
+
+The action downloads the matching release binary for the runner's OS/arch (Linux and macOS, x86_64 and aarch64), verifies it against the release's SHA256 `checksums.txt`, and adds it to `PATH` before running.
 
 Or run via the binary:
 
@@ -344,7 +355,7 @@ Custom context variables for Generic CI: `CI_REPO`, `CI_PR_NUMBER`, `CI_COMMIT_S
 
 ### Agent loop (reason -> act -> observe)
 
-Clausura runs a bounded agent loop of up to 10 iterations. Each iteration:
+Clausura runs a bounded agent loop of up to `max_iterations` iterations (default 10, configurable via YAML, `--max-iterations`, or `CLAUSURA_MAX_ITERATIONS`). Each iteration:
 
 1. Sends the conversation (system prompt + accumulated messages) to the LLM
 2. If the LLM calls a tool, executes it and feeds the result back
@@ -358,6 +369,10 @@ The system prompt is built from `prompt_template` plus available tool definition
 When the conversation exceeds the configured `token_budget`, Clausura automatically truncates older messages to stay within limits. Dropped messages are not silently discarded — they are archived to `.clausura/archives/context-dump-{task_id}-{seq}.log` inside the workspace as JSON lines. A hint message is injected into the conversation telling the LLM where to find the archived context, so it can retrieve earlier findings via the `read_file` tool if needed.
 
 On successful completion (exit code 0), archive files are automatically cleaned up. On failure (exit code 1-3), they are preserved for debugging and audit.
+
+### Incomplete runs fail closed
+
+If the agent loop ends without a clean stop — the context could not be truncated further, the model hit a length limit, or `max_iterations` was exhausted — the extracted findings may be partial. By default (`on_incomplete: fail`) Clausura fails closed: the run exits with code 2 and a clear error message, so an incomplete review can never silently pass a `max_findings: 0` gate. With `on_incomplete: pass`, the previous behavior is kept (gating rules evaluate the partial findings), but a warning is logged and the SARIF output is annotated with `"properties": {"incomplete": true}` on the run.
 
 ### Deterministic rule engine
 
@@ -374,6 +389,8 @@ No LLM calls, no heuristics. Just deterministic logic your pipeline can trust.
 
 Three vendor categories: OpenAI-compatible (works with OpenAI, DeepSeek, Groq, Ollama, vLLM, Mistral), Anthropic-compatible (native Claude Messages API), and Custom (configurable enterprise endpoints). Factory function `create_provider()` dispatches on vendor type.
 
+Each LLM request has its own per-request timeout (default 120s), independent of the task's overall wall-clock `timeout_secs`. Failed requests are retried with exponential backoff (up to 3 retries by default) on HTTP 429, 5xx, and network errors — the `Retry-After` response header is honored when present. Other 4xx responses (e.g. 401, 400) fail immediately without retrying.
+
 ### Tool sandboxing
 
 Five built-in tools:
@@ -384,13 +401,17 @@ Five built-in tools:
 | `list_files`  | List directory contents, with recursive depth, glob filtering, and optional file sizes | Sandboxed to workspace; skips `.clausura/` |
 | `grep`        | Search text patterns across files with literal or regex mode, extension filtering, and binary-skip | Auto-excludes `.git`, `target`, `.clausura`, `node_modules` |
 | `git_diff`    | Run `git diff` with optional base ref or staged  | Operates inside workspace only         |
-| `shell_exec`  | Execute allowed shell commands                   | Restricted to `tool_allowlist` entries |
+| `shell_exec`  | Execute an allowed command (argv form, no shell) | Restricted to `tool_allowlist` entries |
 
-The `shell_exec` tool is locked by default (empty allowlist = no commands). Explicitly list allowed binaries to enable it. Commands run with `current_dir` set to the workspace root, but allowed commands can access paths outside the workspace via arguments.
+The `shell_exec` tool is locked by default (empty allowlist = no commands). Explicitly list allowed binaries to enable it. It takes an `argv` array (e.g. `{"argv": ["git", "status"]}`) and executes `argv[0]` directly **without a shell** — shell metacharacters like `;`, `|`, `$()` or `>` are passed through as literal arguments and have no effect, so they cannot be used to bypass the allowlist. The allowlist is matched against `argv[0]` (both the raw value and its basename). Commands run with `current_dir` set to the workspace root, but allowed commands can access paths outside the workspace via arguments.
+
+Tool outputs are truncated at 32 KB or 1000 lines (whichever comes first) to stay within token budgets; a `[output truncated ...]` marker is appended when this happens — narrow the query or use `read_file`'s `offset`/`limit` to page through large outputs.
 
 ### Memory snapshots (SQLite checkpoints)
 
 On every run, the agent's message history is serialized (MessagePack) and saved to `~/.clausura/checkpoints.db`. You can resume a truncated or interrupted run with `--resume`. Snapshots include a thread ID, version number, and truncation flag.
+
+Note that checkpoints live under the user's home directory (`~/.clausura/`), not the workspace. In ephemeral CI containers without a persistent home/volume, checkpoints do not survive between runs, so `--resume` has nothing to restore from.
 
 Use `clausura snapshot list` and `clausura snapshot show` to inspect saved state.
 

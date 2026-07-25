@@ -13,6 +13,10 @@ pub struct AgentResult {
     pub findings: Vec<Finding>,
     pub usage: Usage,
     pub duration_ms: u64,
+    /// True when the loop ended without a clean `Stop`: context truncation,
+    /// `FinishReason::Length`, an abnormal finish reason, or exhaustion of
+    /// `max_iterations`. Signals to the caller that the result may be
+    /// incomplete (see `TaskContract::on_incomplete`).
     pub truncated: bool,
 }
 
@@ -66,38 +70,48 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 
                 match archive_result {
                     Ok(path) => {
-                        messages.push(Message::new(
-                            Role::User,
-                            format!(
-                                "⚠️ Context was trimmed to stay within token budget.\n\
-                             {} earlier messages are archived at:\n  {}\n\
-                             Use read_file to inspect if you need context from earlier iterations.",
-                                dropped.len(),
-                                path.display(),
+                        // Insert at the truncation boundary (right after the
+                        // system message), not at the end: appending a User
+                        // message after an assistant message with tool_calls
+                        // would leave those calls without results, which the
+                        // OpenAI/Anthropic APIs reject.
+                        messages.insert(
+                            1,
+                            Message::new(
+                                Role::User,
+                                format!(
+                                    "⚠️ Context was trimmed to stay within token budget.\n\
+                                 {} earlier messages are archived at:\n  {}\n\
+                                 Use read_file to inspect if you need context from earlier iterations.",
+                                    dropped.len(),
+                                    path.display(),
+                                ),
                             ),
-                        ));
+                        );
                     }
                     Err(_) => {
-                        messages.push(Message::new(
-                            Role::User,
-                            format!(
-                                "⚠️ Context was trimmed to stay within token budget.\n\
-                             {} earlier messages were dropped (archive unavailable).",
-                                dropped.len(),
+                        messages.insert(
+                            1,
+                            Message::new(
+                                Role::User,
+                                format!(
+                                    "⚠️ Context was trimmed to stay within token budget.\n\
+                                 {} earlier messages were dropped (archive unavailable).",
+                                    dropped.len(),
+                                ),
                             ),
-                        ));
+                        );
                     }
                 }
 
                 running_tokens = cm.count_tokens(&messages);
 
                 if cm.should_truncate(&messages) || running_tokens >= config.contract.token_budget {
-                    truncated = true;
+                    // Fall-through below marks the result truncated.
                     break;
                 }
                 continue;
             } else {
-                truncated = true;
                 break;
             }
         }
@@ -173,7 +187,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                 }
             }
             FinishReason::Length => {
-                truncated = true;
+                // Fall-through below marks the result truncated.
                 break;
             }
             FinishReason::ContentFilter | FinishReason::Other(_) => {
@@ -199,8 +213,11 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 
     // The loop exited without a clean `Stop` (timeout/truncation/iteration cap),
     // so there is no complete final answer to hold to the strict schema below.
-    // Best-effort extraction with a warning is appropriate here; `truncated`
-    // already signals to the caller that this result may be incomplete.
+    // Best-effort extraction with a warning is appropriate here. Mark the
+    // result as truncated (incomplete): this fall-through path is reached on
+    // Length, failed truncation, ContentFilter/Other breaks, and iteration
+    // exhaustion, none of which produced a complete final answer.
+    truncated = true;
     let findings = extract_findings_lenient(&last_content);
 
     Ok(AgentResult {
@@ -342,7 +359,7 @@ mod tests {
     use super::*;
     use crate::provider::tests::MockProvider;
     use crate::tools::default_tools;
-    use crate::types::{AmbiguityPolicy, ChatResponse, ToolCall, VendorConfig};
+    use crate::types::{AmbiguityPolicy, ChatResponse, OnIncompletePolicy, ToolCall, VendorConfig};
     use tempfile::TempDir;
 
     fn test_contract() -> TaskContract {
@@ -359,6 +376,7 @@ mod tests {
             ambiguity_policy: AmbiguityPolicy::FailClosed,
             gating_rules: vec![],
             max_iterations: 10,
+            on_incomplete: OnIncompletePolicy::Fail,
         }
     }
 
@@ -597,14 +615,70 @@ mod tests {
         };
 
         let result = run_agent_loop(config).await.unwrap();
-        let hint = result
-            .messages
-            .iter()
-            .any(|m| m.role == Role::User && m.content.contains("archived at"));
-        assert!(
-            hint,
-            "Expected a hint message about archiving after truncation"
+
+        // (a) The hint sits at index 1 — immediately after the system
+        // message, at the truncation boundary, not appended at the end.
+        assert_eq!(
+            result.messages[0].role,
+            Role::System,
+            "system message must stay at index 0"
         );
+        let hint = &result.messages[1];
+        assert_eq!(hint.role, Role::User, "hint message must be a user message");
+        assert!(
+            hint.content.contains("archived at"),
+            "expected a hint message about archiving at index 1, got: {}",
+            hint.content
+        );
+
+        // (b) Every assistant message with tool_calls is immediately
+        // followed by Role::Tool messages with matching tool_call_ids.
+        // (c) A Role::Tool message only ever appears right after an
+        // assistant-with-tool_calls group.
+        let msgs = &result.messages;
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == Role::Assistant && m.tool_calls.is_some()),
+            "test setup: retained tail must contain an assistant message with tool_calls"
+        );
+        let mut i = 0;
+        while i < msgs.len() {
+            let m = &msgs[i];
+            if m.role == Role::Assistant {
+                if let Some(tool_calls) = &m.tool_calls {
+                    let mut j = i + 1;
+                    for tc in tool_calls {
+                        let tm = msgs.get(j).unwrap_or_else(|| {
+                            panic!("tool_call '{}' has no tool result message", tc.id)
+                        });
+                        assert_eq!(
+                            tm.role,
+                            Role::Tool,
+                            "tool_call '{}' must be followed by a tool message, found {:?} at index {}",
+                            tc.id,
+                            tm.role,
+                            j
+                        );
+                        assert_eq!(
+                            tm.tool_call_id.as_deref(),
+                            Some(tc.id.as_str()),
+                            "tool message at index {} must carry matching tool_call_id",
+                            j
+                        );
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            assert_ne!(
+                m.role,
+                Role::Tool,
+                "tool message at index {} does not follow an assistant-with-tool_calls group",
+                i
+            );
+            i += 1;
+        }
     }
 
     #[tokio::test]

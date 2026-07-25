@@ -6,7 +6,7 @@ use crate::rules::RuleEngine;
 use crate::sarif::SarifFormatter;
 use crate::snapshot::SnapshotManager;
 use crate::tools::default_tools;
-use crate::types::{ExecutionReport, Message, ProviderError, Role, Usage};
+use crate::types::{ExecutionReport, Message, OnIncompletePolicy, ProviderError, Role, Usage};
 use std::path::Path;
 use std::time::Instant;
 
@@ -118,11 +118,33 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
 
     let gate_result = RuleEngine::evaluate(&agent_result.findings, &config.task.gating_rules);
 
-    if let Err(e) = SarifFormatter::write_to_file(&agent_result.findings, &config.output) {
+    // Fail closed on incomplete runs (context truncated or iteration limit
+    // reached): a partial sweep with zero findings must not pass gates like
+    // `max_findings: 0`.
+    let mut errors = Vec::new();
+    let exit_code = apply_incomplete_policy(
+        gate_result.exit_code,
+        agent_result.truncated,
+        config.task.on_incomplete,
+        &mut errors,
+    );
+
+    if agent_result.truncated && config.task.on_incomplete == OnIncompletePolicy::Pass {
+        eprintln!(
+            "Warning: agent run incomplete (context truncated or iteration limit reached); \
+             continuing with partial results (on_incomplete=pass)"
+        );
+    }
+
+    if let Err(e) = SarifFormatter::write_to_file_with_status(
+        &agent_result.findings,
+        &config.output,
+        agent_result.truncated,
+    ) {
         eprintln!("Warning: Failed to write SARIF: {}", e);
     }
 
-    if gate_result.exit_code == 0 {
+    if exit_code == 0 {
         cleanup_archives(&config.workspace, &task_id);
     }
 
@@ -137,13 +159,45 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
 
     ExecutionReport {
         task_id,
-        exit_code: gate_result.exit_code,
+        exit_code,
         findings: agent_result.findings,
         token_usage: agent_result.usage,
         duration_ms: agent_result.duration_ms,
         snapshot_id,
-        errors: vec![],
+        errors,
         violations: gate_result.violations,
+    }
+}
+
+/// Decide the final exit code when the agent run may be incomplete.
+///
+/// A complete run is returned unchanged. For an incomplete run (context
+/// truncated or iteration limit reached without a clean `Stop`):
+/// - `OnIncompletePolicy::Fail` fails closed: returns 2 (error) and pushes a
+///   diagnostic to `errors`, regardless of the gate result — an incomplete
+///   sweep must not pass gates, and a runtime error outranks a rule
+///   violation.
+/// - `OnIncompletePolicy::Pass` keeps the gate result unchanged; the caller
+///   warns and annotates the SARIF output instead.
+fn apply_incomplete_policy(
+    gate_exit_code: u32,
+    incomplete: bool,
+    policy: OnIncompletePolicy,
+    errors: &mut Vec<String>,
+) -> u32 {
+    if !incomplete {
+        return gate_exit_code;
+    }
+    match policy {
+        OnIncompletePolicy::Fail => {
+            errors.push(
+                "Agent run incomplete (context truncated or iteration limit reached); \
+                 failing closed (on_incomplete=fail)"
+                    .to_string(),
+            );
+            2
+        }
+        OnIncompletePolicy::Pass => gate_exit_code,
     }
 }
 
@@ -251,5 +305,65 @@ mod tests {
         cleanup_archives(tmp.path(), "different-task-id");
 
         assert!(archives_dir.join("context-dump-other-task-1.log").exists());
+    }
+
+    #[test]
+    fn test_incomplete_fail_policy_returns_exit_2_with_error() {
+        let mut errors = Vec::new();
+        let code = apply_incomplete_policy(0, true, OnIncompletePolicy::Fail, &mut errors);
+        assert_eq!(code, 2);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("Agent run incomplete"),
+            "got: {}",
+            errors[0]
+        );
+        assert!(
+            errors[0].contains("on_incomplete=fail"),
+            "got: {}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn test_incomplete_pass_policy_keeps_gate_result() {
+        let mut errors = Vec::new();
+        assert_eq!(
+            apply_incomplete_policy(0, true, OnIncompletePolicy::Pass, &mut errors),
+            0
+        );
+        assert_eq!(
+            apply_incomplete_policy(1, true, OnIncompletePolicy::Pass, &mut errors),
+            1
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_incomplete_fail_policy_error_outranks_violation() {
+        // gate=1 + incomplete + Fail → 2: the run itself is untrustworthy,
+        // so the runtime error takes precedence over the rule violation.
+        let mut errors = Vec::new();
+        let code = apply_incomplete_policy(1, true, OnIncompletePolicy::Fail, &mut errors);
+        assert_eq!(code, 2);
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn test_complete_run_unchanged_by_policy() {
+        let mut errors = Vec::new();
+        assert_eq!(
+            apply_incomplete_policy(0, false, OnIncompletePolicy::Fail, &mut errors),
+            0
+        );
+        assert_eq!(
+            apply_incomplete_policy(1, false, OnIncompletePolicy::Fail, &mut errors),
+            1
+        );
+        assert_eq!(
+            apply_incomplete_policy(0, false, OnIncompletePolicy::Pass, &mut errors),
+            0
+        );
+        assert!(errors.is_empty());
     }
 }
