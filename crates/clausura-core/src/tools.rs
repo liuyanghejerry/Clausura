@@ -1050,6 +1050,19 @@ mod tests {
         (tmp, path)
     }
 
+    /// An absolute path that is valid on every platform (`/etc/passwd` is not
+    /// absolute on Windows, where absolute paths need a drive prefix).
+    fn absolute_path() -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Normalize Windows path separators so assertions can use `/`.
+    fn normalize_separators(s: &str) -> String {
+        s.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+
     // -----------------------------------------------------------------------
     // ReadFileTool tests
     // -----------------------------------------------------------------------
@@ -1083,7 +1096,7 @@ mod tests {
         let (_tmp, root) = setup_workspace();
         let tool = ReadFileTool::new(root);
         let result = tool
-            .execute(serde_json::json!({"path": "/etc/passwd"}))
+            .execute(serde_json::json!({"path": absolute_path()}))
             .await;
         assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
     }
@@ -1236,7 +1249,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_sandboxed_rejects_absolute() {
         let (_tmp, root) = setup_workspace();
-        let result = resolve_sandboxed_path(&root, "/etc/passwd");
+        let result = resolve_sandboxed_path(&root, &absolute_path());
         assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
     }
 
@@ -1558,6 +1571,7 @@ mod tests {
             .execute(serde_json::json!({"path": ".", "max_depth": 2}))
             .await
             .unwrap();
+        let result = normalize_separators(&result);
         let lines: Vec<&str> = result.lines().collect();
         assert!(lines.contains(&"top.txt"));
         assert!(lines.contains(&"sub/"));
@@ -1605,7 +1619,9 @@ mod tests {
     async fn test_list_files_rejects_absolute() {
         let (_tmp, root) = setup_workspace();
         let tool = ListFilesTool::new(root);
-        let result = tool.execute(serde_json::json!({"path": "/etc"})).await;
+        let result = tool
+            .execute(serde_json::json!({"path": absolute_path()}))
+            .await;
         assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
     }
 
@@ -1664,6 +1680,7 @@ mod tests {
             .execute(serde_json::json!({"path": ".", "max_depth": 5}))
             .await
             .unwrap();
+        let result = normalize_separators(&result);
         assert!(
             result.contains("a/top.txt"),
             "Expected a/top.txt in output:\n{}",
