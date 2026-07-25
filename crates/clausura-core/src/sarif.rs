@@ -8,7 +8,16 @@ pub struct SarifFormatter;
 impl SarifFormatter {
     /// Convert findings to SARIF JSON string.
     pub fn to_string(findings: &[Finding]) -> Result<String, serde_json::Error> {
-        let sarif = Self::build_sarif(findings);
+        Self::to_string_with_status(findings, false)
+    }
+
+    /// Convert findings to SARIF JSON string, marking the run as incomplete
+    /// (agent loop truncated or iteration limit reached) when requested.
+    pub fn to_string_with_status(
+        findings: &[Finding],
+        incomplete: bool,
+    ) -> Result<String, serde_json::Error> {
+        let sarif = Self::build_sarif(findings, incomplete);
         serde_json::to_string_pretty(&sarif)
     }
 
@@ -17,27 +26,49 @@ impl SarifFormatter {
         findings: &[Finding],
         path: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let content = Self::to_string(findings)?;
+        Self::write_to_file_with_status(findings, path, false)
+    }
+
+    /// Write SARIF output to a file, marking the run as incomplete when
+    /// requested (see [`SarifFormatter::to_string_with_status`]).
+    pub fn write_to_file_with_status(
+        findings: &[Finding],
+        path: &Path,
+        incomplete: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let content = Self::to_string_with_status(findings, incomplete)?;
         fs::write(path, content)?;
         Ok(())
     }
 
-    fn build_sarif(findings: &[Finding]) -> serde_json::Value {
+    fn build_sarif(findings: &[Finding], incomplete: bool) -> serde_json::Value {
         let results: Vec<serde_json::Value> =
             findings.iter().map(Self::finding_to_result).collect();
+
+        let mut run = serde_json::json!({
+            "tool": {
+                "driver": {
+                    "name": "Clausura",
+                    "informationUri": "https://github.com/liuyanghejerry/Clausura"
+                }
+            },
+            "results": results
+        });
+
+        if incomplete {
+            run["properties"] = serde_json::json!({ "incomplete": true });
+            run["invocations"] = serde_json::json!([{
+                "executionSuccessful": false,
+                "properties": {
+                    "incompleteReason": "context truncated or iteration limit reached"
+                }
+            }]);
+        }
 
         serde_json::json!({
             "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
             "version": "2.1.0",
-            "runs": [{
-                "tool": {
-                    "driver": {
-                        "name": "Clausura",
-                        "informationUri": "https://github.com/liuyanghejerry/Clausura"
-                    }
-                },
-                "results": results
-            }]
+            "runs": [run]
         })
     }
 
@@ -180,5 +211,30 @@ mod tests {
         assert!(path.exists());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("Clausura"));
+    }
+
+    #[test]
+    fn test_incomplete_run_annotated() {
+        let sarif = SarifFormatter::to_string_with_status(&[], true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+        assert_eq!(parsed["runs"][0]["properties"]["incomplete"], true);
+        assert_eq!(
+            parsed["runs"][0]["invocations"][0]["executionSuccessful"],
+            false
+        );
+    }
+
+    #[test]
+    fn test_complete_run_not_annotated() {
+        // Both the default to_string and an explicit incomplete=false must
+        // omit the annotation entirely (not emit "incomplete": false).
+        for sarif in [
+            SarifFormatter::to_string(&[]).unwrap(),
+            SarifFormatter::to_string_with_status(&[], false).unwrap(),
+        ] {
+            let parsed: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+            assert!(parsed["runs"][0].get("properties").is_none());
+            assert!(parsed["runs"][0].get("invocations").is_none());
+        }
     }
 }

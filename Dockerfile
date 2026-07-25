@@ -1,20 +1,34 @@
-# Stage 1: Build
-FROM rust:alpine AS build
+# Stage 1: Chef (base image with cargo-chef installed)
+FROM lukemathwalker/cargo-chef:latest-rust-alpine AS chef
 
-# Install build dependencies
 RUN apk add --no-cache musl-dev git
 RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /app
 
-# Copy manifests for dependency caching
+# Stage 2: Planner — compute the dependency recipe from the workspace
+FROM chef AS planner
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 
-# Build the binary as a static musl binary
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Stage 3: Build — cook dependencies first (cached layer), then build source
+FROM chef AS build
+
+COPY --from=planner /app/recipe.json recipe.json
+
+# Build dependencies only; this layer is cached unless Cargo.toml/Cargo.lock change
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --package clausura-cli --recipe-path recipe.json
+
+# Copy the actual source and build the binary as a static musl binary
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+
 RUN cargo build --release --target x86_64-unknown-linux-musl --package clausura-cli
 
-# Stage 2: Runtime
+# Stage 4: Runtime
 FROM alpine:latest
 
 RUN apk add --no-cache ca-certificates git

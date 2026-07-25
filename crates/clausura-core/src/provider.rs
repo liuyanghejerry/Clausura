@@ -34,6 +34,56 @@ pub trait Provider: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Retry helpers
+// ---------------------------------------------------------------------------
+
+/// Parse the `Retry-After` response header as integer seconds.
+/// Missing or unparseable values are ignored.
+fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Delay before the next retry attempt: exponential backoff (1s, 2s, 4s, ...)
+/// with jitter, raised to at least the server-provided `Retry-After` hint.
+fn retry_delay(attempt: u32, retry_after: Option<u64>) -> Duration {
+    // Tests use a short fixed backoff to keep the suite fast.
+    #[cfg(not(test))]
+    let backoff = {
+        let base = Duration::from_secs(1 << (attempt - 1));
+        base + Duration::from_millis(rand::random::<u64>() % 500)
+    };
+    #[cfg(test)]
+    let backoff = Duration::from_millis(10 * (1 << (attempt - 1)));
+
+    match retry_after {
+        Some(secs) => backoff.max(Duration::from_secs(secs)),
+        None => backoff,
+    }
+}
+
+/// Log a failed attempt that will be retried.
+fn log_retry(attempt: u32, max_retries: u32, reason: &str) {
+    tracing::warn!(
+        attempt = attempt + 1,
+        max_retries,
+        reason = %reason,
+        "LLM request failed, retrying"
+    );
+}
+
+/// Log when all retry attempts are exhausted.
+fn log_retries_exhausted(max_retries: u32, err: &ProviderError) {
+    tracing::warn!(
+        max_retries,
+        reason = %err,
+        "LLM request failed, retries exhausted"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // OpenAI-compatible provider
 // ---------------------------------------------------------------------------
 
@@ -54,7 +104,7 @@ impl Default for OpenAIProviderConfig {
             api_key: String::new(),
             base_url: "https://api.openai.com/v1".to_string(),
             max_retries: 3,
-            timeout_secs: 60,
+            timeout_secs: 120,
         }
     }
 }
@@ -158,12 +208,11 @@ impl OpenAICompatibleProvider {
         let body = self.build_request_body(messages, tools);
 
         let mut last_error = None;
+        let mut retry_after = None;
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
-                // Exponential backoff with jitter: 1s, 2s, 4s, ...
-                let base_delay = Duration::from_secs(1 << (attempt - 1));
-                let jitter_ms: u64 = rand::random::<u64>() % 500;
-                tokio::time::sleep(base_delay + Duration::from_millis(jitter_ms)).await;
+                // Exponential backoff with jitter, honoring `Retry-After`.
+                tokio::time::sleep(retry_delay(attempt, retry_after.take())).await;
             }
 
             let response = self
@@ -184,9 +233,23 @@ impl OpenAICompatibleProvider {
                             serde_json::from_str(&text).map_err(ProviderError::JsonError)?;
                         return Self::parse_response(data);
                     } else if status.as_u16() == 429 {
+                        retry_after = retry_after_secs(&resp);
+                        log_retry(
+                            attempt,
+                            self.config.max_retries,
+                            &format!("rate limited (HTTP {status})"),
+                        );
                         last_error = Some(ProviderError::RateLimited("Rate limited".into()));
                         continue;
                     } else if status.is_server_error() {
+                        if status.as_u16() == 503 {
+                            retry_after = retry_after_secs(&resp);
+                        }
+                        log_retry(
+                            attempt,
+                            self.config.max_retries,
+                            &format!("server error (HTTP {status})"),
+                        );
                         last_error = Some(ProviderError::ServerError(format!("HTTP {}", status)));
                         continue;
                     } else if status.as_u16() == 401 {
@@ -201,9 +264,11 @@ impl OpenAICompatibleProvider {
                 }
                 Err(e) => {
                     if e.is_timeout() {
+                        log_retry(attempt, self.config.max_retries, "request timed out");
                         last_error = Some(ProviderError::Timeout("Request timed out".into()));
                         continue;
                     } else if e.is_connect() {
+                        log_retry(attempt, self.config.max_retries, "connection error");
                         last_error = Some(ProviderError::NetworkError(e));
                         continue;
                     } else {
@@ -213,7 +278,10 @@ impl OpenAICompatibleProvider {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| ProviderError::ServerError("Max retries exceeded".into())))
+        let err =
+            last_error.unwrap_or_else(|| ProviderError::ServerError("Max retries exceeded".into()));
+        log_retries_exhausted(self.config.max_retries, &err);
+        Err(err)
     }
 
     /// Parse the OpenAI-style JSON response into our `ChatResponse`.
@@ -342,7 +410,7 @@ impl Default for AnthropicProviderConfig {
             api_key: String::new(),
             base_url: "https://api.anthropic.com".to_string(),
             max_retries: 3,
-            timeout_secs: 60,
+            timeout_secs: 120,
         }
     }
 }
@@ -454,11 +522,11 @@ impl AnthropicProvider {
         }
 
         let mut last_error = None;
+        let mut retry_after = None;
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
-                let base_delay = Duration::from_secs(1 << (attempt - 1));
-                let jitter = Duration::from_millis(rand::random::<u64>() % 500);
-                tokio::time::sleep(base_delay + jitter).await;
+                // Exponential backoff with jitter, honoring `Retry-After`.
+                tokio::time::sleep(retry_delay(attempt, retry_after.take())).await;
             }
 
             let response = self
@@ -480,9 +548,23 @@ impl AnthropicProvider {
                             serde_json::from_str(&text).map_err(ProviderError::JsonError)?;
                         return Self::parse_response(&data);
                     } else if status.as_u16() == 429 {
+                        retry_after = retry_after_secs(&resp);
+                        log_retry(
+                            attempt,
+                            self.config.max_retries,
+                            &format!("rate limited (HTTP {status})"),
+                        );
                         last_error = Some(ProviderError::RateLimited("Rate limited".into()));
                         continue;
                     } else if status.is_server_error() {
+                        if status.as_u16() == 503 {
+                            retry_after = retry_after_secs(&resp);
+                        }
+                        log_retry(
+                            attempt,
+                            self.config.max_retries,
+                            &format!("server error (HTTP {status})"),
+                        );
                         last_error = Some(ProviderError::ServerError(format!("HTTP {}", status)));
                         continue;
                     } else if status.as_u16() == 401 || status.as_u16() == 403 {
@@ -497,6 +579,11 @@ impl AnthropicProvider {
                 }
                 Err(e) => {
                     if e.is_timeout() || e.is_connect() {
+                        log_retry(
+                            attempt,
+                            self.config.max_retries,
+                            "timeout or connection error",
+                        );
                         last_error = Some(ProviderError::NetworkError(e));
                         continue;
                     }
@@ -505,7 +592,10 @@ impl AnthropicProvider {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| ProviderError::ServerError("Max retries exceeded".into())))
+        let err =
+            last_error.unwrap_or_else(|| ProviderError::ServerError("Max retries exceeded".into()));
+        log_retries_exhausted(self.config.max_retries, &err);
+        Err(err)
     }
 
     fn parse_response(data: &serde_json::Value) -> Result<ChatResponse, ProviderError> {
@@ -629,7 +719,7 @@ impl Default for CustomProviderConfig {
             base_url: String::new(),
             auth_header: "Authorization".to_string(),
             max_retries: 3,
-            timeout_secs: 60,
+            timeout_secs: 120,
         }
     }
 }
@@ -670,11 +760,11 @@ impl Provider for CustomProvider {
         }
 
         let mut last_error = None;
+        let mut retry_after = None;
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
-                let base_delay = Duration::from_secs(1 << (attempt - 1));
-                let jitter = Duration::from_millis(rand::random::<u64>() % 500);
-                tokio::time::sleep(base_delay + jitter).await;
+                // Exponential backoff with jitter, honoring `Retry-After`.
+                tokio::time::sleep(retry_delay(attempt, retry_after.take())).await;
             }
 
             let mut request = self
@@ -703,9 +793,23 @@ impl Provider for CustomProvider {
                             serde_json::from_str(&text).map_err(ProviderError::JsonError)?;
                         return OpenAICompatibleProvider::parse_response(data);
                     } else if status.as_u16() == 429 {
+                        retry_after = retry_after_secs(&resp);
+                        log_retry(
+                            attempt,
+                            self.config.max_retries,
+                            &format!("rate limited (HTTP {status})"),
+                        );
                         last_error = Some(ProviderError::RateLimited("Rate limited".into()));
                         continue;
                     } else if status.is_server_error() {
+                        if status.as_u16() == 503 {
+                            retry_after = retry_after_secs(&resp);
+                        }
+                        log_retry(
+                            attempt,
+                            self.config.max_retries,
+                            &format!("server error (HTTP {status})"),
+                        );
                         last_error = Some(ProviderError::ServerError(format!("HTTP {}", status)));
                         continue;
                     } else if status.as_u16() == 401 || status.as_u16() == 403 {
@@ -720,6 +824,11 @@ impl Provider for CustomProvider {
                 }
                 Err(e) => {
                     if e.is_timeout() || e.is_connect() {
+                        log_retry(
+                            attempt,
+                            self.config.max_retries,
+                            "timeout or connection error",
+                        );
                         last_error = Some(ProviderError::NetworkError(e));
                         continue;
                     }
@@ -728,7 +837,10 @@ impl Provider for CustomProvider {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| ProviderError::ServerError("Max retries exceeded".into())))
+        let err =
+            last_error.unwrap_or_else(|| ProviderError::ServerError("Max retries exceeded".into()));
+        log_retries_exhausted(self.config.max_retries, &err);
+        Err(err)
     }
 
     fn count_tokens(&self, text: &str) -> u64 {
@@ -1009,6 +1121,135 @@ pub mod tests {
             .unwrap();
 
         assert_eq!(response.message.content, "OK after retry");
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_500_then_success() {
+        let mock_server = MockServer::start().await;
+
+        // First call: 500, subsequent calls: 200
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "OK after server error"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let provider = OpenAICompatibleProvider::new(OpenAIProviderConfig {
+            base_url: mock_server.uri(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let response = provider
+            .chat(&[Message::new(Role::User, "Hi")])
+            .await
+            .unwrap();
+
+        assert_eq!(response.message.content, "OK after server error");
+    }
+
+    #[tokio::test]
+    async fn test_retry_429_exhausted() {
+        let mock_server = MockServer::start().await;
+
+        // Always 429: 1 initial request + 2 retries = 3 requests total.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(3)
+            .mount(&mock_server)
+            .await;
+
+        let provider = OpenAICompatibleProvider::new(OpenAIProviderConfig {
+            base_url: mock_server.uri(),
+            api_key: "sk-test".into(),
+            max_retries: 2,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let result = provider.chat(&[Message::new(Role::User, "Hi")]).await;
+
+        assert!(matches!(result, Err(ProviderError::RateLimited(_))));
+    }
+
+    #[tokio::test]
+    async fn test_no_retry_on_400() {
+        let mock_server = MockServer::start().await;
+
+        // 400 is not retryable: exactly one request.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = OpenAICompatibleProvider::new(OpenAIProviderConfig {
+            base_url: mock_server.uri(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let result = provider.chat(&[Message::new(Role::User, "Hi")]).await;
+
+        assert!(matches!(result, Err(ProviderError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_header_still_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        // First call: 429 with a Retry-After hint, subsequent calls: 200
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "OK after retry-after"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let provider = OpenAICompatibleProvider::new(OpenAIProviderConfig {
+            base_url: mock_server.uri(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let response = provider
+            .chat(&[Message::new(Role::User, "Hi")])
+            .await
+            .unwrap();
+
+        assert_eq!(response.message.content, "OK after retry-after");
     }
 
     #[tokio::test]

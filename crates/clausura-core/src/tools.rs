@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 // ---------------------------------------------------------------------------
 // Tool trait
@@ -23,6 +24,39 @@ pub trait Tool: Send + Sync {
     fn parameters(&self) -> Value;
     /// Execute the tool with given arguments
     async fn execute(&self, args: Value) -> Result<String, ToolError>;
+}
+
+// ---------------------------------------------------------------------------
+// Output truncation
+// ---------------------------------------------------------------------------
+
+/// Max bytes of tool output before truncation.
+const MAX_OUTPUT_BYTES: usize = 32 * 1024;
+/// Max lines of tool output before truncation.
+const MAX_OUTPUT_LINES: usize = 1000;
+
+/// Truncate tool output to at most 32 KB or 1000 lines, whichever comes first.
+/// Appends a marker when truncation occurs.
+pub(crate) fn truncate_output(output: String) -> String {
+    let mut keep_end = output.len();
+    let mut offset = 0usize;
+    for (lines_kept, line) in output.split_inclusive('\n').enumerate() {
+        if lines_kept >= MAX_OUTPUT_LINES || offset + line.len() > MAX_OUTPUT_BYTES {
+            keep_end = offset;
+            break;
+        }
+        offset += line.len();
+    }
+
+    if keep_end == output.len() {
+        return output;
+    }
+    let mut truncated = output[..keep_end].to_string();
+    truncated.truncate(truncated.trim_end_matches('\n').len());
+    truncated.push_str(
+        "\n... [output truncated: limit is 32KB or 1000 lines, use offset/limit or a narrower query]",
+    );
+    truncated
 }
 
 // ---------------------------------------------------------------------------
@@ -162,27 +196,42 @@ impl Tool for ReadFileTool {
             .as_str()
             .ok_or_else(|| ToolError::ExecutionFailed("Missing 'path' argument".into()))?;
         let resolved = self.resolve_path(path_str)?;
-        let content = tokio::fs::read_to_string(&resolved)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Read error: {}", e)))?;
 
         let offset = args["offset"].as_u64().unwrap_or(1) as usize;
         let limit = args["limit"].as_u64().map(|l| l as usize);
 
+        if limit == Some(0) {
+            return Ok(String::new());
+        }
+
+        let file = tokio::fs::File::open(&resolved)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Read error: {}", e)))?;
+        let mut lines = BufReader::new(file).lines();
+
+        // When no limit is given, cap at the 1000-line output limit. Read one
+        // extra line so truncate_output appends its truncation marker.
+        let max_take = limit.unwrap_or(MAX_OUTPUT_LINES + 1);
+
         // offset is 1-based: offset=1 means no skip
-        let lines: Vec<&str> = content.lines().skip(offset.saturating_sub(1)).collect();
-
-        let result = if let Some(limit) = limit {
-            if limit == 0 {
-                String::new()
-            } else {
-                lines.into_iter().take(limit).collect::<Vec<_>>().join("\n")
+        let mut to_skip = offset.saturating_sub(1);
+        let mut result_lines: Vec<String> = Vec::new();
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Read error: {}", e)))?
+        {
+            if to_skip > 0 {
+                to_skip -= 1;
+                continue;
             }
-        } else {
-            lines.join("\n")
-        };
+            result_lines.push(line);
+            if result_lines.len() >= max_take {
+                break;
+            }
+        }
 
-        Ok(result)
+        Ok(truncate_output(result_lines.join("\n")))
     }
 }
 
@@ -258,7 +307,8 @@ impl Tool for GitDiffTool {
             &["diff"]
         };
 
-        self.run_git(git_args).await
+        let output = self.run_git(git_args).await?;
+        Ok(truncate_output(output))
     }
 }
 
@@ -266,7 +316,7 @@ impl Tool for GitDiffTool {
 // ShellExecTool
 // ---------------------------------------------------------------------------
 
-/// Executes shell commands from a configured allowlist.
+/// Executes commands from a configured allowlist, directly (no shell).
 pub struct ShellExecTool {
     workspace_root: PathBuf,
     allowlist: Vec<String>,
@@ -280,24 +330,23 @@ impl ShellExecTool {
         }
     }
 
-    fn check_allowed(&self, command: &str) -> Result<(), ToolError> {
-        let cmd_name = command.split_whitespace().next().unwrap_or("");
+    fn check_allowed(&self, program: &str) -> Result<(), ToolError> {
         if self.allowlist.is_empty() {
             return Err(ToolError::SandboxViolation(
                 "No commands allowed (empty allowlist)".into(),
             ));
         }
         // Check both the raw token and its basename to support "/usr/bin/git" style
-        let basename = Path::new(cmd_name)
+        let basename = Path::new(program)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or(cmd_name);
-        let allowed = self.allowlist.contains(&cmd_name.to_string())
+            .unwrap_or(program);
+        let allowed = self.allowlist.contains(&program.to_string())
             || self.allowlist.contains(&basename.to_string());
         if !allowed {
             return Err(ToolError::SandboxViolation(format!(
                 "Command not in allowlist: {} (basename: {}). Allowed: {:?}",
-                cmd_name, basename, self.allowlist
+                program, basename, self.allowlist
             )));
         }
         Ok(())
@@ -311,32 +360,43 @@ impl Tool for ShellExecTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command from the allowed list."
+        "Execute a command from the allowed list. The command is executed directly WITHOUT a shell, so shell metacharacters like ';', '|', '$()' or '>' have no effect."
     }
 
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Shell command to execute"
+                "argv": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Command and arguments to execute directly, e.g. [\"git\", \"status\"]"
                 }
             },
-            "required": ["command"]
+            "required": ["argv"]
         })
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let command = args["command"]
-            .as_str()
-            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'command' argument".into()))?;
+        let argv: Vec<String> = args["argv"]
+            .as_array()
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'argv' argument".into()))?
+            .iter()
+            .map(|v| {
+                v.as_str().map(String::from).ok_or_else(|| {
+                    ToolError::ExecutionFailed("'argv' elements must be strings".into())
+                })
+            })
+            .collect::<Result<_, ToolError>>()?;
 
-        self.check_allowed(command)?;
+        let (program, rest) = argv
+            .split_first()
+            .ok_or_else(|| ToolError::ExecutionFailed("'argv' must not be empty".into()))?;
 
-        let output = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
+        self.check_allowed(program)?;
+
+        let output = tokio::process::Command::new(program)
+            .args(rest)
             .current_dir(&self.workspace_root)
             .output()
             .await
@@ -346,14 +406,14 @@ impl Tool for ShellExecTool {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if output.status.success() {
-            Ok(stdout.to_string())
+            Ok(truncate_output(stdout.to_string()))
         } else {
             // Return stderr as the output even on failure (tool result, not error)
-            Ok(format!(
+            Ok(truncate_output(format!(
                 "Exit code: {}\nStderr: {}",
                 output.status.code().unwrap_or(-1),
                 stderr
-            ))
+            )))
         }
     }
 }
@@ -537,7 +597,7 @@ impl Tool for ListFilesTool {
             include_size,
         );
 
-        Ok(lines.join("\n"))
+        Ok(truncate_output(lines.join("\n")))
     }
 }
 
@@ -594,19 +654,20 @@ fn search_file(
     };
     let rel = path.strip_prefix(cfg.root).unwrap_or(path);
     for (line_num, line) in content.lines().enumerate() {
-        if *max_results > 0 && results.len() >= *max_results {
-            *remaining += 1;
-            continue;
-        }
         let matched = if cfg.is_regex {
             cfg.regex.is_some_and(|re| re.is_match(line))
         } else {
             line.contains(cfg.pattern)
         };
-        if matched {
-            let truncated = if line.len() > 200 { &line[..200] } else { line };
-            results.push(format!("{}:{}: {}", rel.display(), line_num + 1, truncated));
+        if !matched {
+            continue;
         }
+        if *max_results > 0 && results.len() >= *max_results {
+            *remaining += 1;
+            continue;
+        }
+        let truncated = if line.len() > 200 { &line[..200] } else { line };
+        results.push(format!("{}:{}: {}", rel.display(), line_num + 1, truncated));
     }
     true
 }
@@ -791,7 +852,7 @@ impl Tool for GrepTool {
             ));
         }
 
-        Ok(output)
+        Ok(truncate_output(output))
     }
 }
 
@@ -945,6 +1006,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_limit_from_large_file() {
+        let (_tmp, root) = setup_workspace();
+        let test_file = root.join("large.txt");
+        let mut content = String::new();
+        for i in 1..=10000 {
+            content.push_str(&format!("line {}\n", i));
+        }
+        std::fs::write(&test_file, content).unwrap();
+
+        let tool = ReadFileTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "large.txt", "offset": 5000, "limit": 3}))
+            .await
+            .unwrap();
+        assert_eq!(result, "line 5000\nline 5001\nline 5002");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_output_truncation() {
+        let (_tmp, root) = setup_workspace();
+        let test_file = root.join("big.txt");
+        let mut content = String::new();
+        for i in 1..=1500 {
+            content.push_str(&format!("line {}\n", i));
+        }
+        std::fs::write(&test_file, content).unwrap();
+
+        let tool = ReadFileTool::new(root);
+        // No limit: capped at the 1000-line output limit with a marker
+        let result = tool
+            .execute(serde_json::json!({"path": "big.txt"}))
+            .await
+            .unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 1001, "Expected 1000 lines + marker");
+        assert!(result.contains("[output truncated:"));
+        assert!(result.contains("line 1000"));
+        assert!(!result.contains("line 1001"));
     }
 
     // -----------------------------------------------------------------------
@@ -1103,6 +1205,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_git_diff_output_truncation() {
+        let (_tmp, root) = setup_workspace();
+        init_git_repo(&root).await;
+
+        let mut content = String::new();
+        for i in 1..=1500 {
+            content.push_str(&format!("line {}\n", i));
+        }
+        std::fs::write(root.join("big.txt"), &content).unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(&root)
+            .output()
+            .await
+            .unwrap();
+
+        // Change every line → diff well over 1000 lines
+        let mut updated = String::new();
+        for i in 1..=1500 {
+            updated.push_str(&format!("changed {}\n", i));
+        }
+        std::fs::write(root.join("big.txt"), &updated).unwrap();
+
+        let tool = GitDiffTool::new(root);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(
+            result.contains("[output truncated:"),
+            "Expected truncation marker, got {} bytes",
+            result.len()
+        );
+        assert!(
+            result.lines().count() <= 1001,
+            "Expected at most 1000 lines + marker"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // ShellExecTool tests
     // -----------------------------------------------------------------------
@@ -1114,7 +1259,7 @@ mod tests {
         let tool = ShellExecTool::new(root, allowlist);
 
         let result = tool
-            .execute(serde_json::json!({"command": "git status"}))
+            .execute(serde_json::json!({"argv": ["git", "status"]}))
             .await;
         assert!(result.is_ok());
     }
@@ -1126,7 +1271,7 @@ mod tests {
         let tool = ShellExecTool::new(root, allowlist);
 
         let result = tool
-            .execute(serde_json::json!({"command": "rm -rf /"}))
+            .execute(serde_json::json!({"argv": ["rm", "-rf", "/"]}))
             .await;
         assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
     }
@@ -1137,7 +1282,7 @@ mod tests {
         let allowlist: Vec<String> = vec![];
         let tool = ShellExecTool::new(root, allowlist);
 
-        let result = tool.execute(serde_json::json!({"command": "ls"})).await;
+        let result = tool.execute(serde_json::json!({"argv": ["ls"]})).await;
         assert!(matches!(result, Err(ToolError::SandboxViolation(_))));
     }
 
@@ -1149,6 +1294,63 @@ mod tests {
 
         let result = tool.execute(serde_json::json!({})).await;
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_shell_exec_empty_argv() {
+        let (_tmp, root) = setup_workspace();
+        let allowlist = vec!["git".into()];
+        let tool = ShellExecTool::new(root, allowlist);
+
+        let result = tool.execute(serde_json::json!({"argv": []})).await;
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_shell_exec_no_shell_injection() {
+        let (_tmp, root) = setup_workspace();
+        let allowlist = vec!["echo".into()];
+        let tool = ShellExecTool::new(root.clone(), allowlist);
+
+        // Metacharacters must be passed through as literal argv elements,
+        // not interpreted by a shell.
+        let result = tool
+            .execute(serde_json::json!({"argv": ["echo", "hello; touch INJECTION_MARKER"]}))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("hello; touch INJECTION_MARKER"),
+            "Expected literal metacharacters in output, got: {}",
+            result
+        );
+        assert!(
+            !root.join("INJECTION_MARKER").exists(),
+            "Injection marker file must not be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_exec_output_truncation() {
+        let (_tmp, root) = setup_workspace();
+        let allowlist = vec!["echo".into()];
+        let tool = ShellExecTool::new(root, allowlist);
+
+        // 40 KB single argument → output exceeds the 32KB limit
+        let big = "x".repeat(40 * 1024);
+        let result = tool
+            .execute(serde_json::json!({"argv": ["echo", big]}))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("[output truncated:"),
+            "Expected truncation marker, got {} bytes",
+            result.len()
+        );
+        assert!(
+            result.len() <= 32 * 1024 + 128,
+            "Output should be bounded near 32KB, got {}",
+            result.len()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1305,6 +1507,29 @@ mod tests {
             !result.contains("a/b/c/d/deep.txt"),
             "Did not expect a/b/c/d/deep.txt (depth > 3) in output:\n{}",
             result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_files_output_truncation() {
+        let (_tmp, root) = setup_workspace();
+        for i in 0..1500 {
+            std::fs::write(root.join(format!("file{:04}.txt", i)), "").unwrap();
+        }
+
+        let tool = ListFilesTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": ".", "recursive": false}))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("[output truncated:"),
+            "Expected truncation marker, got {} lines",
+            result.lines().count()
+        );
+        assert!(
+            result.lines().count() <= 1001,
+            "Expected at most 1000 lines + marker"
         );
     }
 
@@ -1532,13 +1757,45 @@ mod tests {
             .await
             .unwrap();
         let lines: Vec<&str> = result.lines().collect();
-        let match_lines = lines.iter().filter(|l| l.contains(":")).count();
-        let truncation_line = lines.iter().find(|l| l.starts_with("... and "));
+        // The truncation line also contains ":", so count real match lines by prefix
+        let match_lines = lines.iter().filter(|l| l.starts_with("big.txt:")).count();
         assert_eq!(match_lines, 20, "Expected 20 match lines, got: {}", result);
-        assert!(
-            truncation_line.is_some(),
-            "Expected truncation notice, got: {}",
+        let truncation_line = lines.iter().find(|l| l.starts_with("... and "));
+        assert_eq!(
+            truncation_line,
+            Some(&"... and 80 more matches (use more specific pattern or narrower path)"),
+            "Expected exact remaining count, got: {}",
             result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grep_output_truncation() {
+        let (_tmp, root) = setup_workspace();
+        // 200 matching lines of ~250 chars each → results exceed the 32KB limit
+        let long_line = format!("match {}", "x".repeat(250));
+        let content = (0..200)
+            .map(|_| long_line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.join("wide.txt"), content).unwrap();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(
+                serde_json::json!({"path": "wide.txt", "pattern": "match", "max_results": 200}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.contains("[output truncated:"),
+            "Expected truncation marker, got {} bytes",
+            result.len()
+        );
+        assert!(
+            result.len() <= 32 * 1024 + 128,
+            "Output should be bounded near 32KB, got {}",
+            result.len()
         );
     }
 
@@ -1572,6 +1829,7 @@ mod tests {
     // Symlink security tests (P2-4, P2-5)
     // -----------------------------------------------------------------------
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_list_files_symlink_metadata_no_leak() {
         let (_tmp, root) = setup_workspace();
@@ -1597,6 +1855,7 @@ mod tests {
         let _ = std::fs::remove_file(&outside);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_grep_skips_symlink_outside_workspace() {
         let (_tmp, root) = setup_workspace();
@@ -1640,7 +1899,7 @@ mod tests {
 
         // /usr/bin/git should match because basename is "git"
         let result = tool
-            .execute(serde_json::json!({"command": "git status"}))
+            .execute(serde_json::json!({"argv": ["git", "status"]}))
             .await;
         assert!(result.is_ok(), "git should be allowed: {:?}", result.err());
     }
@@ -1655,7 +1914,7 @@ mod tests {
         // by the shell's own sandboxing (workspace root). But the allowlist check
         // should at minimum not match "/etc/passwd" as "cat".
         let result = tool
-            .execute(serde_json::json!({"command": "/etc/passwd"}))
+            .execute(serde_json::json!({"argv": ["/etc/passwd"]}))
             .await;
         assert!(
             matches!(result, Err(ToolError::SandboxViolation(_))),

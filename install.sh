@@ -46,10 +46,12 @@ mkdir -p "$INSTALL_DIR"
 
 # --- Construct download URL ---
 if [ "$APP_VERSION" = "latest" ]; then
-    DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/latest/download/${APP_NAME}-${ARCH}-${TARGET}.tar.gz"
+    BASE_URL="https://github.com/$GITHUB_REPO/releases/latest/download"
 else
-    DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/download/v${APP_VERSION}/${APP_NAME}-${ARCH}-${TARGET}.tar.gz"
+    BASE_URL="https://github.com/$GITHUB_REPO/releases/download/v${APP_VERSION}"
 fi
+DOWNLOAD_URL="$BASE_URL/${APP_NAME}-${ARCH}-${TARGET}.tar.gz"
+CHECKSUMS_URL="$BASE_URL/checksums.txt"
 
 # --- Try prebuilt binary first ---
 download_binary() {
@@ -77,6 +79,32 @@ download_binary() {
         warn "Prebuilt binary not available (HTTP $http_code)"
         return 1
     fi
+
+    # Download checksums and verify the tarball's SHA256
+    if command -v curl &>/dev/null; then
+        curl -fsSL -o "$tmp_dir/checksums.txt" "$CHECKSUMS_URL" || true
+    else
+        wget -q -O "$tmp_dir/checksums.txt" "$CHECKSUMS_URL" || true
+    fi
+
+    if [ ! -s "$tmp_dir/checksums.txt" ]; then
+        warn "Checksum file not available, cannot verify download"
+        return 1
+    fi
+
+    local tarball_name="${APP_NAME}-${ARCH}-${TARGET}.tar.gz"
+    local verify_ok=1
+    if [ "$OS" = "darwin" ]; then
+        (cd "$tmp_dir" && grep " ${tarball_name}\$" checksums.txt | shasum -a 256 -c) && verify_ok=0
+    else
+        (cd "$tmp_dir" && grep " ${tarball_name}\$" checksums.txt | sha256sum -c) && verify_ok=0
+    fi
+
+    if [ "$verify_ok" != "0" ]; then
+        warn "Checksum verification failed for $tarball_name"
+        return 1
+    fi
+    info "Checksum verified."
 
     tar xzf "$tmp_dir/${APP_NAME}.tar.gz" -C "$tmp_dir"
     cp "$tmp_dir/${APP_NAME}" "$INSTALL_DIR/"

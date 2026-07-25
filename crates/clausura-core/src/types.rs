@@ -180,6 +180,19 @@ pub enum AmbiguityPolicy {
     ProceedWithCaution,
 }
 
+/// Policy for handling incomplete agent runs (context truncated or the
+/// iteration limit exhausted without a clean `Stop`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OnIncompletePolicy {
+    /// Fail closed: treat the run as an error (exit code 2).
+    #[default]
+    Fail,
+    /// Continue with the partial result (warning + SARIF annotation).
+    Pass,
+}
+
 /// Supported LLM vendor API types.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -378,6 +391,8 @@ pub struct TaskContract {
     pub gating_rules: Vec<GateRule>,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+    #[serde(default)]
+    pub on_incomplete: OnIncompletePolicy,
 }
 
 fn default_max_iterations() -> u32 {
@@ -605,9 +620,11 @@ mod tests {
             ambiguity_policy: AmbiguityPolicy::FailClosed,
             gating_rules: vec![],
             max_iterations: 10,
+            on_incomplete: OnIncompletePolicy::Fail,
         };
         assert_eq!(contract.ambiguity_policy, AmbiguityPolicy::FailClosed);
         assert!(contract.gating_rules.is_empty());
+        assert_eq!(contract.on_incomplete, OnIncompletePolicy::Fail);
     }
 
     #[test]
