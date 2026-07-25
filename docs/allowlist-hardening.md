@@ -179,15 +179,16 @@ tool, extended.
 ## 5. Recommendation (phased)
 
 **Phase 1 — config-compatible hardening (next minor release):**
-A + B + C + E-timeout.
+A + B + C + E-timeout. (Details settled in §6 Decisions.)
 
 - Rules become prefixes (`"git status"`); bare names unchanged in meaning.
-- Small built-in flag denylist for `git` (`-c`, `--exec-path`, `--git-dir`,
-  `--work-tree`), `tar` (`--checkpoint-action`, `--to-command`).
-- Minimal env for spawned commands; never forward `CLAUSURA_API_KEY`;
-  fixed PATH.
-- 60s default per-command timeout (`task.shell_timeout_secs`, env
-  `CLAUSURA_SHELL_TIMEOUT`).
+- Built-in flag denylist (token matching, D1) for `git` (`-c`,
+  `--exec-path`, `--git-dir`, `--work-tree`), `tar`
+  (`--checkpoint-action`, `--to-command`).
+- Whitelisted minimal env for spawned commands (D2); never forward
+  `CLAUSURA_API_KEY`; fixed PATH.
+- 120s default per-command timeout (`task.shell_timeout_secs`, env
+  `CLAUSURA_SHELL_TIMEOUT`), global policy (D3).
 
 All four are ~150 lines total, fully covered by unit tests, and keep
 existing configs working.
@@ -201,18 +202,69 @@ gets Seatbelt. Document Docker as the always-available strong option.
 G: evaluate replacing common `shell_exec` use cases with structured tools;
 keep `shell_exec` only for advanced use, off by default (as today).
 
-## 6. Open questions
+## 6. Decisions (resolved 2026-07-25)
 
-1. Should flag-injection-resistant matching (B) parse each program's args
-   properly (getopt-style), or is a substring/token denylist enough?
-   (Proposal: token denylist — simple, predictable, auditable.)
-2. Env scrubbing: do real CI setups need any inherited vars beyond
-   PATH/HOME/TERM/LANG/CI? (Needs a compat knob: `shell_env_passthrough: [...]`.)
-3. Is per-rule timeout/env/policy syntax needed, or is one global policy
-   enough for v1? (Proposal: global for Phase 1.)
-4. Windows support for `shell_exec` is currently untested
-   (`#[cfg(unix)]` tests); Phase 2 has no Windows story at all — document
-   Docker/WSL as the answer?
+The original open questions were discussed and settled as follows.
+
+### D1. Dangerous-flag matching: token denylist, not getopt parsing
+
+A full getopt-accurate parser needs per-program option tables (which flags
+take values, short-flag clustering, subcommand boundaries) — unbounded
+complexity that is never complete, and it still cannot see attacks through
+the program's own config surface (e.g. `core.pager` in a poisoned repo
+`.git/config`, which needs no flag at all). Therefore:
+
+- Denylist entries match argv tokens in all three forms: exact (`-c`),
+  attached short-option (`-cfoo=bar`), and long-option prefix
+  (`--exec-path`, `--exec-path=...`).
+- Matching stops at the `--` terminator; tokens after it are operands and
+  are not checked.
+- Residual program-config risk is closed via the environment layer (D2):
+  `GIT_PAGER=cat`, `GIT_CONFIG_NOSYSTEM=1`, etc.
+
+### D2. Environment: deny-by-default whitelist + exact-name passthrough
+
+- Default keep-list: `PATH` (fixed value
+  `/usr/local/bin:/usr/bin:/bin`, plus `$HOME/.cargo/bin` if it exists —
+  rustup installs cargo there), `HOME`, `TERM`, `LANG`, `TMPDIR`, `CI`.
+- Never forwarded, even if requested: `CLAUSURA_API_KEY` and any
+  `*_KEY` / `*_TOKEN` / `*_SECRET` / `*_PASSWORD`; loader hijack vars
+  (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_*`); runtime injection vars
+  (`BASH_ENV`, `ENV`, `PYTHONPATH`, `PERL5LIB`, `RUBYLIB`, `NODE_OPTIONS`,
+  `RUSTFLAGS`); git attack surface (`GIT_SSH_COMMAND`, `GIT_ASKPASS`,
+  `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`); `SSH_AUTH_SOCK`.
+- Safety overrides we set ourselves: `GIT_PAGER=cat`, `PAGER=cat`,
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GIT_EDITOR=:`,
+  `EDITOR=:`.
+- Escape hatch: `shell_env_passthrough: ["HTTP_PROXY", ...]` — **exact
+  variable names only, no globs**; secret-pattern names listed here are
+  refused with a warning (fail-closed).
+
+### D3. Policy granularity: global for Phase 1
+
+- `shell_timeout_secs`: one global per-command timeout, default **120s**
+  (it is a hang safeguard, not the fork-bomb defense — rlimits are a
+  separate concern — so the default favors legitimate slow commands).
+- `shell_env_passthrough`: global (D2).
+- Evolution path: `tool_allowlist` stays a flat string array; per-rule
+  policy, if ever needed, lands as a new `tool_policy` key — a
+  non-breaking addition. Matching precedence (longest-prefix-wins) is
+  deferred until then.
+
+### D4. Windows: documented non-goal, WSL2/Docker is the answer
+
+- Supported platforms are Linux and macOS. Windows is complex to sandbox
+  properly (restricted tokens are a separate engineering effort) and the
+  tool is CI-native where Linux dominates — **Windows users should use
+  WSL2 or the Docker image**. Documented as a non-goal, not "not yet".
+- Keep the door open: Phase 1 code avoids unix-only APIs; unix-specific
+  scrub entries are "remove if present", never "must exist", so the code
+  keeps compiling on Windows.
+- Add a `windows-latest` leg to the CI test matrix to enforce that
+  (compile + non-unix-gated tests must pass).
+- Phase 2 `sandbox: bwrap|seatbelt` on Windows errors out explicitly —
+  no silent degradation.
 
 ## 7. References
 
