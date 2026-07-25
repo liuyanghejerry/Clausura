@@ -385,6 +385,10 @@ pub struct TaskContract {
     pub tool_allowlist: Vec<String>,
     pub token_budget: u64,
     pub timeout_secs: u64,
+    #[serde(default = "default_shell_timeout_secs")]
+    pub shell_timeout_secs: u64,
+    #[serde(default)]
+    pub shell_env_passthrough: Vec<String>,
     #[serde(default = "default_ambiguity_policy")]
     pub ambiguity_policy: AmbiguityPolicy,
     #[serde(default)]
@@ -397,6 +401,10 @@ pub struct TaskContract {
 
 fn default_max_iterations() -> u32 {
     10
+}
+
+fn default_shell_timeout_secs() -> u64 {
+    120
 }
 
 fn default_ambiguity_policy() -> AmbiguityPolicy {
@@ -617,6 +625,8 @@ mod tests {
             tool_allowlist: vec![],
             token_budget: 32000,
             timeout_secs: 300,
+            shell_timeout_secs: 120,
+            shell_env_passthrough: vec![],
             ambiguity_policy: AmbiguityPolicy::FailClosed,
             gating_rules: vec![],
             max_iterations: 10,

@@ -200,6 +200,15 @@ task:
   token_budget: 32000                # Default. Max total tokens across all LLM calls.
   timeout_secs: 300                  # Default. Max wall-clock time in seconds.
   max_iterations: 10                 # Default. Max agent loop iterations.
+  shell_timeout_secs: 120            # Default. Per-command timeout for shell_exec.
+
+  # Optional tool allowlist
+  tool_allowlist:                    # Restrict shell commands to these argv prefixes.
+    - git status                     # "git status" allows that subcommand tree only.
+    - cargo test                     # A bare name (e.g. "git") allows all subcommands.
+  shell_env_passthrough: []          # Default. Extra env vars forwarded to shell_exec
+                                     # commands (exact names only; secret-looking names
+                                     # like *_KEY / *_TOKEN are refused).
 
   # Safety
   ambiguity_policy: fail_closed      # "fail_closed" or "proceed_with_caution".
@@ -207,10 +216,6 @@ task:
                                      # partial results, marked incomplete in logs and SARIF).
                                      # Applies when the agent loop ends without a clean stop
                                      # (context truncated or iteration limit reached).
-
-  # Optional tool allowlist
-  tool_allowlist:                    # Restrict shell commands to these binaries.
-    - git
 
   # Gating rules
   gating:                            # Optional. Evaluated in order.
@@ -242,6 +247,7 @@ task:
 | `CLAUSURA_ON_INCOMPLETE` | `task.on_incomplete` |
 | `CLAUSURA_TOKEN_BUDGET` | `task.token_budget`  |
 | `CLAUSURA_TIMEOUT`      | `task.timeout_secs`  |
+| `CLAUSURA_SHELL_TIMEOUT` | `task.shell_timeout_secs` |
 | `CLAUSURA_MAX_ITERATIONS` | `task.max_iterations` |
 
 Config loading priority: YAML file < CLI flags < environment variables.
@@ -258,6 +264,7 @@ clausura run [OPTIONS]
       --token-budget <N>    Token budget override
       --timeout <SECS>      Timeout override
       --max-iterations <N>  Max agent loop iterations  [default: 10]
+      --shell-timeout <SECS>  Per-command shell_exec timeout  [default: 120]
       --workspace <PATH>    Workspace root            [default: cwd]
       --output <PATH>       SARIF output path          [default: clausura-output.sarif]
       --resume              Resume from last checkpoint
@@ -351,6 +358,10 @@ clausura run
 
 Custom context variables for Generic CI: `CI_REPO`, `CI_PR_NUMBER`, `CI_COMMIT_SHA`, `CI_BRANCH`.
 
+### Supported platforms
+
+Clausura supports Linux and macOS. **Windows is not supported** (a documented non-goal, not "not yet") — on Windows, run Clausura under WSL2 or use the Docker image instead.
+
 ## Architecture
 
 ### Agent loop (reason -> act -> observe)
@@ -401,9 +412,17 @@ Five built-in tools:
 | `list_files`  | List directory contents, with recursive depth, glob filtering, and optional file sizes | Sandboxed to workspace; skips `.clausura/` |
 | `grep`        | Search text patterns across files with literal or regex mode, extension filtering, and binary-skip | Auto-excludes `.git`, `target`, `.clausura`, `node_modules` |
 | `git_diff`    | Run `git diff` with optional base ref or staged  | Operates inside workspace only         |
-| `shell_exec`  | Execute an allowed command (argv form, no shell) | Restricted to `tool_allowlist` entries |
+| `shell_exec`  | Execute an allowed command (argv form, no shell) | Restricted to `tool_allowlist` argv prefixes; dangerous flags denied; scrubbed env |
 
-The `shell_exec` tool is locked by default (empty allowlist = no commands). Explicitly list allowed binaries to enable it. It takes an `argv` array (e.g. `{"argv": ["git", "status"]}`) and executes `argv[0]` directly **without a shell** — shell metacharacters like `;`, `|`, `$()` or `>` are passed through as literal arguments and have no effect, so they cannot be used to bypass the allowlist. The allowlist is matched against `argv[0]` (both the raw value and its basename). Commands run with `current_dir` set to the workspace root, but allowed commands can access paths outside the workspace via arguments.
+The `shell_exec` tool is locked by default (empty allowlist = no commands). Explicitly list allowed commands to enable it. It takes an `argv` array (e.g. `{"argv": ["git", "status"]}`) and executes `argv[0]` directly **without a shell** — shell metacharacters like `;`, `|`, `$()` or `>` are passed through as literal arguments and have no effect, so they cannot be used to bypass the allowlist. Commands run with `current_dir` set to the workspace root, but allowed commands can access paths outside the workspace via arguments.
+
+**Allowlist prefix rules.** Each `tool_allowlist` entry is an argv prefix split on whitespace: an invocation is allowed when its leading tokens equal a rule's tokens. `"git status"` allows `["git", "status"]` and `["git", "status", "--short"]`, but not `["git", "log"]`. A bare program name (e.g. `"git"`) is a length-1 prefix and allows all subcommands of that program (backward compatible). The rule's first token also matches by basename, so `["/usr/bin/git", "status"]` satisfies a `"git status"` rule.
+
+**Dangerous-flag denylist.** On top of the allowlist, known-risky flags are rejected regardless of position (scanning stops at the first `--`, whose following tokens are operands): `git -c`, `git --exec-path`, `git --git-dir`, `git --work-tree`, `tar --checkpoint-action`, `tar --to-command`. Both exact and attached forms are caught (`-c foo`, `-cfoo`, `--git-dir=/x`).
+
+**Environment scrubbing.** Commands run with a minimal, deny-by-default environment: a fixed `PATH` (`/usr/local/bin:/usr/bin:/bin`, plus `$HOME/.cargo/bin` if it exists), `HOME`/`TERM`/`LANG`/`TMPDIR`/`CI` forwarded when present, and safety overrides (`GIT_PAGER=cat`, `PAGER=cat`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GIT_EDITOR=:`, `EDITOR=:`). Everything else — including `CLAUSURA_API_KEY`, `LD_PRELOAD`, `GIT_SSH_COMMAND`, `SSH_AUTH_SOCK`, `BASH_ENV` — is dropped. `shell_env_passthrough` can forward additional variables by exact name; `CLAUSURA_API_KEY` and names ending in `_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` are refused with a warning.
+
+**Per-command timeout.** Each command is killed after `shell_timeout_secs` (default 120; override with `--shell-timeout` or `CLAUSURA_SHELL_TIMEOUT`) and the tool returns a `Command timed out after Ns and was killed` result.
 
 Tool outputs are truncated at 32 KB or 1000 lines (whichever comes first) to stay within token budgets; a `[output truncated ...]` marker is appended when this happens — narrow the query or use `read_file`'s `offset`/`limit` to page through large outputs.
 

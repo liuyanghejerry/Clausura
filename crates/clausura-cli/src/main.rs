@@ -26,7 +26,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Run a Clausura task
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Manage checkpoints
     Snapshot(SnapshotArgs),
 }
@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Run(args) => {
-            let exit_code = commands::run::execute(args).await;
+            let exit_code = commands::run::execute(*args).await;
             std::process::exit(exit_code);
         }
         Commands::Snapshot(args) => {

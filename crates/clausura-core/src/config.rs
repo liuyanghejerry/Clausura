@@ -72,6 +72,10 @@ struct YamlTaskConfig {
     token_budget: u64,
     #[serde(default = "default_timeout")]
     timeout_secs: u64,
+    #[serde(default = "default_shell_timeout")]
+    shell_timeout_secs: u64,
+    #[serde(default)]
+    shell_env_passthrough: Vec<String>,
     #[serde(default = "default_ambiguity")]
     ambiguity_policy: String,
     #[serde(default)]
@@ -105,6 +109,10 @@ fn default_token_budget() -> u64 {
 
 fn default_timeout() -> u64 {
     300
+}
+
+fn default_shell_timeout() -> u64 {
+    120
 }
 
 fn default_max_iterations() -> u32 {
@@ -218,6 +226,7 @@ impl Config {
         cli_token_budget: Option<u64>,
         cli_timeout: Option<u64>,
         cli_max_iterations: Option<u32>,
+        cli_shell_timeout: Option<u64>,
         workspace: PathBuf,
         output: PathBuf,
         resume: bool,
@@ -247,6 +256,8 @@ impl Config {
                     tool_allowlist: vec![],
                     token_budget: default_token_budget(),
                     timeout_secs: default_timeout(),
+                    shell_timeout_secs: default_shell_timeout(),
+                    shell_env_passthrough: vec![],
                     ambiguity_policy: default_ambiguity(),
                     gating: vec![],
                     max_iterations: default_max_iterations(),
@@ -285,6 +296,12 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .or(cli_max_iterations)
             .unwrap_or(yaml_task.max_iterations);
+
+        let shell_timeout = std::env::var("CLAUSURA_SHELL_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(cli_shell_timeout)
+            .unwrap_or(yaml_task.shell_timeout_secs);
 
         // ---- Layer 3: Environment variable overrides ----
         let api_key = std::env::var("CLAUSURA_API_KEY")
@@ -327,6 +344,8 @@ impl Config {
                 tool_allowlist: yaml_task.tool_allowlist,
                 token_budget,
                 timeout_secs: timeout,
+                shell_timeout_secs: shell_timeout,
+                shell_env_passthrough: yaml_task.shell_env_passthrough,
                 ambiguity_policy,
                 gating_rules,
                 max_iterations,
@@ -391,6 +410,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -431,6 +451,7 @@ task:
             Some(32000), // CLI overrides token budget
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -463,6 +484,7 @@ task:
         let config = Config::load(
             Some(file.path()),
             Some("gpt-4o"), // CLI model — env should override this
+            None,
             None,
             None,
             None,
@@ -508,6 +530,7 @@ task:
             Some(16000),
             None,
             Some(120),
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -540,6 +563,7 @@ task:
             std::env::remove_var("CLAUSURA_TIMEOUT");
             std::env::remove_var("CLAUSURA_AMBIGUITY_POLICY");
             std::env::remove_var("CLAUSURA_ON_INCOMPLETE");
+            std::env::remove_var("CLAUSURA_SHELL_TIMEOUT");
         }
     }
 
@@ -549,6 +573,7 @@ task:
         clean_env_vars();
         unsafe { std::env::set_var("CLAUSURA_API_KEY", "sk-test-key") };
         let config = Config::load(
+            None,
             None,
             None,
             None,
@@ -583,6 +608,7 @@ task:
         let file = write_yaml(yaml);
         let config = Config::load(
             Some(file.path()),
+            None,
             None,
             None,
             None,
@@ -629,6 +655,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -665,6 +692,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -694,6 +722,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -714,6 +743,7 @@ task:
             None,
             None,
             Some("sk-cli-key"),
+            None,
             None,
             None,
             None,
@@ -742,6 +772,7 @@ task:
         let file = write_yaml(yaml);
         let result = Config::load(
             Some(file.path()),
+            None,
             None,
             None,
             None,
@@ -778,6 +809,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -802,6 +834,7 @@ task:
         let file = write_yaml(yaml);
         let config = Config::load(
             Some(file.path()),
+            None,
             None,
             None,
             None,
@@ -834,6 +867,7 @@ task:
         let file = write_yaml(yaml);
         let config = Config::load(
             Some(file.path()),
+            None,
             None,
             None,
             None,
@@ -873,6 +907,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -900,6 +935,7 @@ task:
         let file = write_yaml(yaml);
         let config = Config::load(
             Some(file.path()),
+            None,
             None,
             None,
             None,
@@ -940,6 +976,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -959,6 +996,7 @@ task:
             Some("sk-test"),
             Some(16000),
             Some(120),
+            None,
             None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
@@ -1012,6 +1050,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -1057,6 +1096,7 @@ task:
             None,
             None,
             None,
+            None,
             std::env::current_dir().unwrap(),
             "output.sarif".into(),
             false,
@@ -1064,5 +1104,153 @@ task:
         )
         .unwrap();
         assert_eq!(config.config_path, Some(file.path().to_path_buf()));
+    }
+
+    #[test]
+    fn test_shell_config_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.shell_timeout_secs, 120);
+        assert!(config.task.shell_env_passthrough.is_empty());
+    }
+
+    #[test]
+    fn test_shell_config_from_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  shell_timeout_secs: 30
+  shell_env_passthrough:
+    - HTTP_PROXY
+    - CARGO_NET_GIT_FETCH_WITH_CLI
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.shell_timeout_secs, 30);
+        assert_eq!(
+            config.task.shell_env_passthrough,
+            vec![
+                "HTTP_PROXY".to_string(),
+                "CARGO_NET_GIT_FETCH_WITH_CLI".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_shell_timeout_env_overrides_cli_and_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        unsafe { std::env::set_var("CLAUSURA_SHELL_TIMEOUT", "45") };
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  shell_timeout_secs: 30
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(90), // CLI flag — env should override this
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.shell_timeout_secs, 45); // env wins over CLI
+        unsafe { std::env::remove_var("CLAUSURA_SHELL_TIMEOUT") };
+    }
+
+    #[test]
+    fn test_shell_timeout_cli_overrides_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  shell_timeout_secs: 30
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(90),
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.shell_timeout_secs, 90); // CLI wins over YAML
     }
 }
