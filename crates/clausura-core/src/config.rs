@@ -70,6 +70,8 @@ struct YamlTaskConfig {
     tool_allowlist: Vec<String>,
     #[serde(default = "default_token_budget")]
     token_budget: u64,
+    #[serde(default)]
+    max_total_tokens: Option<u64>,
     #[serde(default = "default_timeout")]
     timeout_secs: u64,
     #[serde(default = "default_shell_timeout")]
@@ -182,6 +184,11 @@ fn validate_yaml(yaml: &YamlConfig) -> Result<(), ConfigError> {
             "task.token_budget must be > 0".into(),
         ));
     }
+    if yaml.task.max_total_tokens == Some(0) {
+        return Err(ConfigError::ValidationError(
+            "task.max_total_tokens must be > 0 when set".into(),
+        ));
+    }
     if yaml.task.timeout_secs == 0 {
         return Err(ConfigError::ValidationError(
             "task.timeout_secs must be > 0".into(),
@@ -255,6 +262,7 @@ impl Config {
                     prompt_template: default_prompt(),
                     tool_allowlist: vec![],
                     token_budget: default_token_budget(),
+                    max_total_tokens: None,
                     timeout_secs: default_timeout(),
                     shell_timeout_secs: default_shell_timeout(),
                     shell_env_passthrough: vec![],
@@ -284,6 +292,11 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .or(cli_token_budget)
             .unwrap_or(yaml_task.token_budget);
+
+        let max_total_tokens = std::env::var("CLAUSURA_MAX_TOTAL_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(yaml_task.max_total_tokens);
 
         let timeout = std::env::var("CLAUSURA_TIMEOUT")
             .ok()
@@ -343,6 +356,7 @@ impl Config {
                 prompt_template: yaml_task.prompt_template,
                 tool_allowlist: yaml_task.tool_allowlist,
                 token_budget,
+                max_total_tokens,
                 timeout_secs: timeout,
                 shell_timeout_secs: shell_timeout,
                 shell_env_passthrough: yaml_task.shell_env_passthrough,
@@ -560,6 +574,7 @@ task:
             std::env::remove_var("CLAUSURA_MODEL");
             std::env::remove_var("CLAUSURA_VENDOR");
             std::env::remove_var("CLAUSURA_TOKEN_BUDGET");
+            std::env::remove_var("CLAUSURA_MAX_TOTAL_TOKENS");
             std::env::remove_var("CLAUSURA_TIMEOUT");
             std::env::remove_var("CLAUSURA_AMBIGUITY_POLICY");
             std::env::remove_var("CLAUSURA_ON_INCOMPLETE");
@@ -985,6 +1000,142 @@ task:
         .unwrap();
         assert_eq!(config.task.on_incomplete, OnIncompletePolicy::Pass);
         unsafe { std::env::remove_var("CLAUSURA_ON_INCOMPLETE") };
+    }
+
+    #[test]
+    fn test_max_total_tokens_from_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  max_total_tokens: 200000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.max_total_tokens, Some(200000));
+    }
+
+    #[test]
+    fn test_max_total_tokens_defaults_to_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.max_total_tokens, None);
+    }
+
+    #[test]
+    fn test_max_total_tokens_env_overrides_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        unsafe { std::env::set_var("CLAUSURA_MAX_TOTAL_TOKENS", "500000") };
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  max_total_tokens: 200000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.max_total_tokens, Some(500000));
+        unsafe { std::env::remove_var("CLAUSURA_MAX_TOTAL_TOKENS") };
+    }
+
+    #[test]
+    fn test_zero_max_total_tokens_is_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  max_total_tokens: 0
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let result = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
