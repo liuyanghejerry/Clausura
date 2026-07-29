@@ -1,5 +1,7 @@
 # Clausura + Playwright 端到端 CI 实践
 
+> **📖 本教程是独立的长篇实战案例。** 如需查阅结构化文档，请从 [README](README.md) 开始，或直接访问 [docs/guide/](docs/guide/) 目录下的专题文档（哲学、配置、LLM、门禁、场景、CI 集成、Skills、排错）。
+>
 > 适用版本: clausura 1.0.0
 > 仓库: https://github.com/clausura/clausura
 
