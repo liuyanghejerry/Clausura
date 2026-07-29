@@ -1476,9 +1476,9 @@ task:
   timeout_secs: 60
   ambiguity_policy: fail_closed
   skill_prompts:
-    - "{}"
+    - '{}'
 "#,
-            skill_path.display()
+            skill_path.to_string_lossy()
         );
         let file = write_yaml(&yaml);
         let config = Config::load(
@@ -1574,10 +1574,10 @@ task:
   timeout_secs: 60
   ambiguity_policy: fail_closed
   skill_prompts:
-    - "{}"
+    - '{}'
   prompt_template: "User extra check."
 "#,
-            tmp.path().join("check.md").display()
+            tmp.path().join("check.md").to_string_lossy()
         );
         let file = write_yaml(&yaml);
         let config = Config::load(
