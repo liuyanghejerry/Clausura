@@ -1548,7 +1548,10 @@ task:
             LogFormat::Json,
         )
         .unwrap();
-        assert!(config.task.prompt_template.contains("[Skill: team/vue-check]"));
+        assert!(config
+            .task
+            .prompt_template
+            .contains("[Skill: team/vue-check]"));
         assert!(config.task.prompt_template.contains("# Vue best practices"));
     }
 

@@ -39,9 +39,8 @@ pub fn resolve_skill(name_or_path: &str, workspace: &Path) -> Result<String, Con
 // ---------------------------------------------------------------------------
 
 fn load_skill_file(path: &Path) -> Result<String, ConfigError> {
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        ConfigError::FileNotFound(format!("{}: {e}", path.display()))
-    })?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::FileNotFound(format!("{}: {e}", path.display())))?;
     Ok(strip_frontmatter(&content))
 }
 
@@ -49,10 +48,7 @@ fn resolve_named_skill(name: &str, workspace: &Path) -> Result<String, ConfigErr
     let skill_rel = format!("{}/SKILL.md", name.trim_end_matches('/'));
 
     let search_paths: Vec<PathBuf> = vec![
-        workspace
-            .join(".clausura")
-            .join("skills")
-            .join(&skill_rel),
+        workspace.join(".clausura").join("skills").join(&skill_rel),
         dirs::home_dir()
             .unwrap_or_default()
             .join(".clausura")
@@ -231,11 +227,7 @@ mod tests {
         let skill_path = tmp.path().join("my-skill.md");
         std::fs::write(&skill_path, "# Check for bugs").unwrap();
 
-        let result = resolve_skill(
-            skill_path.to_str().unwrap(),
-            tmp.path(),
-        )
-        .unwrap();
+        let result = resolve_skill(skill_path.to_str().unwrap(), tmp.path()).unwrap();
         assert_eq!(result, "# Check for bugs");
     }
 
@@ -259,7 +251,11 @@ mod tests {
             .join("team")
             .join("my-check");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: t\n---\nTeam check body").unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: t\n---\nTeam check body",
+        )
+        .unwrap();
 
         let result = resolve_skill("team/my-check", tmp.path()).unwrap();
         assert_eq!(result, "Team check body");
@@ -284,11 +280,7 @@ mod tests {
     #[test]
     fn test_resolve_named_skill_trailing_slash() {
         let tmp = TempDir::new().unwrap();
-        let skill_dir = tmp
-            .path()
-            .join(".clausura")
-            .join("skills")
-            .join("trailing");
+        let skill_dir = tmp.path().join(".clausura").join("skills").join("trailing");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), "body").unwrap();
 
