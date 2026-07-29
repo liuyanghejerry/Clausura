@@ -172,6 +172,67 @@ clausura run --dry-run  # show the execution plan
 | 2    | Error         | Runtime error (provider, timeout, etc.), or an incomplete agent run with `on_incomplete: fail` |
 | 3    | Config error  | Invalid configuration                    |
 
+## Using Skills
+
+Clausura 1.2.0+ can reuse community skill files (Markdown) as review prompts. Skills answer "what and how to review", while gating rules answer "how many findings is too many" — the two are cleanly separated.
+
+### Skill file format
+
+A skill is a Markdown file, optionally with YAML frontmatter:
+
+```markdown
+---
+name: security-review
+description: 检查 SQL 注入、XSS、硬编码密钥
+---
+
+# 安全代码审查
+
+## SQL 注入
+- 任何字符串拼接构造的 SQL 查询
+- rule_id: `sql-injection`
+- severity: `error`
+```
+
+The frontmatter is stripped automatically; only the Markdown body is injected into the agent's system prompt.
+
+### Referencing skills
+
+```yaml
+task:
+  skill_prompts:
+    # Local file (relative to workspace or absolute)
+    - ./skills/security-review.md
+
+    # Named skill (looks in .clausura/skills/<name>/SKILL.md,
+    # then ~/.clausura/skills/<name>/SKILL.md)
+    - security-review
+    - team/vue-best-practices
+
+  # Optional: append your own extra instructions
+  prompt_template: |
+    另外检查：禁止 console.log
+
+  gating:
+    - rule: sql-injection
+      max_findings: 0
+      action: fail
+```
+
+### Installing community skills
+
+```bash
+# Project-level (only this repo)
+mkdir -p .clausura/skills/security-review
+cp ~/Downloads/security-review-SKILL.md .clausura/skills/security-review/SKILL.md
+
+# User-level (available to all your projects)
+mkdir -p ~/.clausura/skills/team/vue-check
+cp ~/Downloads/vue-check-SKILL.md ~/.clausura/skills/team/vue-check/SKILL.md
+```
+
+See [`examples/`](examples/) for ready-to-use skill files and a sample configuration.
+
 ## Configuration Reference
 
 ### YAML schema
@@ -195,6 +256,9 @@ task:
 
   # Prompt
   prompt_template: "{{task_description}}"  # Default. The agent's system prompt.
+  skill_prompts: []                           # Optional. Reuse community skill files.
+                                               # Supports local paths, named references,
+                                               # and remote URLs.
 
   # Limits
   token_budget: 32000                # Default. Context-window budget: older messages are

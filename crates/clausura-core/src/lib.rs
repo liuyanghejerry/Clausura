@@ -9,6 +9,7 @@ pub mod logging;
 pub mod provider;
 pub mod rules;
 pub mod sarif;
+pub mod skills;
 pub mod snapshot;
 pub mod tools;
 pub mod types;
