@@ -61,6 +61,8 @@ struct YamlTaskConfig {
     #[serde(default)]
     description: String,
     #[serde(default)]
+    skill_prompts: Vec<String>,
+    #[serde(default)]
     model: String,
     #[serde(default)]
     vendor: String,
@@ -257,6 +259,7 @@ impl Config {
                 YamlTaskConfig {
                     name: "default".into(),
                     description: String::new(),
+                    skill_prompts: vec![],
                     model: String::new(),
                     vendor: String::new(),
                     prompt_template: default_prompt(),
@@ -345,6 +348,18 @@ impl Config {
             })
             .collect();
 
+        // ---- Resolve skill prompts ----
+        let prompt_template = if yaml_task.skill_prompts.is_empty() {
+            yaml_task.prompt_template
+        } else {
+            let mut skill_contents: Vec<(String, String)> = Vec::new();
+            for skill_ref in &yaml_task.skill_prompts {
+                let content = crate::skills::resolve_skill(skill_ref, &workspace)?;
+                skill_contents.push((skill_ref.clone(), content));
+            }
+            crate::skills::merge_prompts(&skill_contents, &yaml_task.prompt_template)
+        };
+
         Ok(Config {
             config_path,
             task: TaskContract {
@@ -353,7 +368,7 @@ impl Config {
                 description: yaml_task.description,
                 model,
                 vendor,
-                prompt_template: yaml_task.prompt_template,
+                prompt_template,
                 tool_allowlist: yaml_task.tool_allowlist,
                 token_budget,
                 max_total_tokens,
@@ -1403,5 +1418,217 @@ task:
         )
         .unwrap();
         assert_eq!(config.task.shell_timeout_secs, 90); // CLI wins over YAML
+    }
+
+    // -- skill_prompts tests ----------------------------------------------
+
+    #[test]
+    fn test_skill_prompts_empty_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        // No skill_prompts in YAML → prompt_template unchanged.
+        assert_eq!(config.task.prompt_template, "{{task_description}}");
+    }
+
+    #[test]
+    fn test_skill_prompts_local_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_path = tmp.path().join("my-check.md");
+        std::fs::write(&skill_path, "# Check for bugs").unwrap();
+
+        let yaml = format!(
+            r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  skill_prompts:
+    - "{}"
+"#,
+            skill_path.display()
+        );
+        let file = write_yaml(&yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            tmp.path().to_path_buf(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert!(config.task.prompt_template.contains("[Skill:"));
+        assert!(config.task.prompt_template.contains("# Check for bugs"));
+        assert!(!config.task.prompt_template.contains("{{task_description}}"));
+    }
+
+    #[test]
+    fn test_skill_prompts_named_skill() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = tmp
+            .path()
+            .join(".clausura")
+            .join("skills")
+            .join("team")
+            .join("vue-check");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: vue-check\n---\n# Vue best practices",
+        )
+        .unwrap();
+
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  skill_prompts:
+    - team/vue-check
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            tmp.path().to_path_buf(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert!(config.task.prompt_template.contains("[Skill: team/vue-check]"));
+        assert!(config.task.prompt_template.contains("# Vue best practices"));
+    }
+
+    #[test]
+    fn test_skill_prompts_with_user_template() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("check.md"), "Skill body").unwrap();
+
+        let yaml = format!(
+            r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  skill_prompts:
+    - "{}"
+  prompt_template: "User extra check."
+"#,
+            tmp.path().join("check.md").display()
+        );
+        let file = write_yaml(&yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            tmp.path().to_path_buf(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert!(config.task.prompt_template.contains("[Skill:"));
+        assert!(config.task.prompt_template.contains("Skill body"));
+        assert!(config.task.prompt_template.contains("User extra check."));
+    }
+
+    #[test]
+    fn test_skill_prompts_not_found_is_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  skill_prompts:
+    - nonexistent/skill
+"#;
+        let file = write_yaml(yaml);
+        let result = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        );
+        assert!(result.is_err());
     }
 }
