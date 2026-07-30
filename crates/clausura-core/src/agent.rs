@@ -389,6 +389,7 @@ mod tests {
             gating_rules: vec![],
             max_iterations: 10,
             on_incomplete: OnIncompletePolicy::Fail,
+            mcp_servers: vec![],
         }
     }
 

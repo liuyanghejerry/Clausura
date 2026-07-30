@@ -88,6 +88,8 @@ struct YamlTaskConfig {
     max_iterations: u32,
     #[serde(default = "default_on_incomplete")]
     on_incomplete: String,
+    #[serde(default)]
+    mcp_servers: Vec<YamlMcpServerConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +99,16 @@ struct YamlGateRule {
     min_severity: String,
     max_findings: u32,
     action: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct YamlMcpServerConfig {
+    name: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: std::collections::HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +208,23 @@ fn validate_yaml(yaml: &YamlConfig) -> Result<(), ConfigError> {
             "task.timeout_secs must be > 0".into(),
         ));
     }
+    // Validate MCP server names are non-empty and unique.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for s in &yaml.task.mcp_servers {
+            if s.name.is_empty() {
+                return Err(ConfigError::ValidationError(
+                    "mcp_servers: name must be non-empty".into(),
+                ));
+            }
+            if !seen.insert(&s.name) {
+                return Err(ConfigError::ValidationError(format!(
+                    "Duplicate MCP server name: '{}'",
+                    s.name
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -273,6 +302,7 @@ impl Config {
                     gating: vec![],
                     max_iterations: default_max_iterations(),
                     on_incomplete: default_on_incomplete(),
+                    mcp_servers: vec![],
                 },
                 None,
             )
@@ -379,6 +409,16 @@ impl Config {
                 gating_rules,
                 max_iterations,
                 on_incomplete,
+                mcp_servers: yaml_task
+                    .mcp_servers
+                    .into_iter()
+                    .map(|s| crate::types::McpServerConfig {
+                        name: s.name,
+                        command: s.command,
+                        args: s.args,
+                        env: s.env,
+                    })
+                    .collect(),
             },
             api_key,
             workspace,
@@ -1633,5 +1673,126 @@ task:
             LogFormat::Json,
         );
         assert!(result.is_err());
+    }
+
+    // ── MCP config tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mcp_config_parsing() {
+        let yaml = r#"
+version: "1"
+task:
+  name: mcp-test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  mcp_servers:
+    - name: github
+      command: npx
+      args: ["-y", "@anthropic/mcp-server-github"]
+      env:
+        GITHUB_TOKEN: "${GITHUB_TOKEN}"
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.mcp_servers.len(), 1);
+        assert_eq!(config.task.mcp_servers[0].name, "github");
+        assert_eq!(config.task.mcp_servers[0].command, "npx");
+        assert_eq!(
+            config.task.mcp_servers[0].args,
+            vec!["-y", "@anthropic/mcp-server-github"]
+        );
+        assert_eq!(
+            config.task.mcp_servers[0].env.get("GITHUB_TOKEN"),
+            Some(&"${GITHUB_TOKEN}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_mcp_empty_name_is_error() {
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  mcp_servers:
+    - name: ""
+      command: npx
+"#;
+        let file = write_yaml(yaml);
+        let result = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        );
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("name must be non-empty"), "got: {err_msg}");
+    }
+
+    #[test]
+    fn test_mcp_duplicate_name_is_error() {
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  mcp_servers:
+    - name: dup
+      command: npx
+    - name: dup
+      command: node
+"#;
+        let file = write_yaml(yaml);
+        let result = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        );
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("Duplicate"), "got: {err_msg}");
     }
 }

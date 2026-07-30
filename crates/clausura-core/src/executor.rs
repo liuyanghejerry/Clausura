@@ -39,12 +39,24 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         }
     };
 
-    let tools = default_tools(
+    let mut tools = default_tools(
         config.workspace.clone(),
         &config.task.tool_allowlist,
         config.task.shell_timeout_secs,
         &config.task.shell_env_passthrough,
     );
+
+    // Start MCP servers and register their tools.
+    // Kept alive in `_mcp_manager` for the duration of this task;
+    // dropped processes are killed via kill_on_drop(true).
+    let _mcp_manager = crate::mcp::McpClientManager::start(
+        &config.task.mcp_servers,
+        config.task.shell_timeout_secs,
+    )
+    .await;
+    if let Some(ref mgr) = _mcp_manager {
+        mgr.register_all(&mut tools);
+    }
 
     let checkpoint_store = match CheckpointStore::new() {
         Ok(cs) => cs,
