@@ -568,13 +568,27 @@ pub struct PreflightCheck {
     pub default_severity: String,
 }
 
-fn default_preflight_rule_prefix() -> String { "preflight-".into() }
-fn default_preflight_severity_field() -> String { "severity".into() }
-fn default_preflight_message_field() -> String { "message".into() }
-fn default_preflight_file_field() -> String { "file".into() }
-fn default_preflight_line_field() -> String { "line".into() }
-fn default_preflight_column_field() -> String { "column".into() }
-fn default_preflight_default_severity() -> String { "warning".into() }
+fn default_preflight_rule_prefix() -> String {
+    "preflight-".into()
+}
+fn default_preflight_severity_field() -> String {
+    "severity".into()
+}
+fn default_preflight_message_field() -> String {
+    "message".into()
+}
+fn default_preflight_file_field() -> String {
+    "file".into()
+}
+fn default_preflight_line_field() -> String {
+    "line".into()
+}
+fn default_preflight_column_field() -> String {
+    "column".into()
+}
+fn default_preflight_default_severity() -> String {
+    "warning".into()
+}
 
 impl Default for PreflightCheck {
     fn default() -> Self {

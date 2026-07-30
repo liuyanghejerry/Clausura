@@ -80,7 +80,10 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
                     tool = %check.tool,
                     "Running preflight check"
                 );
-                match mgr.call_tool(&check.mcp_server, &check.tool, check.args.clone()).await {
+                match mgr
+                    .call_tool(&check.mcp_server, &check.tool, check.args.clone())
+                    .await
+                {
                     Ok(output) => {
                         let findings = parse_preflight_result(&output, check);
                         all_items.extend(findings);
@@ -391,7 +394,11 @@ fn format_preflight_summary(findings: &[Finding]) -> String {
             .as_ref()
             .map(|l| format!("{}:{}", l.file, l.line_start))
             .unwrap_or_default();
-        let _ = writeln!(buf, "  [{:?}][{}] {} — {}", f.severity, f.rule_id, f.message, loc);
+        let _ = writeln!(
+            buf,
+            "  [{:?}][{}] {} — {}",
+            f.severity, f.rule_id, f.message, loc
+        );
     }
     buf.push_str("\nConsider these findings in your review.");
     buf
@@ -405,7 +412,14 @@ fn format_preflight_summary(findings: &[Finding]) -> String {
 /// grep for code understanding.
 fn detect_lsp_tools(registry: &crate::tools::ToolRegistry) -> Option<String> {
     let defs = registry.list_definitions();
-    let lsp_keywords = ["diagnostics", "hover", "references", "definition", "symbol", "lsp"];
+    let lsp_keywords = [
+        "diagnostics",
+        "hover",
+        "references",
+        "definition",
+        "symbol",
+        "lsp",
+    ];
     let has_lsp_tool = defs.iter().any(|t| {
         let name = t.name.to_lowercase();
         lsp_keywords.iter().any(|kw| name.contains(kw))
@@ -651,7 +665,7 @@ mod tests {
     fn test_parse_severity_str() {
         assert_eq!(parse_severity_str("error"), Severity::Error);
         assert_eq!(parse_severity_str("ERROR"), Severity::Error);
-        assert_eq!(parse_severity_str("1"), Severity::Error);     // LSP convention
+        assert_eq!(parse_severity_str("1"), Severity::Error); // LSP convention
         assert_eq!(parse_severity_str("warning"), Severity::Warning);
         assert_eq!(parse_severity_str("2"), Severity::Warning);
         assert_eq!(parse_severity_str("warn"), Severity::Warning);
@@ -664,22 +678,20 @@ mod tests {
 
     #[test]
     fn test_format_preflight_summary() {
-        let findings = vec![
-            Finding {
-                id: uuid::Uuid::new_v4(),
-                rule_id: "test-err".into(),
-                severity: Severity::Error,
-                message: "Something failed".into(),
-                location: Some(crate::types::Location {
-                    file: "src/main.rs".into(),
-                    line_start: 42,
-                    line_end: 42,
-                    column_start: 1,
-                    column_end: 1,
-                }),
-                evidence: "".into(),
-            },
-        ];
+        let findings = vec![Finding {
+            id: uuid::Uuid::new_v4(),
+            rule_id: "test-err".into(),
+            severity: Severity::Error,
+            message: "Something failed".into(),
+            location: Some(crate::types::Location {
+                file: "src/main.rs".into(),
+                line_start: 42,
+                line_end: 42,
+                column_start: 1,
+                column_end: 1,
+            }),
+            evidence: "".into(),
+        }];
         let summary = format_preflight_summary(&findings);
         assert!(summary.contains("Preflight diagnostics"));
         assert!(summary.contains("src/main.rs:42"));
