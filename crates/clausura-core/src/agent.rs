@@ -248,19 +248,18 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 /// text is recovered and parsed instead; models very commonly emit their
 /// real final answer last, after any reasoning prose.
 ///
-/// Every element of the resulting array MUST deserialize into a `Finding` —
-/// if no JSON can be recovered at all, or if one or more elements fail
-/// schema validation, this returns `Err` with a diagnostic rather than
-/// silently dropping the offending elements. A schema mismatch between what
-/// a task's prompt asks the model to emit and what `Finding` actually
-/// requires must fail loudly: silently treating it as "no findings" would
-/// let a real violation slip through CI gating undetected. Tolerating
-/// incidental prose/fences around otherwise-valid JSON is a separate,
-/// narrower concession — it does not weaken that guarantee.
+/// Individual findings that fail schema validation are skipped with a
+/// warning (so one malformed element does not discard the entire batch).
+/// Only when *every* element fails, or no JSON can be recovered at all,
+/// does this return `Err`.
+///
+/// The `id` field (UUID v4) is auto-generated server-side when the agent
+/// omits it or supplies a malformed value; agents are not required to
+/// produce syntactically valid UUIDs themselves.
 fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
     let trimmed = content.trim();
 
-    let json: serde_json::Value = match serde_json::from_str(trimmed) {
+    let mut json: serde_json::Value = match serde_json::from_str(trimmed) {
         Ok(v) => v,
         Err(first_err) => {
             let recovered = find_last_balanced_block(trimmed, '{', '}')
@@ -277,30 +276,82 @@ fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
     };
 
     // Accept either {"findings": [...]} or a bare top-level [...] array.
-    let findings_value = json.get("findings").cloned().unwrap_or(json);
-    let elements = findings_value
-        .as_array()
-        .ok_or_else(|| format!("expected a `findings` array, got: {findings_value}"))?;
+    let findings_value = if json.get("findings").is_some() {
+        // Take ownership of the findings array so we can mutate elements.
+        std::mem::replace(json.get_mut("findings").unwrap(), serde_json::Value::Null)
+    } else {
+        json
+    };
+    let mut elements = match findings_value {
+        serde_json::Value::Array(arr) => arr,
+        other => return Err(format!("expected a `findings` array, got: {other}")),
+    };
 
-    let mut parsed = Vec::with_capacity(elements.len());
+    let total = elements.len();
+    let mut parsed = Vec::with_capacity(total);
     let mut errors = Vec::new();
-    for (i, el) in elements.iter().enumerate() {
+    for (i, el) in elements.iter_mut().enumerate() {
+        // Fix UUID before deserialization: LLMs sometimes omit or malform
+        // the id field. Since it is an internal-only identifier (not forwarded
+        // to SARIF), we can safely auto-generate it server-side.
+        fix_finding_uuid(el);
+
         match serde_json::from_value::<Finding>(el.clone()) {
             Ok(f) => parsed.push(f),
             Err(e) => errors.push(format!("findings[{i}]: {e} (raw: {el})")),
         }
     }
 
-    if !errors.is_empty() {
+    if parsed.is_empty() && !errors.is_empty() {
         return Err(format!(
             "{} of {} finding(s) failed to match the Finding schema:\n{}",
             errors.len(),
-            elements.len(),
+            total,
             errors.join("\n")
         ));
     }
 
+    if !errors.is_empty() {
+        eprintln!(
+            "Warning: {} of {} finding(s) failed schema validation and were skipped:\n{}",
+            errors.len(),
+            total,
+            errors.join("\n")
+        );
+    }
+
     Ok(parsed)
+}
+
+/// Ensure a finding element has a valid UUID v4 in its `id` field.
+///
+/// If `id` is present but not a valid UUID string, replace it with a freshly
+/// generated UUID v4 and print a warning. If `id` is absent altogether,
+/// insert a freshly generated UUID v4 silently (the agent is not expected to
+/// supply one).
+fn fix_finding_uuid(el: &mut serde_json::Value) {
+    let obj = match el.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+
+    match obj.get("id").and_then(|v| v.as_str()) {
+        Some(id_str) => {
+            if uuid::Uuid::parse_str(id_str).is_err() {
+                let new_id = uuid::Uuid::new_v4().to_string();
+                eprintln!(
+                    "Warning: invalid UUID '{}' in agent finding `id` field, \
+                     auto-generating replacement '{}'",
+                    id_str, new_id
+                );
+                obj.insert("id".to_string(), serde_json::Value::String(new_id));
+            }
+        }
+        None => {
+            let new_id = uuid::Uuid::new_v4().to_string();
+            obj.insert("id".to_string(), serde_json::Value::String(new_id));
+        }
+    }
 }
 
 /// Find the last top-level balanced `open`/`close` delimited block in `s`
@@ -977,15 +1028,64 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_findings_partial_schema_mismatch_is_error() {
-        // One valid finding and one malformed one: the malformed one must
-        // not be silently dropped just because its sibling parsed fine.
+    fn test_extract_findings_skips_malformed_elements() {
+        // One valid finding and one malformed one (missing message/evidence):
+        // the valid one is returned, the malformed one is skipped with a
+        // warning.  A single bad element must not discard the whole batch.
         let content = r#"{"findings": [
             {"id": "00000000-0000-0000-0000-000000000000", "rule_id": "ok", "severity": "error", "message": "m", "evidence": "e"},
             {"rule_id": "bad", "severity": "error", "file": "a.ts", "line": 1, "title": "t"}
         ]}"#;
+        let findings = extract_findings(content).expect("should return the valid finding");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "ok");
+    }
+
+    #[test]
+    fn test_extract_findings_partial_schema_mismatch_with_all_bad_still_errors() {
+        // When ALL findings are malformed, extraction must still error
+        // (otherwise a real schema mismatch could be silently ignored).
+        let content = r#"{"findings": [
+            {"rule_id": "bad1", "severity": "error", "file": "a.ts", "line": 1, "title": "t1"},
+            {"rule_id": "bad2", "severity": "error", "file": "b.ts", "line": 2, "title": "t2"}
+        ]}"#;
         let err = extract_findings(content).unwrap_err();
-        assert!(err.contains("1 of 2 finding(s) failed"), "got: {err}");
+        assert!(err.contains("2 of 2 finding(s) failed"), "got: {err}");
+    }
+
+    #[test]
+    fn test_extract_findings_auto_generates_missing_uuid() {
+        // Agent omitted the `id` field — it should be auto-generated.
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "message": "m", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("should auto-generate UUID");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "r");
+        // The UUID must not be nil (which would indicate no generation).
+        assert!(
+            !findings[0].id.is_nil(),
+            "UUID should be auto-generated, not nil"
+        );
+    }
+
+    #[test]
+    fn test_extract_findings_fixes_malformed_uuid() {
+        // Agent supplied an invalid UUID (11-char group 4 instead of 12).
+        // Regression test for painttyServer PR #547.
+        let content = r#"{"findings": [
+            {"id": "3c4d5e6f-789a-bcde-f012-3456789abcd", "rule_id": "r", "severity": "error", "message": "m", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("should fix malformed UUID");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "r");
+        assert!(!findings[0].id.is_nil(), "UUID should be replaced, not nil");
+        // The replacement must NOT be the original malformed string.
+        assert_ne!(
+            findings[0].id.to_string(),
+            "3c4d5e6f-789a-bcde-f012-3456789abcd",
+            "malformed UUID must be replaced"
+        );
     }
 
     #[test]
