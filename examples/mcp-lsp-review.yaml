@@ -1,0 +1,70 @@
+# 示例：使用 MCP + LSP 进行代码审查
+#
+# 前提：CI 环境中需要安装 agent-lsp + 对应语言服务器
+#   curl -fsSL https://raw.githubusercontent.com/blackwell-systems/agent-lsp/main/install.sh | sh
+#   rustup component add rust-analyzer
+#   npm i -g typescript-language-server
+#   pip install pyright
+#
+# 运行方式：
+#   clausura run -c examples/mcp-lsp-review.yaml
+#
+# 架构：
+#   1. Preflight：agent 启动前自动收集 LSP diagnostics → 确定性 Finding
+#   2. Agent loop：使用 mcp__lsp__* 工具做深层语义分析
+#   3. Gating：preflight 的 LSP findings + agent findings 一起走门禁
+
+version: "1"
+task:
+  name: mcp-lsp-review
+  model: gpt-4o
+  vendor: openai
+
+  # ── MCP 服务器 ─────────────────────────────────────────────
+  mcp_servers:
+    - name: lsp
+      command: agent-lsp
+      args: []
+    # - name: github     # 可选：同时接入其他 MCP 服务器
+    #   command: npx
+    #   args: ["-y", "@anthropic/mcp-server-github"]
+
+  # ── Preflight：确定性诊断门禁 ──────────────────────────────
+  # 在 agent 启动前自动运行，输出直接转为 Finding 走 gating
+  preflight:
+    - mcp_server: lsp
+      tool: get_diagnostics
+      args:
+        path: "."
+      rule_id_prefix: "lsp-"
+      severity_field: "severity"
+      message_field: "message"
+      file_field: "file"
+      line_field: "line"
+
+  # ── Skill：引导 agent 使用 LSP 工具 ───────────────────────
+  skill_prompts:
+    - examples/skills/code-review-with-lsp/SKILL.md
+
+  # ── Prompt 模板（可选补充） ─────────────────────────────────
+  prompt_template: |
+    审查上述代码变更。如果有 LSP 工具可用，优先使用它们获取
+    语义信息，而不是仅依赖 grep/read_file。
+
+  token_budget: 32000
+  timeout_secs: 300
+
+  # ── 门禁规则 ─────────────────────────────────────────────
+  gating:
+    # LSP 诊断产生的 finding 自动带 rule_id 前缀 "lsp-"
+    # 只要有任何 error 级别的 LSP 诊断，就 fail
+    - rule: lsp-error
+      min_severity: error
+      max_findings: 0
+      action: fail
+
+    # warning 级别的 LSP 诊断最多允许 5 个
+    - rule: lsp-warning
+      min_severity: warning
+      max_findings: 5
+      action: warn

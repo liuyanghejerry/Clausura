@@ -61,6 +61,11 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         mgr.register_all(&mut tools);
     }
 
+    // ── LSP tool hint injection ────────────────────────────────────────────
+    // When the agent has access to LSP-like MCP tools, generate a guidance
+    // note that will be injected into initial_messages.
+    let lsp_hint = detect_lsp_tools(&tools);
+
     // ── Preflight checks ──────────────────────────────────────────────────
     // Run configured MCP tool calls *before* the agent loop. Their output is
     // parsed into deterministic Findings and merged with agent findings.
@@ -135,6 +140,11 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
     // Inject preflight summary into agent context (if any findings).
     if let Some(summary) = preflight_summary {
         initial_messages.insert(0, Message::new(Role::User, summary));
+    }
+
+    // Inject LSP tool guidance into agent context (if LSP tools detected).
+    if let Some(hint) = &lsp_hint {
+        initial_messages.push(Message::new(Role::User, hint.clone()));
     }
 
     let agent_config = AgentConfig {
@@ -387,6 +397,54 @@ fn format_preflight_summary(findings: &[Finding]) -> String {
     buf
 }
 
+/// Detect if any registered tools provide LSP-like capabilities and return
+/// a guidance hint for the agent.
+///
+/// Scans tool names for common LSP-related keywords. When found, injects
+/// a short usage guide so the agent prioritizes semantic tools over text
+/// grep for code understanding.
+fn detect_lsp_tools(registry: &crate::tools::ToolRegistry) -> Option<String> {
+    let defs = registry.list_definitions();
+    let lsp_keywords = ["diagnostics", "hover", "references", "definition", "symbol", "lsp"];
+    let has_lsp_tool = defs.iter().any(|t| {
+        let name = t.name.to_lowercase();
+        lsp_keywords.iter().any(|kw| name.contains(kw))
+    });
+
+    if !has_lsp_tool {
+        return None;
+    }
+
+    // Collect tool names for the user message.
+    let mut tool_lines: Vec<String> = Vec::new();
+    for t in &defs {
+        let name_lower = t.name.to_lowercase();
+        if lsp_keywords.iter().any(|kw| name_lower.contains(kw)) {
+            tool_lines.push(format!("  - `{}` — {}", t.name, t.description));
+        }
+    }
+
+    let tools_section = tool_lines.join("\n");
+    Some(format!(
+        r#"📐 LSP Code Intelligence Tools Available
+
+The following language-server tools are at your disposal. Prefer them over
+plain `grep`/`read_file` when you need semantic understanding of the code:
+
+{tools_section}
+
+When to use each tool:
+- **diagnostics** — check for compile errors, type mismatches, lints
+- **hover** — get type information and documentation for a symbol
+- **definition** — jump to a symbol's definition
+- **references** — find all usages of a symbol across the codebase
+- **symbols** — list all symbols in a file or workspace
+
+Use these tools to answer questions about code structure and correctness
+before reaching for text-based searches."#,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +684,14 @@ mod tests {
         assert!(summary.contains("Preflight diagnostics"));
         assert!(summary.contains("src/main.rs:42"));
         assert!(summary.contains("Something failed"));
+    }
+
+    #[test]
+    fn test_detect_lsp_tools_no_lsp_tools_returns_none() {
+        // Only built-in tools (read_file, git_diff, etc.) — no LSP hint.
+        let tmp = TempDir::new().unwrap();
+        let registry = default_tools(tmp.path().to_path_buf(), &[], 120, &[]);
+        let hint = detect_lsp_tools(&registry);
+        assert!(hint.is_none(), "no LSP tools configured → no hint");
     }
 }
