@@ -94,6 +94,37 @@ impl McpClientManager {
         }
     }
 
+    /// Call a tool on a specific MCP server directly, bypassing the ToolRegistry.
+    ///
+    /// Used for preflight checks that must run *before* the agent loop.
+    /// The server must have been configured and started successfully.
+    pub async fn call_tool(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        args: Value,
+    ) -> Result<String, ToolError> {
+        let client = self
+            .clients
+            .iter()
+            .find(|c| c.name == server_name)
+            .ok_or_else(|| {
+                ToolError::ExecutionFailed(format!(
+                    "MCP server '{}' not found (not started or configured)",
+                    server_name
+                ))
+            })?;
+        let channel = client.clone_channel();
+        McpClient::call_tool(&channel, tool_name, args)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "MCP preflight '{}' on '{}': {e}",
+                    tool_name, server_name
+                ))
+            })
+    }
+
     /// Return the number of connected servers.
     #[cfg(test)]
     pub fn server_count(&self) -> usize {

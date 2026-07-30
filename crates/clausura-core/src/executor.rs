@@ -6,7 +6,10 @@ use crate::rules::RuleEngine;
 use crate::sarif::SarifFormatter;
 use crate::snapshot::SnapshotManager;
 use crate::tools::default_tools;
-use crate::types::{ExecutionReport, Message, OnIncompletePolicy, ProviderError, Role, Usage};
+use crate::types::{
+    ExecutionReport, Finding, Message, OnIncompletePolicy, PreflightCheck, ProviderError, Role,
+    Severity, Usage,
+};
 use std::path::Path;
 use std::time::Instant;
 
@@ -58,6 +61,51 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         mgr.register_all(&mut tools);
     }
 
+    // ── LSP tool hint injection ────────────────────────────────────────────
+    // When the agent has access to LSP-like MCP tools, generate a guidance
+    // note that will be injected into initial_messages.
+    let lsp_hint = detect_lsp_tools(&tools);
+
+    // ── Preflight checks ──────────────────────────────────────────────────
+    // Run configured MCP tool calls *before* the agent loop. Their output is
+    // parsed into deterministic Findings and merged with agent findings.
+    let mut preflight_findings: Vec<Finding> = Vec::new();
+    let mut preflight_summary: Option<String> = None;
+    if let Some(ref mgr) = _mcp_manager {
+        if !config.task.preflight.is_empty() {
+            let mut all_items: Vec<Finding> = Vec::new();
+            for check in &config.task.preflight {
+                tracing::info!(
+                    server = %check.mcp_server,
+                    tool = %check.tool,
+                    "Running preflight check"
+                );
+                match mgr
+                    .call_tool(&check.mcp_server, &check.tool, check.args.clone())
+                    .await
+                {
+                    Ok(output) => {
+                        let findings = parse_preflight_result(&output, check);
+                        all_items.extend(findings);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            server = %check.mcp_server,
+                            tool = %check.tool,
+                            error = %e,
+                            "Preflight check failed — skipping"
+                        );
+                    }
+                }
+            }
+            if !all_items.is_empty() {
+                let summary = format_preflight_summary(&all_items);
+                preflight_summary = Some(summary);
+                preflight_findings = all_items;
+            }
+        }
+    }
+
     let checkpoint_store = match CheckpointStore::new() {
         Ok(cs) => cs,
         Err(e) => {
@@ -75,7 +123,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
     };
     let snapshot_mgr = SnapshotManager::new(checkpoint_store);
 
-    let initial_messages = if config.resume {
+    let mut initial_messages = if config.resume {
         match snapshot_mgr.restore_snapshot(&task_id, true) {
             Ok(Some(snapshot)) => snapshot.messages,
             _ => {
@@ -91,6 +139,16 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
             config.task.prompt_template.clone(),
         )]
     };
+
+    // Inject preflight summary into agent context (if any findings).
+    if let Some(summary) = preflight_summary {
+        initial_messages.insert(0, Message::new(Role::User, summary));
+    }
+
+    // Inject LSP tool guidance into agent context (if LSP tools detected).
+    if let Some(hint) = &lsp_hint {
+        initial_messages.push(Message::new(Role::User, hint.clone()));
+    }
 
     let agent_config = AgentConfig {
         contract: &config.task,
@@ -133,7 +191,10 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         .save_snapshot(&task_id, &agent_result.messages, agent_result.truncated)
         .ok();
 
-    let gate_result = RuleEngine::evaluate(&agent_result.findings, &config.task.gating_rules);
+    // Merge preflight findings (deterministic) with agent findings.
+    let all_findings = [preflight_findings, agent_result.findings].concat();
+
+    let gate_result = RuleEngine::evaluate(&all_findings, &config.task.gating_rules);
 
     // Fail closed on incomplete runs (context truncated or iteration limit
     // reached): a partial sweep with zero findings must not pass gates like
@@ -154,7 +215,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
     }
 
     if let Err(e) = SarifFormatter::write_to_file_with_status(
-        &agent_result.findings,
+        &all_findings,
         &config.output,
         agent_result.truncated,
     ) {
@@ -177,7 +238,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
     ExecutionReport {
         task_id,
         exit_code,
-        findings: agent_result.findings,
+        findings: all_findings,
         token_usage: agent_result.usage,
         duration_ms: agent_result.duration_ms,
         snapshot_id,
@@ -235,6 +296,167 @@ pub fn cleanup_archives(workspace: &Path, task_id: &str) {
             }
         }
     }
+}
+
+// ── Preflight helpers ─────────────────────────────────────────────────────
+
+/// Parse an MCP tool's JSON output into `Finding` objects.
+///
+/// The output is expected to be a JSON array of objects. Each object's fields
+/// are mapped to `Finding` fields using the `PreflightCheck` configuration.
+/// Items that cannot be parsed are silently skipped.
+fn parse_preflight_result(output: &str, check: &PreflightCheck) -> Vec<Finding> {
+    let value: serde_json::Value = match serde_json::from_str(output) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let items = match value.as_array() {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    let mut findings = Vec::new();
+    for item in items {
+        if let Some(msg) = item
+            .get(&check.message_field)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            let severity_str = item
+                .get(&check.severity_field)
+                .and_then(|v| v.as_str())
+                .unwrap_or(&check.default_severity);
+            let severity = parse_severity_str(severity_str);
+
+            let file = item
+                .get(&check.file_field)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let line_start = item
+                .get(&check.line_field)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let col_start = item
+                .get(&check.column_field)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+
+            let location = if !file.is_empty() {
+                Some(crate::types::Location {
+                    file,
+                    line_start,
+                    line_end: line_start,
+                    column_start: col_start,
+                    column_end: col_start,
+                })
+            } else {
+                None
+            };
+
+            let rule_id = format!("{}{}", check.rule_id_prefix, msg);
+
+            findings.push(Finding {
+                id: uuid::Uuid::new_v4(),
+                rule_id,
+                severity,
+                message: msg.to_string(),
+                location,
+                evidence: output.len().min(200).to_string(), // first 200 chars as evidence
+            });
+        }
+    }
+
+    findings
+}
+
+/// Convert a string like "error", "warning", "info" into `Severity`.
+/// Also accepts integer-string severities (e.g. "1" → error per LSP convention).
+fn parse_severity_str(s: &str) -> Severity {
+    match s.to_lowercase().as_str() {
+        "error" | "1" => Severity::Error,
+        "warning" | "2" | "warn" => Severity::Warning,
+        "info" | "3" | "information" => Severity::Info,
+        "hint" | "4" => Severity::Hint,
+        _ => Severity::Warning,
+    }
+}
+
+/// Format a human-readable summary of preflight findings.
+fn format_preflight_summary(findings: &[Finding]) -> String {
+    use std::fmt::Write;
+    let mut buf = String::from("Preflight diagnostics found:\n");
+    for f in findings {
+        let loc = f
+            .location
+            .as_ref()
+            .map(|l| format!("{}:{}", l.file, l.line_start))
+            .unwrap_or_default();
+        let _ = writeln!(
+            buf,
+            "  [{:?}][{}] {} — {}",
+            f.severity, f.rule_id, f.message, loc
+        );
+    }
+    buf.push_str("\nConsider these findings in your review.");
+    buf
+}
+
+/// Detect if any registered tools provide LSP-like capabilities and return
+/// a guidance hint for the agent.
+///
+/// Scans tool names for common LSP-related keywords. When found, injects
+/// a short usage guide so the agent prioritizes semantic tools over text
+/// grep for code understanding.
+fn detect_lsp_tools(registry: &crate::tools::ToolRegistry) -> Option<String> {
+    let defs = registry.list_definitions();
+    let lsp_keywords = [
+        "diagnostics",
+        "hover",
+        "references",
+        "definition",
+        "symbol",
+        "lsp",
+    ];
+    let has_lsp_tool = defs.iter().any(|t| {
+        let name = t.name.to_lowercase();
+        lsp_keywords.iter().any(|kw| name.contains(kw))
+    });
+
+    if !has_lsp_tool {
+        return None;
+    }
+
+    // Collect tool names for the user message.
+    let mut tool_lines: Vec<String> = Vec::new();
+    for t in &defs {
+        let name_lower = t.name.to_lowercase();
+        if lsp_keywords.iter().any(|kw| name_lower.contains(kw)) {
+            tool_lines.push(format!("  - `{}` — {}", t.name, t.description));
+        }
+    }
+
+    let tools_section = tool_lines.join("\n");
+    Some(format!(
+        r#"📐 LSP Code Intelligence Tools Available
+
+The following language-server tools are at your disposal. Prefer them over
+plain `grep`/`read_file` when you need semantic understanding of the code:
+
+{tools_section}
+
+When to use each tool:
+- **diagnostics** — check for compile errors, type mismatches, lints
+- **hover** — get type information and documentation for a symbol
+- **definition** — jump to a symbol's definition
+- **references** — find all usages of a symbol across the codebase
+- **symbols** — list all symbols in a file or workspace
+
+Use these tools to answer questions about code structure and correctness
+before reaching for text-based searches."#,
+    ))
 }
 
 #[cfg(test)]
@@ -382,5 +604,106 @@ mod tests {
             0
         );
         assert!(errors.is_empty());
+    }
+
+    // ── parse_preflight_result tests ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_preflight_result_basic() {
+        let check = PreflightCheck::default();
+        let output = r#"[
+            {"severity": "error", "message": "type mismatch", "file": "src/main.rs", "line": 42},
+            {"severity": "warning", "message": "unused variable", "file": "src/lib.rs", "line": 10}
+        ]"#;
+        let findings = parse_preflight_result(output, &check);
+        assert_eq!(findings.len(), 2);
+
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(findings[0].message.contains("type mismatch"));
+        assert_eq!(findings[0].location.as_ref().unwrap().file, "src/main.rs");
+        assert_eq!(findings[0].location.as_ref().unwrap().line_start, 42);
+        assert!(findings[0].rule_id.starts_with("preflight-"));
+
+        assert_eq!(findings[1].severity, Severity::Warning);
+        assert!(findings[1].message.contains("unused variable"));
+    }
+
+    #[test]
+    fn test_parse_preflight_result_empty() {
+        let check = PreflightCheck::default();
+        let findings = parse_preflight_result(r#"[]"#, &check);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_parse_preflight_result_non_json() {
+        let check = PreflightCheck::default();
+        let findings = parse_preflight_result("not json at all", &check);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_parse_preflight_result_custom_fields() {
+        let check = PreflightCheck {
+            rule_id_prefix: "diag-".into(),
+            severity_field: "s".into(),
+            message_field: "m".into(),
+            file_field: "path".into(),
+            line_field: "ln".into(),
+            ..Default::default()
+        };
+        let output = r#"[
+            {"s": "error", "m": "E001: something wrong", "path": "a.rs", "ln": 1}
+        ]"#;
+        let findings = parse_preflight_result(output, &check);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(findings[0].rule_id.starts_with("diag-"));
+    }
+
+    #[test]
+    fn test_parse_severity_str() {
+        assert_eq!(parse_severity_str("error"), Severity::Error);
+        assert_eq!(parse_severity_str("ERROR"), Severity::Error);
+        assert_eq!(parse_severity_str("1"), Severity::Error); // LSP convention
+        assert_eq!(parse_severity_str("warning"), Severity::Warning);
+        assert_eq!(parse_severity_str("2"), Severity::Warning);
+        assert_eq!(parse_severity_str("warn"), Severity::Warning);
+        assert_eq!(parse_severity_str("info"), Severity::Info);
+        assert_eq!(parse_severity_str("3"), Severity::Info);
+        assert_eq!(parse_severity_str("hint"), Severity::Hint);
+        assert_eq!(parse_severity_str("4"), Severity::Hint);
+        assert_eq!(parse_severity_str("unknown"), Severity::Warning); // fallback
+    }
+
+    #[test]
+    fn test_format_preflight_summary() {
+        let findings = vec![Finding {
+            id: uuid::Uuid::new_v4(),
+            rule_id: "test-err".into(),
+            severity: Severity::Error,
+            message: "Something failed".into(),
+            location: Some(crate::types::Location {
+                file: "src/main.rs".into(),
+                line_start: 42,
+                line_end: 42,
+                column_start: 1,
+                column_end: 1,
+            }),
+            evidence: "".into(),
+        }];
+        let summary = format_preflight_summary(&findings);
+        assert!(summary.contains("Preflight diagnostics"));
+        assert!(summary.contains("src/main.rs:42"));
+        assert!(summary.contains("Something failed"));
+    }
+
+    #[test]
+    fn test_detect_lsp_tools_no_lsp_tools_returns_none() {
+        // Only built-in tools (read_file, git_diff, etc.) — no LSP hint.
+        let tmp = TempDir::new().unwrap();
+        let registry = default_tools(tmp.path().to_path_buf(), &[], 120, &[]);
+        let hint = detect_lsp_tools(&registry);
+        assert!(hint.is_none(), "no LSP tools configured → no hint");
     }
 }
