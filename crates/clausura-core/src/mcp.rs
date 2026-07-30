@@ -43,10 +43,7 @@ impl McpClientManager {
     ///
     /// Servers that fail to start or handshake are silently skipped (a warning is
     /// logged). Returns `None` when the config list is empty.
-    pub async fn start(
-        servers: &[McpServerConfig],
-        tool_timeout_secs: u64,
-    ) -> Option<Self> {
+    pub async fn start(servers: &[McpServerConfig], tool_timeout_secs: u64) -> Option<Self> {
         if servers.is_empty() {
             return None;
         }
@@ -130,10 +127,7 @@ struct McpClient {
 
 impl McpClient {
     /// Spawn the server, perform initialize handshake, and discover tools.
-    async fn connect(
-        cfg: &McpServerConfig,
-        tool_timeout_secs: u64,
-    ) -> Result<Self, McpError> {
+    async fn connect(cfg: &McpServerConfig, tool_timeout_secs: u64) -> Result<Self, McpError> {
         let env: Vec<(String, String)> = cfg
             .env
             .iter()
@@ -165,9 +159,7 @@ impl McpClient {
         drop(child);
 
         if tools.is_empty() {
-            return Err(McpError::Protocol(
-                "MCP server returned no tools".into(),
-            ));
+            return Err(McpError::Protocol("MCP server returned no tools".into()));
         }
 
         Ok(Self {
@@ -246,9 +238,10 @@ impl McpClient {
                 .ok_or_else(|| McpError::Protocol("tool missing 'name'".into()))?
                 .to_string();
             let description = t["description"].as_str().unwrap_or("").to_string();
-            let parameters = t.get("inputSchema").cloned().unwrap_or_else(|| {
-                serde_json::json!({"type": "object", "properties": {}})
-            });
+            let parameters = t
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
 
             tools.push(ToolDef {
                 name,
@@ -291,10 +284,12 @@ impl McpClient {
             child.recv_response(id),
         )
         .await
-        .map_err(|_| McpError::Timeout(format!(
-            "MCP tool '{}' timed out after {}s",
-            tool_name, channel.timeout_secs
-        )))??;
+        .map_err(|_| {
+            McpError::Timeout(format!(
+                "MCP tool '{}' timed out after {}s",
+                tool_name, channel.timeout_secs
+            ))
+        })??;
 
         // Extract the tool result content.
         // MCP spec: result is { content: [{ type: "text", text: "..." }] }
@@ -498,19 +493,11 @@ impl crate::tools::Tool for McpToolAdapter {
         // lifetime parameter, and we need to construct the name dynamically.
         // Since the adapter lives for the duration of the task, leaking is
         // acceptable.
-        &*Box::leak(
-            format!("mcp__{}__{}", self.server_name, self.tool_name).into_boxed_str(),
-        )
+        &*Box::leak(format!("mcp__{}__{}", self.server_name, self.tool_name).into_boxed_str())
     }
 
     fn description(&self) -> &str {
-        &*Box::leak(
-            format!(
-                "[MCP:{}] {}",
-                self.server_name, self.description
-            )
-            .into_boxed_str(),
-        )
+        &*Box::leak(format!("[MCP:{}] {}", self.server_name, self.description).into_boxed_str())
     }
 
     fn parameters(&self) -> Value {
@@ -537,12 +524,10 @@ impl crate::tools::Tool for McpToolAdapter {
                 "MCP tool '{}': {msg}",
                 self.tool_name
             ))),
-            Err(McpError::RpcError { code, message }) => {
-                Err(ToolError::ExecutionFailed(format!(
-                    "MCP tool '{}': RPC error [{code}]: {message}",
-                    self.tool_name
-                )))
-            }
+            Err(McpError::RpcError { code, message }) => Err(ToolError::ExecutionFailed(format!(
+                "MCP tool '{}': RPC error [{code}]: {message}",
+                self.tool_name
+            ))),
         }
     }
 }
@@ -852,10 +837,7 @@ while True:
             .expect_err("expected RPC error");
 
         let msg = format!("{err}");
-        assert!(
-            msg.contains("RPC error"),
-            "expected RPC error, got: {msg}"
-        );
+        assert!(msg.contains("RPC error"), "expected RPC error, got: {msg}");
         assert!(msg.contains("-32602"), "error code missing: {msg}");
     }
 

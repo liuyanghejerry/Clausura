@@ -1719,9 +1719,7 @@ task:
             vec!["-y", "@anthropic/mcp-server-github"]
         );
         assert_eq!(
-            config.task.mcp_servers[0]
-                .env
-                .get("GITHUB_TOKEN"),
+            config.task.mcp_servers[0].env.get("GITHUB_TOKEN"),
             Some(&"${GITHUB_TOKEN}".to_string())
         );
     }
