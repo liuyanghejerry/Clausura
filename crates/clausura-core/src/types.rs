@@ -403,6 +403,9 @@ pub struct TaskContract {
     pub max_iterations: u32,
     #[serde(default)]
     pub on_incomplete: OnIncompletePolicy,
+    /// External MCP servers whose tools should be available to the agent.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -503,6 +506,24 @@ pub enum ConfigError {
     ParseError(String),
     #[error("Validation error: {0}")]
     ValidationError(String),
+}
+
+/// Configuration for a single MCP (Model Context Protocol) server.
+///
+/// Describes how to spawn and communicate with an external MCP server
+/// process over stdio transport.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct McpServerConfig {
+    /// Unique name for this server (used as tool prefix).
+    pub name: String,
+    /// Command to spawn the MCP server process.
+    pub command: String,
+    /// Arguments passed to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables injected into the server process.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 /// Error types for checkpoint operations
@@ -638,6 +659,7 @@ mod tests {
             gating_rules: vec![],
             max_iterations: 10,
             on_incomplete: OnIncompletePolicy::Fail,
+            mcp_servers: vec![],
         };
         assert_eq!(contract.ambiguity_policy, AmbiguityPolicy::FailClosed);
         assert!(contract.gating_rules.is_empty());

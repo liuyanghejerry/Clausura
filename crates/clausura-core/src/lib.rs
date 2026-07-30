@@ -6,6 +6,7 @@ pub mod config;
 pub mod context;
 pub mod executor;
 pub mod logging;
+pub mod mcp;
 pub mod provider;
 pub mod rules;
 pub mod sarif;
