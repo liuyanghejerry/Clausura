@@ -406,6 +406,11 @@ pub struct TaskContract {
     /// External MCP servers whose tools should be available to the agent.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Preflight checks — MCP tool calls that run before the agent loop.
+    /// Their output is parsed into deterministic Findings and merged with
+    /// the agent's findings for gating.
+    #[serde(default)]
+    pub preflight: Vec<PreflightCheck>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -524,6 +529,68 @@ pub struct McpServerConfig {
     /// Environment variables injected into the server process.
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+}
+
+/// A preflight check — an MCP tool call that runs *before* the agent loop.
+///
+/// The tool's JSON output is parsed into `Finding` objects and passed
+/// through the gating rule engine alongside agent-produced findings.
+/// A summary is also injected into the agent's context.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PreflightCheck {
+    /// Name of the MCP server (must match an entry in `mcp_servers`).
+    pub mcp_server: String,
+    /// Tool name to call on that server.
+    pub tool: String,
+    /// Arguments to pass to the tool.
+    #[serde(default)]
+    pub args: serde_json::Value,
+    /// Prefix for the auto-generated `rule_id` on each Finding.
+    #[serde(default = "default_preflight_rule_prefix")]
+    pub rule_id_prefix: String,
+    /// JSON field name for severity in each result item.
+    #[serde(default = "default_preflight_severity_field")]
+    pub severity_field: String,
+    /// JSON field name for message text.
+    #[serde(default = "default_preflight_message_field")]
+    pub message_field: String,
+    /// JSON field name for file path.
+    #[serde(default = "default_preflight_file_field")]
+    pub file_field: String,
+    /// JSON field name for line number.
+    #[serde(default = "default_preflight_line_field")]
+    pub line_field: String,
+    /// JSON field name for column number.
+    #[serde(default = "default_preflight_column_field")]
+    pub column_field: String,
+    /// Default severity string when the source item lacks one.
+    #[serde(default = "default_preflight_default_severity")]
+    pub default_severity: String,
+}
+
+fn default_preflight_rule_prefix() -> String { "preflight-".into() }
+fn default_preflight_severity_field() -> String { "severity".into() }
+fn default_preflight_message_field() -> String { "message".into() }
+fn default_preflight_file_field() -> String { "file".into() }
+fn default_preflight_line_field() -> String { "line".into() }
+fn default_preflight_column_field() -> String { "column".into() }
+fn default_preflight_default_severity() -> String { "warning".into() }
+
+impl Default for PreflightCheck {
+    fn default() -> Self {
+        Self {
+            mcp_server: String::new(),
+            tool: String::new(),
+            args: serde_json::json!({}),
+            rule_id_prefix: default_preflight_rule_prefix(),
+            severity_field: default_preflight_severity_field(),
+            message_field: default_preflight_message_field(),
+            file_field: default_preflight_file_field(),
+            line_field: default_preflight_line_field(),
+            column_field: default_preflight_column_field(),
+            default_severity: default_preflight_default_severity(),
+        }
+    }
 }
 
 /// Error types for checkpoint operations
@@ -660,6 +727,7 @@ mod tests {
             max_iterations: 10,
             on_incomplete: OnIncompletePolicy::Fail,
             mcp_servers: vec![],
+            preflight: vec![],
         };
         assert_eq!(contract.ambiguity_policy, AmbiguityPolicy::FailClosed);
         assert!(contract.gating_rules.is_empty());

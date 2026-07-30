@@ -90,6 +90,8 @@ struct YamlTaskConfig {
     on_incomplete: String,
     #[serde(default)]
     mcp_servers: Vec<YamlMcpServerConfig>,
+    #[serde(default)]
+    preflight: Vec<YamlPreflightCheck>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +111,28 @@ struct YamlMcpServerConfig {
     args: Vec<String>,
     #[serde(default)]
     env: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YamlPreflightCheck {
+    mcp_server: String,
+    tool: String,
+    #[serde(default)]
+    args: serde_json::Value,
+    #[serde(default)]
+    rule_id_prefix: Option<String>,
+    #[serde(default)]
+    severity_field: Option<String>,
+    #[serde(default)]
+    message_field: Option<String>,
+    #[serde(default)]
+    file_field: Option<String>,
+    #[serde(default)]
+    line_field: Option<String>,
+    #[serde(default)]
+    column_field: Option<String>,
+    #[serde(default)]
+    default_severity: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +327,7 @@ impl Config {
                     max_iterations: default_max_iterations(),
                     on_incomplete: default_on_incomplete(),
                     mcp_servers: vec![],
+                    preflight: vec![],
                 },
                 None,
             )
@@ -417,6 +442,25 @@ impl Config {
                         command: s.command,
                         args: s.args,
                         env: s.env,
+                    })
+                    .collect(),
+                preflight: yaml_task
+                    .preflight
+                    .into_iter()
+                    .map(|p| {
+                        let d = crate::types::PreflightCheck::default();
+                        crate::types::PreflightCheck {
+                            mcp_server: p.mcp_server,
+                            tool: p.tool,
+                            args: p.args,
+                            rule_id_prefix: p.rule_id_prefix.unwrap_or(d.rule_id_prefix),
+                            severity_field: p.severity_field.unwrap_or(d.severity_field),
+                            message_field: p.message_field.unwrap_or(d.message_field),
+                            file_field: p.file_field.unwrap_or(d.file_field),
+                            line_field: p.line_field.unwrap_or(d.line_field),
+                            column_field: p.column_field.unwrap_or(d.column_field),
+                            default_severity: p.default_severity.unwrap_or(d.default_severity),
+                        }
                     })
                     .collect(),
             },
@@ -1794,5 +1838,105 @@ task:
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("Duplicate"), "got: {err_msg}");
+    }
+
+    #[test]
+    fn test_preflight_config_parsing() {
+        let yaml = r#"
+version: "1"
+task:
+  name: preflight-test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  mcp_servers:
+    - name: diag
+      command: agent-lsp
+  preflight:
+    - mcp_server: diag
+      tool: get_diagnostics
+      args:
+        path: "."
+      rule_id_prefix: "lsp-"
+      severity_field: "severity"
+      message_field: "message"
+      file_field: "file"
+      line_field: "line"
+      default_severity: "warning"
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.preflight.len(), 1);
+        let check = &config.task.preflight[0];
+        assert_eq!(check.mcp_server, "diag");
+        assert_eq!(check.tool, "get_diagnostics");
+        assert_eq!(check.rule_id_prefix, "lsp-");
+        assert_eq!(check.severity_field, "severity");
+        assert_eq!(check.message_field, "message");
+        assert_eq!(check.file_field, "file");
+        assert_eq!(check.line_field, "line");
+        assert_eq!(check.default_severity, "warning");
+    }
+
+    #[test]
+    fn test_preflight_config_defaults() {
+        let yaml = r#"
+version: "1"
+task:
+  name: preflight-min
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  mcp_servers:
+    - name: diag
+      command: agent-lsp
+  preflight:
+    - mcp_server: diag
+      tool: get_diagnostics
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(config.task.preflight.len(), 1);
+        let check = &config.task.preflight[0];
+        assert_eq!(check.mcp_server, "diag");
+        assert_eq!(check.tool, "get_diagnostics");
+        // All field mappings should use defaults
+        assert_eq!(check.rule_id_prefix, "preflight-");
+        assert_eq!(check.severity_field, "severity");
+        assert_eq!(check.message_field, "message");
+        assert_eq!(check.file_field, "file");
+        assert_eq!(check.default_severity, "warning");
     }
 }
