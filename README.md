@@ -267,6 +267,12 @@ task:
   max_total_tokens: 200000           # Optional. Cap on cumulative billed tokens across all
                                      # LLM calls in one run; the run stops (marked incomplete)
                                      # when reached. Unset means no cap.
+  auto_compact: false                # Default. When true, dropped context is summarized with
+                                     # an LLM call and injected back instead of a bare hint.
+  max_compactions: 3                 # Default. Per-run cap on auto-compact calls. 0 disables.
+  findings_ledger: true              # Default. Persist interim findings to a disk ledger and
+                                     # merge them back before the final answer, so findings from
+                                     # truncated iterations are never lost.
   timeout_secs: 300                  # Default. Max wall-clock time in seconds.
   max_iterations: 10                 # Default. Max agent loop iterations.
   shell_timeout_secs: 120            # Default. Per-command timeout for shell_exec.
@@ -549,9 +555,20 @@ Clausura runs a bounded agent loop of up to `max_iterations` iterations (default
 
 The system prompt is built from `prompt_template` plus available tool definitions. The LLM is instructed to respond in JSON with a `findings` array.
 
-### Context truncation and archiving
+### Context truncation, archiving, and auto-compact
 
 When the conversation exceeds the configured `token_budget`, Clausura automatically truncates older messages to stay within limits. Dropped messages are not silently discarded — they are archived to `.clausura/archives/context-dump-{task_id}-{seq}.log` inside the workspace as JSON lines. A hint message is injected into the conversation telling the LLM where to find the archived context, so it can retrieve earlier findings via the `read_file` tool if needed.
+
+With `auto_compact: true`, the dropped messages are instead **summarized with a single LLM call** and the summary is injected at the truncation boundary, so the agent keeps its memory of earlier findings, files examined, and decisions across truncation. The full transcript is still archived. Auto-compact never changes the run's pass/fail semantics:
+
+- Summary calls are billed and counted against `max_total_tokens`, but the call is **skipped** if it would not fit under the remaining quota.
+- If the summarization call fails or times out, Clausura silently falls back to the bare truncation hint.
+- Summaries are sized to the headroom the retained context leaves under the truncation threshold (capped at 10% of `token_budget`); oversized output is trimmed. A compacted context always stays within budget, so a successful compaction can never push the run into "incomplete".
+- `max_compactions` bounds the number of summary calls per run (default 3) to prevent compaction loops on very long tasks.
+
+### Findings ledger (disk-backed memory)
+
+Compaction is lossy by design, so Clausura also keeps a **lossless, deterministic memory** on disk: whenever the agent emits findings in a response, they are appended to `{workspace}/.clausura/archives/findings-ledger-{task_id}.jsonl` (one JSON object per line). When the run finishes, the final findings are **merged with the ledger** — the final response wins on conflicts, and findings from iterations that were truncated out of context are appended back. No extra LLM calls are involved; the merge is plain deduplication keyed on `rule_id` + location + message. Disable with `findings_ledger: false` (env `CLAUSURA_FINDINGS_LEDGER=false`).
 
 On successful completion (exit code 0), archive files are automatically cleaned up. On failure (exit code 1-3), they are preserved for debugging and audit.
 
