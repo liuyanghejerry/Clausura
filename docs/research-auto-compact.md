@@ -70,7 +70,69 @@ Date: 2026-08-04
 
 ---
 
-## 3. 什么是"给 Clausura 加 auto-compact"
+## 3. 三者关系：token_budget / max_total_tokens / auto_compact
+
+这三个概念历史上就被混淆过（v1.2.0 之前把累计计费 token 误当成上下文预算，导致
+正常 run 被误判 incomplete，见 commit `1f88d76`）。建议在文档与 README 里把它们
+显式区分开。
+
+### 3.1 各自职责边界
+
+| 概念 | 控制什么 | 默认值 | 触发后的行为 |
+|------|---------|--------|-------------|
+| `token_budget` | **单次请求**的上下文大小上限（system + 消息历史，含将来注入的摘要） | 32000 | 用量 >80% 触发截断，压回 75% 以内；压不住 → incomplete |
+| `max_total_tokens` | **整次运行**累计计费 token 上限（所有 LLM 调用 `usage.total_tokens` 之和） | None（无上限） | 累计达到 → 停止 agent 循环 → incomplete |
+| `auto_compact`（提案） | 在 `token_budget` 触发截断时，**用摘要替换裸丢弃**的处理策略 | false（默认关） | 触发一次 LLM 摘要调用，把被丢消息总结注入对话 |
+
+一句话：`token_budget` 管"单次请求多大"，`max_total_tokens` 管"总共花多少"，
+`auto_compact` 管"预算逼近时旧消息怎么处理"。前两者是**约束**，compact 是**策略**。
+
+### 3.2 交互关系（关键点）
+
+1. **触发链**：`auto_compact` **只由 `token_budget` 触发**（>80% 阈值），与
+   `max_total_tokens` 无触发关系。`max_total_tokens` 到达时无论上下文多空都停——
+   compact 救不了它。
+2. **计费链**：compact 调用是真实 LLM 调用，其 usage 应**计入** `max_total_tokens`
+   （默认），否则用户会看到"没到配额却多花钱"。但计入后必须**防死循环**：调用前检查
+   剩余配额，若不足以完成一次 compact，应跳过 compact 直接走降级截断——否则
+   compact 自己把配额打满，反而比不 compact 更早中断 run。
+3. **预算链**：compact 的产物（摘要）**回填 `token_budget`**——摘要注入后仍须通过
+   `should_truncate` 检查；摘要大小应设上限（建议 ≤ `token_budget` 的 10%）。
+   compact 不改变 `token_budget` 本身，只是让"被丢掉的记忆"以低成本形式留在预算内。
+4. **终止语义不变**：两种终止（`token_budget` 压不住 / `max_total_tokens` 到达）都
+   标记 incomplete，`on_incomplete` 策略不变。compact 只降低"截断后失忆 → 重复工具
+   调用 → 长度/迭代超限"的**概率**，不改变任何终止条件本身。
+5. **总量净效应不确定**：
+   - 不 compact：后续请求 input 更小，但失忆导致重复工具调用 → 请求数变多；
+   - compact：后续请求 input 多一段摘要，但记忆连续 → 请求数减少；
+   - 净 token 可能是节省（长任务），也可能是支出（短任务恰好触发一次）。
+   这正是"默认关闭 + 用户按场景开启"的原因。
+
+### 3.3 判定顺序（每次迭代）
+
+```
+迭代开始
+├─ max_total_tokens 已达? ──是──▶ break → incomplete
+├─ token_budget 用量 >80%? ──否──▶ 正常 chat_with_tools
+│   └─是
+│       ├─ auto_compact 开 & 剩余配额够一次 compact & 未超 compact 次数上限?
+│       │    是 → 摘要调用（计入 max_total_tokens）→ 摘要注入 index 1 → 归档原始消息
+│       │    否 → 现有截断 + 提示 + 归档（降级）
+│       └─ 截断/摘要后仍 >80%? ──是──▶ break → incomplete
+└─ 正常推进
+```
+
+### 3.4 配置层面的显式化建议
+
+- 文档用表格明确"谁管什么"，并给典型组合示例：
+  `token_budget: 32000, max_total_tokens: 200000, auto_compact: true`——单请求 ≤32k、
+  整轮 ≤200k、预算逼近时摘要续命。
+- 明确说明一个**反直觉现象**：`max_total_tokens` 设得接近 `token_budget`（如 32000）时，
+  `auto_compact` 基本不会生效（配额被 agent 自身调用先耗尽），属正常，不是 bug。
+
+---
+
+## 4. 什么是"给 Clausura 加 auto-compact"
 
 在 agent 循环里，把现有的"截断→归档→提示"升级为：
 
@@ -87,7 +149,7 @@ Date: 2026-08-04
 
 ---
 
-## 4. 价值分析（Value）
+## 5. 价值分析（Value）
 
 ### 4.1 直接价值：保住"过程记忆"，减少有损截断导致的错误结局
 
@@ -126,7 +188,7 @@ auto-compact 直接缓解上述两种结局：摘要携带"已发现 findings �
 
 ---
 
-## 5. 成本分析（Cost）
+## 6. 成本分析（Cost）
 
 ### 5.1 运行期成本（token / 延迟 / 计费）
 
@@ -140,7 +202,7 @@ auto-compact 直接缓解上述两种结局：摘要携带"已发现 findings �
   - GPT-4o 级别（$2.5/M in、$10/M out）：单次 ~**$0.02**；
   - 一次跑 2–3 次 compact 的任务：计费 token 增加 **~3–10%**（相对正常 60–200k 总量）。
 - 延迟：6k token 输入的摘要调用约 **5–20s**（慢模型更长），且与 agent 迭代串行。
-- 需要把 compact 调用计入 `max_total_tokens` 与 `timeout_secs` 的账——否则用户对
+- 需要把 compact 调用计入 `max_total_tokens` 与 `timeout_secs` 的账（关系细节见 §3.2）——否则用户对
   "预算超支/超时"的预期会被悄悄打破。
 
 结论：绝对成本小，但**不是零**，且与任务时长线性叠加；对按次计费/配额紧张的 CI 账户
@@ -180,7 +242,7 @@ auto-compact 直接缓解上述两种结局：摘要携带"已发现 findings �
 
 ---
 
-## 6. 备选方案（Alternatives）
+## 7. 备选方案（Alternatives）
 
 | 方案 | 成本 | 效果 | 点评 |
 |------|------|------|------|
@@ -193,7 +255,7 @@ auto-compact 直接缓解上述两种结局：摘要携带"已发现 findings �
 
 ---
 
-## 7. 建议与实施路线
+## 8. 建议与实施路线
 
 ### 7.1 建议
 
@@ -205,6 +267,7 @@ auto-compact 直接缓解上述两种结局：摘要携带"已发现 findings �
    - 触发：与截断同一阈值（>80% 预算），一次任务最多 N 次（防死循环）；
    - 摘要上限：≤ token_budget 的 10%，且摘要后仍须通过 `should_truncate` 检查；
    - 记账：compact 调用单独记 usage，默认**计入** `max_total_tokens`，日志明示；
+     调用前须检查剩余配额，不足则跳过 compact 走降级截断（见 §3.2 计费链）；
    - 降级：摘要失败/超时 → 回退现状（提示+归档），run 状态不受影响；
    - 注入位置：index 1，User 角色，维持 assistant→tool 配对不变式；
    - 摘要指令：要求**逐条保留 findings**（rule_id/severity/message），禁止发挥。
@@ -222,7 +285,7 @@ auto-compact 直接缓解上述两种结局：摘要携带"已发现 findings �
 
 ---
 
-## 8. 参考（代码位置）
+## 9. 参考（代码位置）
 
 - `crates/clausura-core/src/context.rs` — 预算跟踪、截断算法、归档
 - `crates/clausura-core/src/agent.rs` — agent 循环、截断注入、findings 提取
