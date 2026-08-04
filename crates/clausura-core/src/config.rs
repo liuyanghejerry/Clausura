@@ -1155,7 +1155,10 @@ task:
             LogFormat::Json,
         )
         .unwrap();
-        assert!(!config.task.auto_compact, "auto_compact must default to off");
+        assert!(
+            !config.task.auto_compact,
+            "auto_compact must default to off"
+        );
         assert_eq!(config.task.max_compactions, 3);
     }
 

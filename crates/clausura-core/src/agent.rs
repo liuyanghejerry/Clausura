@@ -91,9 +91,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                 // bare "context trimmed" hint — compaction must never fail
                 // the run.
                 let compact_summary: Option<String> = match &archive_result {
-                    Ok(path)
-                        if auto_compact && compactions_used < max_compactions =>
-                    {
+                    Ok(path) if auto_compact && compactions_used < max_compactions => {
                         match try_compact(
                             config.provider,
                             &cm,
@@ -301,10 +299,7 @@ fn dropped_to_text(dropped: &[Message]) -> String {
             Role::Assistant => {
                 if let Some(calls) = &m.tool_calls {
                     let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
-                    out.push_str(&format!(
-                        "Assistant (tool calls: {}):\n",
-                        names.join(", ")
-                    ));
+                    out.push_str(&format!("Assistant (tool calls: {}):\n", names.join(", ")));
                 } else {
                     out.push_str("Assistant:\n");
                 }
@@ -1120,8 +1115,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_loop_auto_compact_injects_summary() {
-        let (tmp, contract, tool_call, initial) =
-            auto_compact_setup(10000, None, true, 3);
+        let (tmp, contract, tool_call, initial) = auto_compact_setup(10000, None, true, 3);
         let root = tmp.path().to_path_buf();
         let tools = default_tools(root.clone(), &[], 120, &[]);
 
@@ -1187,8 +1181,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_loop_auto_compact_falls_back_on_llm_error() {
-        let (tmp, contract, tool_call, initial) =
-            auto_compact_setup(10000, None, true, 3);
+        let (tmp, contract, tool_call, initial) = auto_compact_setup(10000, None, true, 3);
         let root = tmp.path().to_path_buf();
         let tools = default_tools(root.clone(), &[], 120, &[]);
 
@@ -1233,8 +1226,7 @@ mod tests {
     async fn test_agent_loop_auto_compact_disabled_by_max_compactions_zero() {
         // max_compactions = 0 disables compaction even when auto_compact is
         // on: the queued summary response must never be consumed.
-        let (tmp, contract, tool_call, initial) =
-            auto_compact_setup(10000, None, true, 0);
+        let (tmp, contract, tool_call, initial) = auto_compact_setup(10000, None, true, 0);
         let root = tmp.path().to_path_buf();
         let tools = default_tools(root.clone(), &[], 120, &[]);
 
@@ -1272,8 +1264,7 @@ mod tests {
         // max_total_tokens too small for a summary call → compaction is
         // skipped by the quota guard (bare hint), and the queued summary is
         // never consumed.
-        let (tmp, contract, tool_call, initial) =
-            auto_compact_setup(10000, Some(500), true, 3);
+        let (tmp, contract, tool_call, initial) = auto_compact_setup(10000, Some(500), true, 3);
         let root = tmp.path().to_path_buf();
         let tools = default_tools(root.clone(), &[], 120, &[]);
 
