@@ -1,6 +1,6 @@
 [package]
 name = "clausura-core"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 description = "Core library for Clausura — a CI-native agent for deterministic pipeline gating"
 license = "MIT"
