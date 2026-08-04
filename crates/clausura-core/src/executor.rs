@@ -279,19 +279,22 @@ fn apply_incomplete_policy(
     }
 }
 
-/// Delete archive files for the given task_id after successful execution.
-/// Silently ignores errors — this is best-effort cleanup.
+/// Delete archive and ledger files for the given task_id after successful
+/// execution. Silently ignores errors — this is best-effort cleanup.
 pub fn cleanup_archives(workspace: &Path, task_id: &str) {
     let archives_dir = workspace.join(".clausura").join("archives");
     if !archives_dir.exists() {
         return;
     }
-    let prefix = format!("context-dump-{}-", task_id);
+    let dump_prefix = format!("context-dump-{}-{}", task_id, "");
+    let ledger_prefix = format!("findings-ledger-{}", task_id);
     if let Ok(entries) = std::fs::read_dir(&archives_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with(&prefix) && name_str.ends_with(".log") {
+            let is_dump = name_str.starts_with(&dump_prefix) && name_str.ends_with(".log");
+            let is_ledger = name_str.starts_with(&ledger_prefix) && name_str.ends_with(".jsonl");
+            if is_dump || is_ledger {
                 let _ = std::fs::remove_file(entry.path());
             }
         }

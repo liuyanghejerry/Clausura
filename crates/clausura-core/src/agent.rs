@@ -166,6 +166,19 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         total_usage.total_tokens += response.usage.total_tokens;
         running_tokens += response.usage.total_tokens;
 
+        // Persist any findings in this response to the on-disk ledger so they
+        // survive later context truncation/compaction and can be merged back
+        // into the final answer. Best-effort: a failed write is ignored.
+        if config.contract.findings_ledger {
+            let interim = extract_findings_lenient(&response.message.content);
+            if !interim.is_empty() {
+                let ledger = ledger_path(&config.workspace_root, &config.contract.id);
+                if let Err(e) = append_findings_to_ledger(&ledger, &interim) {
+                    tracing::debug!(reason = %e, "findings ledger write failed (ignored)");
+                }
+            }
+        }
+
         match response.finish_reason {
             FinishReason::Stop => {
                 messages.push(Message::new(
@@ -175,6 +188,20 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 
                 let findings = extract_findings(&response.message.content)
                     .map_err(ProviderError::MalformedFindings)?;
+
+                // Merge findings persisted earlier in the run (which may have
+                // been truncated out of context since) back into the final
+                // set, so the final answer is never missing early iterations.
+                let findings = if config.contract.findings_ledger {
+                    let ledger = read_ledger_findings(&ledger_path(
+                        &config.workspace_root,
+                        &config.contract.id,
+                    ));
+                    merge_with_ledger(findings, ledger)
+                } else {
+                    findings
+                };
+
                 return Ok(AgentResult {
                     messages,
                     findings,
@@ -187,7 +214,11 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                 if let Some(tool_calls) = response.tool_calls {
                     messages.push(Message {
                         role: Role::Assistant,
-                        content: String::new(),
+                        // Preserve the assistant's text: models commonly emit
+                        // reasoning/progress (and findings drafts) alongside
+                        // tool calls; discarding it loses interim findings
+                        // before they can reach the final answer.
+                        content: response.message.content.clone(),
                         tool_call_id: None,
                         tool_calls: Some(tool_calls.clone()),
                     });
@@ -259,6 +290,15 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
     // exhaustion, none of which produced a complete final answer.
     truncated = true;
     let findings = extract_findings_lenient(&last_content);
+
+    // Best-effort merge of ledger findings for the incomplete path too.
+    let findings = if config.contract.findings_ledger {
+        let ledger =
+            read_ledger_findings(&ledger_path(&config.workspace_root, &config.contract.id));
+        merge_with_ledger(findings, ledger)
+    } else {
+        findings
+    };
 
     Ok(AgentResult {
         messages,
@@ -432,6 +472,85 @@ fn truncate_summary_to_budget(provider: &dyn Provider, summary: &str, cap_tokens
     let mut trimmed: String = chars[..low].iter().collect();
     trimmed.push_str(MARKER);
     trimmed
+}
+
+// ---------------------------------------------------------------------------
+// Findings ledger
+// ---------------------------------------------------------------------------
+
+/// Path to the findings ledger for a task: one Finding per JSON line.
+/// Lives next to the context archives so cleanup can sweep both.
+fn ledger_path(workspace_root: &Path, task_id: &str) -> PathBuf {
+    workspace_root
+        .join(".clausura")
+        .join("archives")
+        .join(format!("findings-ledger-{}.jsonl", task_id))
+}
+
+/// Append findings to the ledger, creating file/dirs as needed.
+/// Best-effort by design: the ledger is a safety net, not a dependency.
+fn append_findings_to_ledger(path: &Path, findings: &[Finding]) -> std::io::Result<()> {
+    if findings.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut content = String::new();
+    for f in findings {
+        if let Ok(line) = serde_json::to_string(f) {
+            content.push_str(&line);
+            content.push('\n');
+        }
+    }
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(content.as_bytes())
+}
+
+/// Read all findings previously persisted to the ledger.
+/// A missing or unreadable ledger yields an empty vector.
+fn read_ledger_findings(path: &Path) -> Vec<Finding> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Merge ledger findings into the final findings.
+///
+/// The final response wins on conflicts; ledger-only findings (e.g. from
+/// iterations that were truncated out of context) are appended. Dedup key:
+/// rule_id + location + message. Deterministic — no LLM involved.
+fn merge_with_ledger(final_findings: Vec<Finding>, ledger: Vec<Finding>) -> Vec<Finding> {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::with_capacity(final_findings.len() + ledger.len());
+    for f in final_findings {
+        if seen.insert(finding_key(&f)) {
+            merged.push(f);
+        }
+    }
+    for f in ledger {
+        if seen.insert(finding_key(&f)) {
+            merged.push(f);
+        }
+    }
+    merged
+}
+
+fn finding_key(f: &Finding) -> String {
+    format!(
+        "{}|{}|{}",
+        f.rule_id,
+        serde_json::to_string(&f.location).unwrap_or_default(),
+        f.message
+    )
 }
 
 /// Extract findings from a completed agent response.
@@ -615,7 +734,9 @@ mod tests {
     use super::*;
     use crate::provider::tests::MockProvider;
     use crate::tools::default_tools;
-    use crate::types::{AmbiguityPolicy, ChatResponse, OnIncompletePolicy, ToolCall, VendorConfig};
+    use crate::types::{
+        AmbiguityPolicy, ChatResponse, OnIncompletePolicy, Severity, ToolCall, VendorConfig,
+    };
     use tempfile::TempDir;
 
     fn test_contract() -> TaskContract {
@@ -631,6 +752,7 @@ mod tests {
             max_total_tokens: None,
             auto_compact: false,
             max_compactions: 3,
+            findings_ledger: true,
             timeout_secs: 60,
             shell_timeout_secs: 120,
             shell_env_passthrough: vec![],
@@ -1342,6 +1464,190 @@ mod tests {
         let short = "short summary".to_string();
         let untouched = truncate_summary_to_budget(&mock, &short, cap_tokens);
         assert_eq!(untouched, short);
+    }
+
+    // -----------------------------------------------------------------
+    // Findings ledger
+    // -----------------------------------------------------------------
+
+    fn finding(rule_id: &str, severity: Severity, message: &str) -> Finding {
+        Finding {
+            id: uuid::Uuid::new_v4(),
+            rule_id: rule_id.into(),
+            severity,
+            message: message.into(),
+            location: None,
+            evidence: "e".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_ledger_merges_findings_from_earlier_iterations() {
+        // An early iteration emits findings alongside a tool call; the final
+        // Stop response only reports later findings. The ledger must preserve
+        // the early ones and merge them back into the final result.
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut contract = test_contract();
+        contract.findings_ledger = true;
+
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            name: "git_diff".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let early = finding(
+            "early-issue",
+            Severity::Warning,
+            "found in an early iteration",
+        );
+        let late = finding("final-issue", Severity::Error, "found at the end");
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_response(ChatResponse {
+            message: Message::new(
+                Role::Assistant,
+                serde_json::json!({"findings": [early]}).to_string(),
+            ),
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![tool_call.clone()]),
+        });
+        mock.add_response(ChatResponse {
+            message: Message::new(
+                Role::Assistant,
+                serde_json::json!({"findings": [late]}).to_string(),
+            ),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(!result.truncated);
+        let rule_ids: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            rule_ids.contains(&"early-issue"),
+            "early finding must survive via the ledger, got: {:?}",
+            rule_ids
+        );
+        assert!(
+            rule_ids.contains(&"final-issue"),
+            "final finding must be present, got: {:?}",
+            rule_ids
+        );
+        // Final response findings come first, ledger-only findings appended.
+        assert_eq!(rule_ids[0], "final-issue");
+
+        // The ledger file was written next to the archives.
+        let ledger = root
+            .join(".clausura")
+            .join("archives")
+            .join("findings-ledger-test.jsonl");
+        assert!(ledger.exists(), "ledger file should exist");
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_ledger_disabled() {
+        // findings_ledger = false: interim findings are not persisted and the
+        // final result contains only the Stop response findings.
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut contract = test_contract();
+        contract.findings_ledger = false;
+
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            name: "git_diff".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let early = finding("early-issue", Severity::Warning, "early");
+        let late = finding("final-issue", Severity::Error, "final");
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_response(ChatResponse {
+            message: Message::new(
+                Role::Assistant,
+                serde_json::json!({"findings": [early]}).to_string(),
+            ),
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![tool_call.clone()]),
+        });
+        mock.add_response(ChatResponse {
+            message: Message::new(
+                Role::Assistant,
+                serde_json::json!({"findings": [late]}).to_string(),
+            ),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        let rule_ids: Vec<&str> = result.findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(rule_ids, vec!["final-issue"]);
+
+        let ledger = root
+            .join(".clausura")
+            .join("archives")
+            .join("findings-ledger-test.jsonl");
+        assert!(
+            !ledger.exists(),
+            "no ledger should be written when disabled"
+        );
+    }
+
+    #[test]
+    fn test_merge_with_ledger_dedup() {
+        // The final response wins; a ledger-only finding is appended; an
+        // identical (rule_id + location + message) ledger copy is dropped.
+        let final_a = finding("r1", Severity::Error, "dup message");
+        let final_b = finding("r2", Severity::Warning, "only final");
+        let ledger_a = finding("r1", Severity::Error, "dup message");
+        let ledger_c = finding("r3", Severity::Info, "only ledger");
+
+        let merged = merge_with_ledger(vec![final_a, final_b], vec![ledger_a, ledger_c]);
+        let rule_ids: Vec<&str> = merged.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(rule_ids, vec!["r1", "r2", "r3"]);
     }
 
     #[tokio::test]

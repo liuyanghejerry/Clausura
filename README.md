@@ -270,6 +270,9 @@ task:
   auto_compact: false                # Default. When true, dropped context is summarized with
                                      # an LLM call and injected back instead of a bare hint.
   max_compactions: 3                 # Default. Per-run cap on auto-compact calls. 0 disables.
+  findings_ledger: true              # Default. Persist interim findings to a disk ledger and
+                                     # merge them back before the final answer, so findings from
+                                     # truncated iterations are never lost.
   timeout_secs: 300                  # Default. Max wall-clock time in seconds.
   max_iterations: 10                 # Default. Max agent loop iterations.
   shell_timeout_secs: 120            # Default. Per-command timeout for shell_exec.
@@ -562,6 +565,10 @@ With `auto_compact: true`, the dropped messages are instead **summarized with a 
 - If the summarization call fails or times out, Clausura silently falls back to the bare truncation hint.
 - Summaries are capped at 10% of `token_budget`; oversized output is trimmed.
 - `max_compactions` bounds the number of summary calls per run (default 3) to prevent compaction loops on very long tasks.
+
+### Findings ledger (disk-backed memory)
+
+Compaction is lossy by design, so Clausura also keeps a **lossless, deterministic memory** on disk: whenever the agent emits findings in a response, they are appended to `{workspace}/.clausura/archives/findings-ledger-{task_id}.jsonl` (one JSON object per line). When the run finishes, the final findings are **merged with the ledger** — the final response wins on conflicts, and findings from iterations that were truncated out of context are appended back. No extra LLM calls are involved; the merge is plain deduplication keyed on `rule_id` + location + message. Disable with `findings_ledger: false` (env `CLAUSURA_FINDINGS_LEDGER=false`).
 
 On successful completion (exit code 0), archive files are automatically cleaned up. On failure (exit code 1-3), they are preserved for debugging and audit.
 

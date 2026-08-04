@@ -400,6 +400,13 @@ pub struct TaskContract {
     /// when `auto_compact` is true.
     #[serde(default = "default_max_compactions")]
     pub max_compactions: u32,
+    /// When true, findings the agent emits during the run are appended to a
+    /// JSON-lines ledger on disk (`{workspace}/.clausura/archives/`). Before
+    /// returning, the final findings are merged with the ledger so findings
+    /// from earlier iterations survive context truncation/compaction. Default
+    /// true; costs no LLM calls and is deterministic.
+    #[serde(default = "default_findings_ledger")]
+    pub findings_ledger: bool,
     pub timeout_secs: u64,
     #[serde(default = "default_shell_timeout_secs")]
     pub shell_timeout_secs: u64,
@@ -429,6 +436,10 @@ fn default_max_iterations() -> u32 {
 
 fn default_max_compactions() -> u32 {
     3
+}
+
+fn default_findings_ledger() -> bool {
+    true
 }
 
 fn default_shell_timeout_secs() -> u64 {
@@ -749,6 +760,7 @@ mod tests {
             max_total_tokens: None,
             auto_compact: false,
             max_compactions: 3,
+            findings_ledger: true,
             timeout_secs: 300,
             shell_timeout_secs: 120,
             shell_env_passthrough: vec![],
@@ -764,6 +776,7 @@ mod tests {
         assert_eq!(contract.on_incomplete, OnIncompletePolicy::Fail);
         assert!(!contract.auto_compact);
         assert_eq!(contract.max_compactions, 3);
+        assert!(contract.findings_ledger);
     }
 
     #[test]

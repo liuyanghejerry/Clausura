@@ -44,6 +44,8 @@ task:
   auto_compact: false                # Optional. Summarize dropped context with an LLM call
                                      # instead of a bare truncation hint.
   max_compactions: 3                 # Per-run cap on auto-compact calls. 0 disables.
+  findings_ledger: true              # Persist interim findings to a disk ledger and merge
+                                     # them back before the final answer (lossless memory).
   timeout_secs: 300                  # Max wall-clock time for the entire run.
   max_iterations: 10                 # Max agent loop iterations (tool calls + LLM turns).
   shell_timeout_secs: 120            # Per-command timeout for shell_exec.
@@ -206,6 +208,23 @@ task:
 ```
 
 Env override: `CLAUSURA_AUTO_COMPACT=true`, `CLAUSURA_MAX_COMPACTIONS=5`.
+
+### `task.findings_ledger`
+
+**Default: true.** Whenever the agent emits findings in a response, Clausura appends them to `{workspace}/.clausura/archives/findings-ledger-{task_id}.jsonl` (one JSON object per line). When the run finishes, the final findings are merged with the ledger:
+
+- The final response wins on conflicts (same `rule_id` + location + message).
+- Findings from iterations that were truncated out of context are appended back — so context truncation/compaction can never silently drop an already-discovered finding.
+- The merge is deterministic (plain deduplication, no LLM call) and zero-cost.
+
+This is the **lossless complement to auto-compact**: compaction preserves continuity (summary in context), the ledger preserves completeness (findings on disk). It also applies when `auto_compact` is off — bare truncation drops just as much.
+
+```yaml
+task:
+  findings_ledger: true   # default; set false to disable
+```
+
+Env override: `CLAUSURA_FINDINGS_LEDGER=false`.
 
 ### `task.timeout_secs`
 

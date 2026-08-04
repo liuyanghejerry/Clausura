@@ -78,6 +78,8 @@ struct YamlTaskConfig {
     auto_compact: bool,
     #[serde(default = "default_max_compactions")]
     max_compactions: u32,
+    #[serde(default = "default_findings_ledger")]
+    findings_ledger: bool,
     #[serde(default = "default_timeout")]
     timeout_secs: u64,
     #[serde(default = "default_shell_timeout")]
@@ -165,6 +167,10 @@ fn default_max_iterations() -> u32 {
 
 fn default_max_compactions() -> u32 {
     3
+}
+
+fn default_findings_ledger() -> bool {
+    true
 }
 
 fn default_ambiguity() -> String {
@@ -329,6 +335,7 @@ impl Config {
                     max_total_tokens: None,
                     auto_compact: false,
                     max_compactions: default_max_compactions(),
+                    findings_ledger: default_findings_ledger(),
                     timeout_secs: default_timeout(),
                     shell_timeout_secs: default_shell_timeout(),
                     shell_env_passthrough: vec![],
@@ -375,6 +382,10 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(yaml_task.max_compactions);
+        let findings_ledger = match std::env::var("CLAUSURA_FINDINGS_LEDGER") {
+            Ok(v) => matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+            Err(_) => yaml_task.findings_ledger,
+        };
 
         let timeout = std::env::var("CLAUSURA_TIMEOUT")
             .ok()
@@ -449,6 +460,7 @@ impl Config {
                 max_total_tokens,
                 auto_compact,
                 max_compactions,
+                findings_ledger,
                 timeout_secs: timeout,
                 shell_timeout_secs: shell_timeout,
                 shell_env_passthrough: yaml_task.shell_env_passthrough,
@@ -702,6 +714,7 @@ task:
             std::env::remove_var("CLAUSURA_SHELL_TIMEOUT");
             std::env::remove_var("CLAUSURA_AUTO_COMPACT");
             std::env::remove_var("CLAUSURA_MAX_COMPACTIONS");
+            std::env::remove_var("CLAUSURA_FINDINGS_LEDGER");
         }
     }
 
@@ -1265,6 +1278,111 @@ task:
             assert!(!config.task.auto_compact, "{val} must parse as false");
         }
         unsafe { std::env::remove_var("CLAUSURA_AUTO_COMPACT") };
+    }
+
+    #[test]
+    fn test_findings_ledger_defaults_true() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert!(
+            config.task.findings_ledger,
+            "findings_ledger must default to true"
+        );
+    }
+
+    #[test]
+    fn test_findings_ledger_from_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+  findings_ledger: false
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert!(!config.task.findings_ledger);
+    }
+
+    #[test]
+    fn test_findings_ledger_env_overrides_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clean_env_vars();
+        unsafe { std::env::set_var("CLAUSURA_FINDINGS_LEDGER", "false") };
+        let yaml = r#"
+version: "1"
+task:
+  name: test
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  timeout_secs: 60
+  ambiguity_policy: fail_closed
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert!(!config.task.findings_ledger, "env must override default");
+        unsafe { std::env::remove_var("CLAUSURA_FINDINGS_LEDGER") };
     }
 
     #[test]

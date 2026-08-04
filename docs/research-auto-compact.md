@@ -7,6 +7,12 @@ Date: 2026-08-04
 > **Update (2026-08-04):** Phase 1 (LLM 摘要 compact) 已在本分支实现：
 > `auto_compact`（默认 false）+ `max_compactions`（默认 3）已落地，含配额守卫与
 > 失败降级。详见 §7.1 与 §9。本报告其余部分保留为设计依据与成本记录。
+>
+> **Update 2 (2026-08-04)**：新增**磁盘 findings ledger**（`findings_ledger`，默认 true）——
+> 运行中每轮响应出现的 findings 追加到 `.clausura/archives/findings-ledger-{task_id}.jsonl`，
+> 终局 Stop 时确定性合并回最终 findings（去重键 rule_id+location+message，最终响应优先）。
+> 这是 compact 的**无损互补**：compact 保上下文连续性，ledger 保结果完整性，零 LLM 成本、
+> 确定性、可审计。顺带修复了 ToolCalls 分支丢弃 assistant content 的信息丢失点。
 
 ## 1. 结论先行（TL;DR）
 
@@ -261,13 +267,15 @@ auto-compact 直接缓解上述两种结局：摘要携带"已发现 findings �
 
 ## 8. 建议与实施路线
 
-> **已实现（2026-08-04）**：§7.1 的 Phase 1 已落地为可选开关（默认关闭，行为零变化）：
+> **已实现 (2026-08-04)**：§7.1 的 Phase 1 已落地为可选开关（默认关闭，行为零变化）：
 > `auto_compact: true/false`、`max_compactions: u32`（默认 3，0 = 关闭），Env
 > `CLAUSURA_AUTO_COMPACT` / `CLAUSURA_MAX_COMPACTIONS`。实现遵循本报告全部关键约束：
 > 触发阈值与截断一致、摘要注入 index 1（User 角色）、摘要上限 = 10% token_budget、
 > compact 计费计入 `max_total_tokens` 且调用前有配额守卫、失败/超时降级为现有截断+提示、
 > 摘要输入对被丢 Tool 消息做文本化以绕过 Anthropic `tool_use_id` 配对问题。
-> Phase 0（确定性 findings 台账）尚未实施，可作后续低成本增强。
+> Phase 0（确定性 findings 台账）已以**磁盘 ledger** 形式实现（`findings_ledger`，默认 true，
+> 见 §7.2 验收点），并与 compact 形成无损互补：截断/compact 丢掉的早期 findings 由
+> ledger 在终局回读合并，不再依赖摘要或模型自觉。
 
 ### 7.1 建议
 
@@ -294,6 +302,14 @@ auto-compact 直接缓解上述两种结局：摘要携带"已发现 findings �
 - Anthropic vendor 下被丢 Tool 消息不导致摘要调用 400/配对错乱。
 - `--resume` 恢复含摘要的对话后行为一致。
 - 归档目录清理逻辑（成功时删除）不受影响。
+
+**已实现 (Update 2) —— findings ledger 验收：**
+
+- 早期迭代的 findings（与 tool call 同响应）在后续被截断/compact 后，终局 Stop 仍能合并回最终结果；
+- 合并确定性：同 rule_id+location+message 去重，最终响应优先，ledger 独有项追加；
+- `findings_ledger: false` 时行为与旧版完全一致（不写文件、不合并）；
+- 成功退出（exit 0）时 ledger 与归档一并清理；失败时保留可审计；
+- ToolCalls 分支保留 assistant content（修复信息丢失点），中间轮 findings 草稿得以落盘。
 
 ---
 
