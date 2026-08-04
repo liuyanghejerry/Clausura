@@ -428,6 +428,7 @@ async fn try_compact(
     let threshold = (token_budget as f64 * 0.8) as u64;
     let hint_fixed_tokens =
         provider.count_tokens(&compact_hint(dropped.len(), archive_path, "")) + 1; // +1 per-message overhead
+
     // Absorb the ±few-token rounding drift of the heuristic counters.
     const ROUNDING_MARGIN: u64 = 8;
     const MIN_SUMMARY_TOKENS: u64 = 200;
@@ -1509,7 +1510,8 @@ mod tests {
             hint.content
         );
         assert!(
-            hint.content.contains("[summary truncated to fit token budget]"),
+            hint.content
+                .contains("[summary truncated to fit token budget]"),
             "oversized summary must carry the trim marker, got: {}",
             hint.content
         );
