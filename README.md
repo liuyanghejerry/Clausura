@@ -563,7 +563,7 @@ With `auto_compact: true`, the dropped messages are instead **summarized with a 
 
 - Summary calls are billed and counted against `max_total_tokens`, but the call is **skipped** if it would not fit under the remaining quota.
 - If the summarization call fails or times out, Clausura silently falls back to the bare truncation hint.
-- Summaries are capped at 10% of `token_budget`; oversized output is trimmed.
+- Summaries are sized to the headroom the retained context leaves under the truncation threshold (capped at 10% of `token_budget`); oversized output is trimmed. A compacted context always stays within budget, so a successful compaction can never push the run into "incomplete".
 - `max_compactions` bounds the number of summary calls per run (default 3) to prevent compaction loops on very long tasks.
 
 ### Findings ledger (disk-backed memory)

@@ -92,6 +92,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                 // the run.
                 let compact_summary: Option<String> = match &archive_result {
                     Ok(path) if auto_compact && compactions_used < max_compactions => {
+                        let tail_tokens = cm.count_tokens(&messages);
                         match try_compact(
                             config.provider,
                             &cm,
@@ -99,6 +100,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                             path,
                             config.contract.token_budget,
                             config.contract.max_total_tokens,
+                            tail_tokens,
                             &mut running_tokens,
                             &mut total_usage,
                         )
@@ -120,15 +122,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                     // message after an assistant message with tool_calls
                     // would leave those calls without results, which the
                     // OpenAI/Anthropic APIs reject.
-                    (Ok(path), Some(summary)) => format!(
-                        "⚠️ Context was compacted to stay within token budget.\n\
-                         {} earlier messages were summarized below; the full transcript is archived at:\n  {}\n\
-                         Use read_file to inspect the archive if you need details from earlier iterations.\n\n\
-                         --- COMPACTED SUMMARY ---\n{}\n--- END SUMMARY ---",
-                        dropped.len(),
-                        path.display(),
-                        summary,
-                    ),
+                    (Ok(path), Some(summary)) => compact_hint(dropped.len(), path, &summary),
                     (Ok(path), None) => format!(
                         "⚠️ Context was trimmed to stay within token budget.\n\
                          {} earlier messages are archived at:\n  {}\n\
@@ -146,8 +140,10 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                 messages.insert(1, Message::new(Role::User, hint));
 
                 if cm.should_truncate(&messages) {
-                    // Context cannot be reduced far enough to fit the budget;
-                    // fall-through below marks the result truncated.
+                    // Last resort: the summary budget was computed against the
+                    // tail's token count, so this only fires on heuristic
+                    // counter drift. Fall-through below marks the run
+                    // truncated (findings still survive via the ledger).
                     break;
                 }
                 continue;
@@ -314,6 +310,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 // ---------------------------------------------------------------------------
 
 /// Outcome of an auto-compact attempt.
+#[derive(Debug)]
 enum CompactOutcome {
     /// Summary produced and billed; the text is ready to inject.
     Ok { summary: String },
@@ -356,6 +353,23 @@ fn dropped_to_text(dropped: &[Message]) -> String {
     out
 }
 
+/// Render the "context compacted" hint injected at the truncation boundary.
+///
+/// The fixed template text is measured by `try_compact` to size the summary,
+/// so this template must stay byte-identical between the two call sites —
+/// the summary budget is computed from the text the hint will actually carry.
+fn compact_hint(dropped_len: usize, archive_path: &Path, summary: &str) -> String {
+    format!(
+        "⚠️ Context was compacted to stay within token budget.\n\
+         {} earlier messages were summarized below; the full transcript is archived at:\n  {}\n\
+         Use read_file to inspect the archive if you need details from earlier iterations.\n\n\
+         --- COMPACTED SUMMARY ---\n{}\n--- END SUMMARY ---",
+        dropped_len,
+        archive_path.display(),
+        summary,
+    )
+}
+
 /// Build the summarization request messages (system instruction + the
 /// dropped conversation as a single user message).
 fn compact_request_messages(dropped_text: &str, archive_path: &Path) -> Vec<Message> {
@@ -382,9 +396,13 @@ fn compact_request_messages(dropped_text: &str, archive_path: &Path) -> Vec<Mess
 ///   (input + capped output) must fit under the remaining quota, otherwise
 ///   compaction is skipped so it cannot eat the quota and cut the run short
 ///   earlier than bare truncation would.
-/// - Summary output is capped at 10% of `token_budget`; oversized summaries
-///   are trimmed so the injected summary always leaves room for the retained
-///   tail under the context budget.
+/// - Summary output is sized to the headroom the retained tail leaves under
+///   the truncation threshold (80% of budget), capped at 10% of
+///   `token_budget`; oversized summaries are trimmed so a successful
+///   compaction can never push the context back over the threshold and mark
+///   the run incomplete.
+/// - If the headroom is too small for a meaningful summary, compaction is
+///   skipped (bare truncation hint).
 ///
 /// Usage from the summarization call is added to `running_tokens` (the
 /// `max_total_tokens` accumulator) and `total_usage`.
@@ -396,11 +414,37 @@ async fn try_compact(
     archive_path: &Path,
     token_budget: u64,
     max_total_tokens: Option<u64>,
+    tail_tokens: u64,
     running_tokens: &mut u64,
     total_usage: &mut Usage,
 ) -> CompactOutcome {
     let request = compact_request_messages(&dropped_to_text(dropped), archive_path);
-    let max_summary_tokens = ((token_budget as f64) * 0.10).max(200.0) as u64;
+
+    // Size the summary to the space left under the truncation threshold
+    // (80% of budget). A fixed cap would let "75% tail + 10% summary + hint"
+    // overflow the 80% line: `should_truncate` after injection would then
+    // mark the run incomplete right after a *successful* compaction,
+    // defeating the feature's purpose.
+    let threshold = (token_budget as f64 * 0.8) as u64;
+    let hint_fixed_tokens =
+        provider.count_tokens(&compact_hint(dropped.len(), archive_path, "")) + 1; // +1 per-message overhead
+    // Absorb the ±few-token rounding drift of the heuristic counters.
+    const ROUNDING_MARGIN: u64 = 8;
+    const MIN_SUMMARY_TOKENS: u64 = 200;
+    let headroom = threshold
+        .saturating_sub(tail_tokens)
+        .saturating_sub(hint_fixed_tokens)
+        .saturating_sub(ROUNDING_MARGIN);
+    if headroom < MIN_SUMMARY_TOKENS {
+        tracing::debug!(
+            tail_tokens,
+            headroom,
+            "auto-compact skipped: no room for a summary under the truncation threshold"
+        );
+        return CompactOutcome::Skipped;
+    }
+    let budget_ceiling = ((token_budget as f64) * 0.10).max(200.0) as u64;
+    let max_summary_tokens = headroom.min(budget_ceiling);
 
     // Quota guard: never spend the last of max_total_tokens on a summary.
     let input_estimate = cm.count_tokens(&request);
@@ -1418,6 +1462,97 @@ mod tests {
             hint.content
         );
         assert_eq!(result.usage.total_tokens, 10 + 30);
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_auto_compact_large_summary_stays_within_budget() {
+        // The summary budget is the headroom the retained tail leaves under
+        // the truncation threshold (80%), not a fixed 10%: an oversized
+        // summary must be trimmed so that injecting it cannot push the
+        // context back over the threshold and mark the run incomplete.
+        let (tmp, contract, tool_call, initial) = auto_compact_setup(10000, None, true, 3);
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        // ~1500 tokens by the mock heuristic — far above the summary budget,
+        // which is the headroom under the 80% truncation threshold.
+        let mut mock = MockProvider::new("test-model");
+        mock.add_response(tool_call_response(&tool_call));
+        mock.add_summary_response(Ok("y".repeat(6000)));
+        mock.add_response(stop_response(r#"{"findings": []}"#));
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: initial,
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(
+            !result.truncated,
+            "a large summary must be trimmed to fit, not truncate the run"
+        );
+        // The whole point of the headroom sizing: after injection the context
+        // must stay under the truncation threshold (80% of budget).
+        let cm = ContextManager::new(&mock, contract.token_budget, root.clone());
+        assert!(
+            !cm.should_truncate(&result.messages),
+            "injecting the summary must not push the context back over the threshold"
+        );
+        let hint = &result.messages[1];
+        assert!(
+            hint.content.contains("COMPACTED SUMMARY"),
+            "expected the compacted hint, got: {}",
+            hint.content
+        );
+        assert!(
+            hint.content.contains("[summary truncated to fit token budget]"),
+            "oversized summary must carry the trim marker, got: {}",
+            hint.content
+        );
+        assert!(
+            !hint.content.contains(&"y".repeat(5000)),
+            "summary must not retain its full oversized body, got: {}",
+            hint.content
+        );
+        // Summary usage (100 in / 50 out / 150 total) still billed.
+        assert_eq!(result.usage.total_tokens, 10 + 150 + 30);
+    }
+
+    #[tokio::test]
+    async fn test_try_compact_skipped_when_no_headroom() {
+        // Retained tail already sits near the truncation threshold: the
+        // headroom for a summary is below MIN_SUMMARY_TOKENS, so compaction
+        // is skipped without spending an LLM call.
+        let mock = MockProvider::new("test-model");
+        let cm = ContextManager::new(&mock, 10000, PathBuf::from("/tmp"));
+        let dropped = vec![Message::new(Role::User, "old message".to_string())];
+        let archive = Path::new(".clausura/archives/context-dump-test-1.log");
+        let mut running = 0u64;
+        let mut usage = Usage::default();
+        let outcome = try_compact(
+            &mock,
+            &cm,
+            &dropped,
+            archive,
+            10000,
+            None,
+            7900, // tail at 79% → headroom ≈ 31 < MIN_SUMMARY_TOKENS
+            &mut running,
+            &mut usage,
+        )
+        .await;
+        assert!(
+            matches!(outcome, CompactOutcome::Skipped),
+            "expected Skipped, got: {:?}",
+            outcome
+        );
+        // No summary call was made: no usage, nothing billed.
+        assert_eq!(usage.total_tokens, 0);
+        assert_eq!(running, 0);
     }
 
     #[test]

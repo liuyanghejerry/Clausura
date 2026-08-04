@@ -198,7 +198,7 @@ Auto-compact never changes the run's pass/fail semantics:
 
 - The summary call is billed and counts toward `max_total_tokens`, but is **skipped** when the remaining quota is too small to afford it (bare hint is used instead).
 - If the summary call fails or times out, Clausura falls back to the bare hint silently.
-- Summaries are capped at 10% of `token_budget`; oversized output is trimmed to fit.
+- Summaries are sized to the headroom the retained context leaves under the truncation threshold (capped at 10% of `token_budget`); oversized output is trimmed to fit. A compacted context always stays within budget, so a successful compaction can never push the run into "incomplete".
 - `max_compactions` (default 3) bounds summary calls per run; set it to `0` to disable compaction even with `auto_compact: true`.
 
 ```yaml

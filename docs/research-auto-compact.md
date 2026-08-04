@@ -270,9 +270,12 @@ auto-compact 直接缓解上述两种结局：摘要携带"已发现 findings �
 > **已实现 (2026-08-04)**：§7.1 的 Phase 1 已落地为可选开关（默认关闭，行为零变化）：
 > `auto_compact: true/false`、`max_compactions: u32`（默认 3，0 = 关闭），Env
 > `CLAUSURA_AUTO_COMPACT` / `CLAUSURA_MAX_COMPACTIONS`。实现遵循本报告全部关键约束：
-> 触发阈值与截断一致、摘要注入 index 1（User 角色）、摘要上限 = 10% token_budget、
-> compact 计费计入 `max_total_tokens` 且调用前有配额守卫、失败/超时降级为现有截断+提示、
-> 摘要输入对被丢 Tool 消息做文本化以绕过 Anthropic `tool_use_id` 配对问题。
+> 触发阈值与截断一致、摘要注入 index 1（User 角色）、摘要上限按**截断阈值下的剩余空间**
+> 动态计算（`80% 预算 − 保留尾部 token − hint 固定文本`，另设 10% 预算封顶；剩余空间不足
+> 200 token 时跳过 compact）——保证摘要注入后上下文仍低于 80% 阈值，成功 compact 不会
+> 反手把 run 标记 incomplete；compact 计费计入 `max_total_tokens` 且调用前有配额守卫、
+> 失败/超时降级为现有截断+提示、摘要输入对被丢 Tool 消息做文本化以绕过 Anthropic
+> `tool_use_id` 配对问题。
 > Phase 0（确定性 findings 台账）已以**磁盘 ledger** 形式实现（`findings_ledger`，默认 true，
 > 见 §7.2 验收点），并与 compact 形成无损互补：截断/compact 丢掉的早期 findings 由
 > ledger 在终局回读合并，不再依赖摘要或模型自觉。
