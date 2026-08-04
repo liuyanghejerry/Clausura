@@ -390,6 +390,16 @@ pub struct TaskContract {
     /// incomplete. `None` means no cap.
     #[serde(default)]
     pub max_total_tokens: Option<u64>,
+    /// When true, the agent loop summarizes messages dropped by context
+    /// truncation with an LLM call and injects the summary at the truncation
+    /// boundary instead of a bare "context trimmed" hint. Default false.
+    #[serde(default)]
+    pub auto_compact: bool,
+    /// Per-run cap on auto-compaction LLM calls. Guards against compaction
+    /// loops on long-running tasks. Default 3; 0 disables compaction even
+    /// when `auto_compact` is true.
+    #[serde(default = "default_max_compactions")]
+    pub max_compactions: u32,
     pub timeout_secs: u64,
     #[serde(default = "default_shell_timeout_secs")]
     pub shell_timeout_secs: u64,
@@ -415,6 +425,10 @@ pub struct TaskContract {
 
 fn default_max_iterations() -> u32 {
     10
+}
+
+fn default_max_compactions() -> u32 {
+    3
 }
 
 fn default_shell_timeout_secs() -> u64 {
@@ -733,6 +747,8 @@ mod tests {
             tool_allowlist: vec![],
             token_budget: 32000,
             max_total_tokens: None,
+            auto_compact: false,
+            max_compactions: 3,
             timeout_secs: 300,
             shell_timeout_secs: 120,
             shell_env_passthrough: vec![],
@@ -746,6 +762,8 @@ mod tests {
         assert_eq!(contract.ambiguity_policy, AmbiguityPolicy::FailClosed);
         assert!(contract.gating_rules.is_empty());
         assert_eq!(contract.on_incomplete, OnIncompletePolicy::Fail);
+        assert!(!contract.auto_compact);
+        assert_eq!(contract.max_compactions, 3);
     }
 
     #[test]

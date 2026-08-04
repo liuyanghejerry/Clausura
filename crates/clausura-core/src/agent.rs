@@ -3,6 +3,7 @@ use crate::provider::Provider;
 use crate::snapshot::SnapshotManager;
 use crate::tools::ToolRegistry;
 use crate::types::{Finding, FinishReason, Message, ProviderError, Role, TaskContract, Usage};
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,12 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         config.workspace_root.clone(),
     );
 
+    // Auto-compact state: summarize dropped messages instead of bare
+    // truncation, bounded by a per-run call cap to prevent compaction loops.
+    let auto_compact = config.contract.auto_compact;
+    let max_compactions = config.contract.max_compactions;
+    let mut compactions_used: u32 = 0;
+
     for _iteration in 0..max_iterations {
         if start.elapsed() > Duration::from_secs(config.contract.timeout_secs) {
             return Err(ProviderError::Timeout("Task timeout exceeded".into()));
@@ -78,41 +85,67 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 
                 let archive_result = cm.archive(&dropped, &config.contract.id).await;
 
-                match archive_result {
-                    Ok(path) => {
-                        // Insert at the truncation boundary (right after the
-                        // system message), not at the end: appending a User
-                        // message after an assistant message with tool_calls
-                        // would leave those calls without results, which the
-                        // OpenAI/Anthropic APIs reject.
-                        messages.insert(
-                            1,
-                            Message::new(
-                                Role::User,
-                                format!(
-                                    "⚠️ Context was trimmed to stay within token budget.\n\
-                                 {} earlier messages are archived at:\n  {}\n\
-                                 Use read_file to inspect if you need context from earlier iterations.",
-                                    dropped.len(),
-                                    path.display(),
-                                ),
-                            ),
-                        );
+                // Auto-compact: summarize the dropped messages with a single
+                // no-tool LLM call and inject the summary at the truncation
+                // boundary. Any guard failure or LLM error falls back to the
+                // bare "context trimmed" hint — compaction must never fail
+                // the run.
+                let compact_summary: Option<String> = match &archive_result {
+                    Ok(path)
+                        if auto_compact && compactions_used < max_compactions =>
+                    {
+                        match try_compact(
+                            config.provider,
+                            &cm,
+                            &dropped,
+                            path,
+                            config.contract.token_budget,
+                            config.contract.max_total_tokens,
+                            &mut running_tokens,
+                            &mut total_usage,
+                        )
+                        .await
+                        {
+                            CompactOutcome::Ok { summary } => {
+                                compactions_used += 1;
+                                Some(summary)
+                            }
+                            CompactOutcome::Skipped | CompactOutcome::Failed => None,
+                        }
                     }
-                    Err(_) => {
-                        messages.insert(
-                            1,
-                            Message::new(
-                                Role::User,
-                                format!(
-                                    "⚠️ Context was trimmed to stay within token budget.\n\
-                                 {} earlier messages were dropped (archive unavailable).",
-                                    dropped.len(),
-                                ),
-                            ),
-                        );
-                    }
-                }
+                    _ => None,
+                };
+
+                let hint = match (&archive_result, compact_summary) {
+                    // Insert at the truncation boundary (right after the
+                    // system message), not at the end: appending a User
+                    // message after an assistant message with tool_calls
+                    // would leave those calls without results, which the
+                    // OpenAI/Anthropic APIs reject.
+                    (Ok(path), Some(summary)) => format!(
+                        "⚠️ Context was compacted to stay within token budget.\n\
+                         {} earlier messages were summarized below; the full transcript is archived at:\n  {}\n\
+                         Use read_file to inspect the archive if you need details from earlier iterations.\n\n\
+                         --- COMPACTED SUMMARY ---\n{}\n--- END SUMMARY ---",
+                        dropped.len(),
+                        path.display(),
+                        summary,
+                    ),
+                    (Ok(path), None) => format!(
+                        "⚠️ Context was trimmed to stay within token budget.\n\
+                         {} earlier messages are archived at:\n  {}\n\
+                         Use read_file to inspect if you need context from earlier iterations.",
+                        dropped.len(),
+                        path.display(),
+                    ),
+                    (Err(_), _) => format!(
+                        "⚠️ Context was trimmed to stay within token budget.\n\
+                         {} earlier messages were dropped (archive unavailable).",
+                        dropped.len(),
+                    ),
+                };
+
+                messages.insert(1, Message::new(Role::User, hint));
 
                 if cm.should_truncate(&messages) {
                     // Context cannot be reduced far enough to fit the budget;
@@ -236,6 +269,174 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         duration_ms: start.elapsed().as_millis() as u64,
         truncated,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Auto-compact
+// ---------------------------------------------------------------------------
+
+/// Outcome of an auto-compact attempt.
+enum CompactOutcome {
+    /// Summary produced and billed; the text is ready to inject.
+    Ok { summary: String },
+    /// Compaction skipped by a guard (insufficient `max_total_tokens` headroom).
+    Skipped,
+    /// The summarization LLM call failed; callers fall back to the bare hint.
+    Failed,
+}
+
+/// Serialize dropped messages to plain text for the summarization call.
+///
+/// Tool results are rendered inline (role + content) rather than as
+/// structured `tool` messages: this keeps the summarization input portable
+/// across providers (Anthropic's message converter maps `tool` messages to
+/// `tool_result` with a placeholder id, which is fragile outside the agent
+/// loop) and avoids feeding half-paired tool_calls into the summary.
+fn dropped_to_text(dropped: &[Message]) -> String {
+    let mut out = String::new();
+    for m in dropped {
+        match m.role {
+            Role::System => out.push_str("System:\n"),
+            Role::User => out.push_str("User:\n"),
+            Role::Assistant => {
+                if let Some(calls) = &m.tool_calls {
+                    let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                    out.push_str(&format!(
+                        "Assistant (tool calls: {}):\n",
+                        names.join(", ")
+                    ));
+                } else {
+                    out.push_str("Assistant:\n");
+                }
+            }
+            Role::Tool => match &m.tool_call_id {
+                Some(tcid) => out.push_str(&format!("Tool result ({}):\n", tcid)),
+                None => out.push_str("Tool result:\n"),
+            },
+        }
+        out.push_str(&m.content);
+        out.push('\n');
+        out.push('\n');
+    }
+    out
+}
+
+/// Build the summarization request messages (system instruction + the
+/// dropped conversation as a single user message).
+fn compact_request_messages(dropped_text: &str, archive_path: &Path) -> Vec<Message> {
+    let system = format!(
+        "You are compacting a segment of a code-review conversation for a CI agent.\n\
+         Produce a concise summary that preserves, verbatim where possible:\n\
+         - every finding reported so far (rule_id, severity, message, evidence, location)\n\
+         - key facts learned from tool outputs (files examined, diffs reviewed, test results)\n\
+         - decisions made and open questions\n\
+         Do NOT invent findings, facts, or conclusions that are not present in the messages.\n\
+         The full transcript is archived at {} for reference.",
+        archive_path.display()
+    );
+    vec![
+        Message::new(Role::System, system),
+        Message::new(Role::User, dropped_text.to_string()),
+    ]
+}
+
+/// Attempt to summarize `dropped` with a single no-tool LLM call.
+///
+/// Guards (all checked before spending a request):
+/// - `max_total_tokens` headroom: the estimated cost of the summary call
+///   (input + capped output) must fit under the remaining quota, otherwise
+///   compaction is skipped so it cannot eat the quota and cut the run short
+///   earlier than bare truncation would.
+/// - Summary output is capped at 10% of `token_budget`; oversized summaries
+///   are trimmed so the injected summary always leaves room for the retained
+///   tail under the context budget.
+///
+/// Usage from the summarization call is added to `running_tokens` (the
+/// `max_total_tokens` accumulator) and `total_usage`.
+#[allow(clippy::too_many_arguments)]
+async fn try_compact(
+    provider: &dyn Provider,
+    cm: &ContextManager<'_>,
+    dropped: &[Message],
+    archive_path: &Path,
+    token_budget: u64,
+    max_total_tokens: Option<u64>,
+    running_tokens: &mut u64,
+    total_usage: &mut Usage,
+) -> CompactOutcome {
+    let request = compact_request_messages(&dropped_to_text(dropped), archive_path);
+    let max_summary_tokens = ((token_budget as f64) * 0.10).max(200.0) as u64;
+
+    // Quota guard: never spend the last of max_total_tokens on a summary.
+    let input_estimate = cm.count_tokens(&request);
+    if let Some(cap) = max_total_tokens {
+        if *running_tokens + input_estimate + max_summary_tokens > cap {
+            tracing::debug!(
+                input_estimate,
+                max_summary_tokens,
+                running = *running_tokens,
+                cap,
+                "auto-compact skipped: insufficient max_total_tokens headroom"
+            );
+            return CompactOutcome::Skipped;
+        }
+    }
+
+    match provider.chat(&request).await {
+        Ok(response) => {
+            let mut summary = response.message.content.clone();
+            if provider.count_tokens(&summary) > max_summary_tokens {
+                summary = truncate_summary_to_budget(provider, &summary, max_summary_tokens);
+            }
+            *running_tokens += response.usage.total_tokens;
+            total_usage.input_tokens += response.usage.input_tokens;
+            total_usage.output_tokens += response.usage.output_tokens;
+            total_usage.total_tokens += response.usage.total_tokens;
+            tracing::info!(
+                dropped_messages = dropped.len(),
+                input_tokens = response.usage.input_tokens,
+                output_tokens = response.usage.output_tokens,
+                summary_chars = summary.len(),
+                "auto-compact: summarized dropped messages"
+            );
+            CompactOutcome::Ok { summary }
+        }
+        Err(e) => {
+            tracing::warn!(
+                reason = %e,
+                "auto-compact failed, falling back to truncation hint"
+            );
+            CompactOutcome::Failed
+        }
+    }
+}
+
+/// Trim `summary` to the largest char prefix that keeps the trimmed result
+/// (including the truncation marker) within `cap_tokens`, using the
+/// provider's token heuristic. Appends a marker so the agent knows the
+/// summary was cut.
+fn truncate_summary_to_budget(provider: &dyn Provider, summary: &str, cap_tokens: u64) -> String {
+    const MARKER: &str = "\n\n[summary truncated to fit token budget]";
+    // Already within budget: pass through untouched.
+    if provider.count_tokens(summary) <= cap_tokens {
+        return summary.to_string();
+    }
+    let chars: Vec<char> = summary.chars().collect();
+    let mut low = 0usize;
+    let mut high = chars.len();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let prefix: String = chars[..mid].iter().collect();
+        let candidate = format!("{}{}", prefix, MARKER);
+        if provider.count_tokens(&candidate) <= cap_tokens {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let mut trimmed: String = chars[..low].iter().collect();
+    trimmed.push_str(MARKER);
+    trimmed
 }
 
 /// Extract findings from a completed agent response.
@@ -433,6 +634,8 @@ mod tests {
             tool_allowlist: vec!["git".into()],
             token_budget: 100000,
             max_total_tokens: None,
+            auto_compact: false,
+            max_compactions: 3,
             timeout_secs: 60,
             shell_timeout_secs: 120,
             shell_env_passthrough: vec![],
@@ -855,6 +1058,299 @@ mod tests {
             );
             i += 1;
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Auto-compact
+    // -----------------------------------------------------------------
+
+    /// Shared setup for auto-compact tests: a contract that triggers
+    /// truncation on a huge initial message, with a tool-call then a
+    /// Stop response queued for the agent loop.
+    fn auto_compact_setup(
+        token_budget: u64,
+        max_total_tokens: Option<u64>,
+        auto_compact: bool,
+        max_compactions: u32,
+    ) -> (TempDir, TaskContract, ToolCall, Vec<Message>) {
+        let tmp = TempDir::new().unwrap();
+        let mut contract = test_contract();
+        contract.token_budget = token_budget;
+        contract.max_total_tokens = max_total_tokens;
+        contract.auto_compact = auto_compact;
+        contract.max_compactions = max_compactions;
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            name: "git_diff".into(),
+            arguments: serde_json::json!({}),
+        };
+        (
+            tmp,
+            contract,
+            tool_call,
+            vec![Message::new(Role::User, "x".repeat(40000))],
+        )
+    }
+
+    fn tool_call_response(tool_call: &ToolCall) -> ChatResponse {
+        ChatResponse {
+            message: Message::new(Role::Assistant, "Running tool..."),
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![tool_call.clone()]),
+        }
+    }
+
+    fn stop_response(content: &str) -> ChatResponse {
+        ChatResponse {
+            message: Message::new(Role::Assistant, content.to_string()),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_auto_compact_injects_summary() {
+        let (tmp, contract, tool_call, initial) =
+            auto_compact_setup(10000, None, true, 3);
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_response(tool_call_response(&tool_call));
+        mock.add_summary_response(Ok("Summary: found X in file A".to_string()));
+        mock.add_response(stop_response(
+            r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "m", "evidence": "e"}]}"#,
+        ));
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: initial,
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(!result.truncated, "expected a clean run");
+
+        // The summary sits at index 1 — immediately after the system message.
+        let summary_msg = &result.messages[1];
+        assert_eq!(summary_msg.role, Role::User);
+        assert!(
+            summary_msg.content.contains("COMPACTED SUMMARY"),
+            "expected a compacted-summary marker, got: {}",
+            summary_msg.content
+        );
+        assert!(
+            summary_msg.content.contains("Summary: found X in file A"),
+            "expected the LLM summary inside the hint, got: {}",
+            summary_msg.content
+        );
+        assert!(
+            summary_msg.content.contains("archived at"),
+            "expected the archive path in the hint, got: {}",
+            summary_msg.content
+        );
+
+        // The summarization call (mock usage 100 in / 50 out / 150 total)
+        // is included in reported usage.
+        assert_eq!(result.usage.total_tokens, 10 + 30 + 150);
+
+        // Archive still written.
+        let archive_dir = root.join(".clausura").join("archives");
+        let mut found = false;
+        if let Ok(entries) = std::fs::read_dir(&archive_dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("context-dump-test-")
+                {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "archive file should exist after compaction");
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_auto_compact_falls_back_on_llm_error() {
+        let (tmp, contract, tool_call, initial) =
+            auto_compact_setup(10000, None, true, 3);
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_response(tool_call_response(&tool_call));
+        mock.add_summary_response(Err(ProviderError::ServerError("boom".into())));
+        mock.add_response(stop_response(r#"{"findings": []}"#));
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: initial,
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(
+            !result.truncated,
+            "a failed summary call must not mark the run incomplete"
+        );
+
+        // Falls back to the bare "context trimmed" hint.
+        let hint = &result.messages[1];
+        assert!(
+            hint.content.contains("was trimmed"),
+            "expected the bare hint, got: {}",
+            hint.content
+        );
+        assert!(
+            !hint.content.contains("COMPACTED SUMMARY"),
+            "expected no summary on failure, got: {}",
+            hint.content
+        );
+
+        // No usage from the failed summary call.
+        assert_eq!(result.usage.total_tokens, 10 + 30);
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_auto_compact_disabled_by_max_compactions_zero() {
+        // max_compactions = 0 disables compaction even when auto_compact is
+        // on: the queued summary response must never be consumed.
+        let (tmp, contract, tool_call, initial) =
+            auto_compact_setup(10000, None, true, 0);
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_response(tool_call_response(&tool_call));
+        mock.add_summary_response(Ok("SHOULD NOT APPEAR".to_string()));
+        mock.add_response(stop_response(r#"{"findings": []}"#));
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: initial,
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        let hint = &result.messages[1];
+        assert!(
+            hint.content.contains("was trimmed"),
+            "expected the bare hint, got: {}",
+            hint.content
+        );
+        assert!(
+            !hint.content.contains("SHOULD NOT APPEAR"),
+            "compaction must not run with max_compactions = 0, got: {}",
+            hint.content
+        );
+        assert_eq!(result.usage.total_tokens, 10 + 30);
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_auto_compact_respects_max_total_tokens_headroom() {
+        // max_total_tokens too small for a summary call → compaction is
+        // skipped by the quota guard (bare hint), and the queued summary is
+        // never consumed.
+        let (tmp, contract, tool_call, initial) =
+            auto_compact_setup(10000, Some(500), true, 3);
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_response(tool_call_response(&tool_call));
+        mock.add_summary_response(Ok("SHOULD NOT APPEAR".to_string()));
+        mock.add_response(stop_response(r#"{"findings": []}"#));
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: initial,
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(!result.truncated);
+        let hint = &result.messages[1];
+        assert!(
+            hint.content.contains("was trimmed"),
+            "expected the bare hint, got: {}",
+            hint.content
+        );
+        assert!(
+            !hint.content.contains("SHOULD NOT APPEAR"),
+            "quota guard must skip compaction, got: {}",
+            hint.content
+        );
+        assert_eq!(result.usage.total_tokens, 10 + 30);
+    }
+
+    #[test]
+    fn test_dropped_to_text_renders_roles_and_tool_results() {
+        let dropped = vec![
+            Message::new(Role::User, "check the diff".to_string()),
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "git_diff".into(),
+                    arguments: serde_json::json!({}),
+                }]),
+            },
+            Message::with_tool_call(Role::Tool, "diff output".to_string(), "call_1".into()),
+        ];
+        let text = dropped_to_text(&dropped);
+        assert!(text.contains("User:"));
+        assert!(text.contains("check the diff"));
+        assert!(text.contains("Assistant (tool calls: git_diff):"));
+        assert!(text.contains("Tool result (call_1):"));
+        assert!(text.contains("diff output"));
+    }
+
+    #[test]
+    fn test_truncate_summary_to_budget_trims_oversized_summary() {
+        let mock = MockProvider::new("test");
+        // Mock counts ~1 token per 4 chars.
+        let cap_tokens = 50;
+        let summary = "y".repeat(400); // ~100 tokens by the mock heuristic
+        let trimmed = truncate_summary_to_budget(&mock, &summary, cap_tokens);
+        assert!(
+            mock.count_tokens(&trimmed) <= cap_tokens,
+            "trimmed summary exceeds cap: {} > {}",
+            mock.count_tokens(&trimmed),
+            cap_tokens
+        );
+        assert!(trimmed.ends_with("[summary truncated to fit token budget]"));
+        assert!(trimmed.starts_with('y'));
+
+        // Short summaries pass through untouched.
+        let short = "short summary".to_string();
+        let untouched = truncate_summary_to_budget(&mock, &short, cap_tokens);
+        assert_eq!(untouched, short);
     }
 
     #[tokio::test]

@@ -918,6 +918,7 @@ pub mod tests {
     pub struct MockProvider {
         model: String,
         responses: Arc<Mutex<VecDeque<Result<ChatResponse, ProviderError>>>>,
+        summary_responses: Arc<Mutex<VecDeque<Result<String, ProviderError>>>>,
         slow_responses: Arc<Mutex<VecDeque<Duration>>>,
     }
 
@@ -926,12 +927,18 @@ pub mod tests {
             Self {
                 model: model.to_string(),
                 responses: Arc::new(Mutex::new(VecDeque::new())),
+                summary_responses: Arc::new(Mutex::new(VecDeque::new())),
                 slow_responses: Arc::new(Mutex::new(VecDeque::new())),
             }
         }
 
         pub fn add_response(&mut self, response: ChatResponse) {
             self.responses.lock().unwrap().push_back(Ok(response));
+        }
+
+        /// Queue a response for a no-tool `chat` call (auto-compact summary).
+        pub fn add_summary_response(&mut self, summary: Result<String, ProviderError>) {
+            self.summary_responses.lock().unwrap().push_back(summary);
         }
 
         pub fn add_slow_response(&mut self, delay: Duration) {
@@ -941,8 +948,28 @@ pub mod tests {
 
     #[async_trait]
     impl Provider for MockProvider {
-        async fn chat(&self, messages: &[Message]) -> Result<ChatResponse, ProviderError> {
-            self.chat_with_tools(messages, &[]).await
+        async fn chat(&self, _messages: &[Message]) -> Result<ChatResponse, ProviderError> {
+            let delay = { self.slow_responses.lock().unwrap().pop_front() };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+                return Err(ProviderError::Timeout("Simulated timeout".into()));
+            }
+            match self.summary_responses.lock().unwrap().pop_front() {
+                Some(Ok(text)) => Ok(ChatResponse {
+                    message: Message::new(Role::Assistant, text),
+                    usage: Usage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                        total_tokens: 150,
+                    },
+                    finish_reason: FinishReason::Stop,
+                    tool_calls: None,
+                }),
+                Some(Err(e)) => Err(e),
+                None => Err(ProviderError::ServerError(
+                    "No more mock summary responses".into(),
+                )),
+            }
         }
 
         async fn chat_with_tools(

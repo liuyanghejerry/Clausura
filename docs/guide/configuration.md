@@ -41,6 +41,9 @@ task:
   token_budget: 32000                # Context-window budget. Drives message truncation.
   max_total_tokens: 200000           # Optional. Cumulative token cap across all LLM calls.
                                      # Unset = no cap. When reached, run stops (incomplete).
+  auto_compact: false                # Optional. Summarize dropped context with an LLM call
+                                     # instead of a bare truncation hint.
+  max_compactions: 3                 # Per-run cap on auto-compact calls. 0 disables.
   timeout_secs: 300                  # Max wall-clock time for the entire run.
   max_iterations: 10                 # Max agent loop iterations (tool calls + LLM turns).
   shell_timeout_secs: 120            # Per-command timeout for shell_exec.
@@ -184,6 +187,25 @@ task:
   token_budget: 32000        # context window budget
   max_total_tokens: 200000   # stop after $X worth of API calls
 ```
+
+### `task.auto_compact`
+
+**Default: false.** When the conversation exceeds `token_budget`, Clausura truncates older messages and injects a bare "context trimmed" hint. With `auto_compact: true`, the dropped messages are instead **summarized with one extra LLM call** and the summary is injected at the truncation boundary — the agent keeps remembering earlier findings, files examined, and decisions across truncation instead of relying on the `read_file`-the-archive hint.
+
+Auto-compact never changes the run's pass/fail semantics:
+
+- The summary call is billed and counts toward `max_total_tokens`, but is **skipped** when the remaining quota is too small to afford it (bare hint is used instead).
+- If the summary call fails or times out, Clausura falls back to the bare hint silently.
+- Summaries are capped at 10% of `token_budget`; oversized output is trimmed to fit.
+- `max_compactions` (default 3) bounds summary calls per run; set it to `0` to disable compaction even with `auto_compact: true`.
+
+```yaml
+task:
+  auto_compact: true       # summarize dropped context (adds one LLM call per compaction)
+  max_compactions: 3       # at most 3 summary calls per run
+```
+
+Env override: `CLAUSURA_AUTO_COMPACT=true`, `CLAUSURA_MAX_COMPACTIONS=5`.
 
 ### `task.timeout_secs`
 

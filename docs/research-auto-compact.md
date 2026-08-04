@@ -1,8 +1,12 @@
 # Clausura 自动 Compact（对话摘要压缩）的价值与成本调研
 
-Status: research / proposal（本分支仅调研，无代码改动）
+Status: implemented on this branch (originally research / proposal)
 Branch: `research/auto-compact`
 Date: 2026-08-04
+
+> **Update (2026-08-04):** Phase 1 (LLM 摘要 compact) 已在本分支实现：
+> `auto_compact`（默认 false）+ `max_compactions`（默认 3）已落地，含配额守卫与
+> 失败降级。详见 §7.1 与 §9。本报告其余部分保留为设计依据与成本记录。
 
 ## 1. 结论先行（TL;DR）
 
@@ -257,6 +261,14 @@ auto-compact 直接缓解上述两种结局：摘要携带"已发现 findings �
 
 ## 8. 建议与实施路线
 
+> **已实现（2026-08-04）**：§7.1 的 Phase 1 已落地为可选开关（默认关闭，行为零变化）：
+> `auto_compact: true/false`、`max_compactions: u32`（默认 3，0 = 关闭），Env
+> `CLAUSURA_AUTO_COMPACT` / `CLAUSURA_MAX_COMPACTIONS`。实现遵循本报告全部关键约束：
+> 触发阈值与截断一致、摘要注入 index 1（User 角色）、摘要上限 = 10% token_budget、
+> compact 计费计入 `max_total_tokens` 且调用前有配额守卫、失败/超时降级为现有截断+提示、
+> 摘要输入对被丢 Tool 消息做文本化以绕过 Anthropic `tool_use_id` 配对问题。
+> Phase 0（确定性 findings 台账）尚未实施，可作后续低成本增强。
+
 ### 7.1 建议
 
 1. **先做 Phase 0（确定性 findings 台账，~1 人日）**：零 LLM 成本、零非确定性，
@@ -288,9 +300,12 @@ auto-compact 直接缓解上述两种结局：摘要携带"已发现 findings �
 ## 9. 参考（代码位置）
 
 - `crates/clausura-core/src/context.rs` — 预算跟踪、截断算法、归档
-- `crates/clausura-core/src/agent.rs` — agent 循环、截断注入、findings 提取
-- `crates/clausura-core/src/provider.rs` — provider trait、启发式 token 计数、Anthropic 消息转换
-- `crates/clausura-core/src/config.rs` / `types.rs` — `TaskContract`、默认值、校验
+- `crates/clausura-core/src/agent.rs` — agent 循环、截断注入、auto-compact（`try_compact`、
+  `dropped_to_text`、`compact_request_messages`、`truncate_summary_to_budget`）、findings 提取
+- `crates/clausura-core/src/provider.rs` — provider trait、启发式 token 计数、Anthropic 消息转换、
+  MockProvider 摘要队列
+- `crates/clausura-core/src/config.rs` / `types.rs` — `TaskContract`（新增 `auto_compact` /
+  `max_compactions`）、默认值、YAML/Env 解析与校验
 - `crates/clausura-core/src/snapshot.rs` — 快照/断点（compact 摘要随消息自然持久化）
 - `docs/guide/overview.md`、`docs/guide/troubleshooting.md`、`README.md` — 现状文档与
   "context exhausted" 排障路径
