@@ -31,6 +31,9 @@ pub struct AgentConfig<'a> {
     pub snapshot_mgr: Option<&'a SnapshotManager>,
 }
 
+/// Number of corrective "reply with JSON only" attempts per recovery point.
+const MAX_RECOVERY_RETRIES: usize = 2;
+
 /// Bounded corrective retry for a final answer whose findings JSON does not
 /// parse. Models occasionally end a run with prose or markdown instead of the
 /// schema'd `findings` JSON; a nudge asking for a JSON-only reply recovers the
@@ -42,13 +45,12 @@ async fn recover_findings_json(
     provider: &dyn Provider,
     tools: &ToolRegistry,
     messages: &mut Vec<Message>,
-    max_retries: usize,
     start: &Instant,
     running_tokens: &mut u64,
     total_usage: &mut Usage,
 ) -> Result<Vec<Finding>, String> {
     let mut last_err = "no corrective attempts made".to_string();
-    for _ in 0..max_retries {
+    for _ in 0..MAX_RECOVERY_RETRIES {
         if start.elapsed() > Duration::from_secs(contract.timeout_secs) {
             break;
         }
@@ -247,7 +249,6 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                         config.provider,
                         config.tools,
                         &mut messages,
-                        2,
                         &start,
                         &mut running_tokens,
                         &mut total_usage,
@@ -367,7 +368,6 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
             config.provider,
             config.tools,
             &mut messages,
-            2,
             &start,
             &mut running_tokens,
             &mut total_usage,
