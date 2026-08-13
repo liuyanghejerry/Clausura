@@ -31,6 +31,62 @@ pub struct AgentConfig<'a> {
     pub snapshot_mgr: Option<&'a SnapshotManager>,
 }
 
+/// Bounded corrective retry for a final answer whose findings JSON does not
+/// parse. Models occasionally end a run with prose or markdown instead of the
+/// schema'd `findings` JSON; a nudge asking for a JSON-only reply recovers the
+/// run instead of failing it. Returns the first parseable findings or the last
+/// extraction error. Each attempt is a billed LLM call and respects the
+/// cumulative token cap and the task deadline.
+async fn recover_findings_json(
+    contract: &TaskContract,
+    provider: &dyn Provider,
+    tools: &ToolRegistry,
+    messages: &mut Vec<Message>,
+    max_retries: usize,
+    start: &Instant,
+    running_tokens: &mut u64,
+    total_usage: &mut Usage,
+) -> Result<Vec<Finding>, String> {
+    let mut last_err = "no corrective attempts made".to_string();
+    for _ in 0..max_retries {
+        if start.elapsed() > Duration::from_secs(contract.timeout_secs) {
+            break;
+        }
+        if let Some(max_total) = contract.max_total_tokens {
+            if *running_tokens >= max_total {
+                break;
+            }
+        }
+        messages.push(Message::new(
+            Role::User,
+            "Your last response did not contain valid findings JSON. Reply with \
+             ONLY the JSON object that holds the `findings` array — no prose, \
+             no markdown fences, no other text."
+                .to_string(),
+        ));
+        let retry = match provider
+            .chat_with_tools(messages, tools.list_definitions().as_slice())
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("corrective call failed: {e}");
+                break;
+            }
+        };
+        total_usage.input_tokens += retry.usage.input_tokens;
+        total_usage.output_tokens += retry.usage.output_tokens;
+        total_usage.total_tokens += retry.usage.total_tokens;
+        *running_tokens += retry.usage.total_tokens;
+        messages.push(Message::new(Role::Assistant, retry.message.content.clone()));
+        match extract_findings(&retry.message.content) {
+            Ok(findings) => return Ok(findings),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
 /// Run the bounded agent loop.
 pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, ProviderError> {
     let start = Instant::now();
@@ -182,8 +238,23 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                     response.message.content.clone(),
                 ));
 
-                let findings = extract_findings(&response.message.content)
-                    .map_err(ProviderError::MalformedFindings)?;
+                // Strict parse; on failure, ask for a JSON-only reply before
+                // giving up (bounded, billed, budget-respecting).
+                let findings = match extract_findings(&response.message.content) {
+                    Ok(findings) => findings,
+                    Err(_) => recover_findings_json(
+                        config.contract,
+                        config.provider,
+                        config.tools,
+                        &mut messages,
+                        2,
+                        &start,
+                        &mut running_tokens,
+                        &mut total_usage,
+                    )
+                    .await
+                    .map_err(ProviderError::MalformedFindings)?,
+                };
 
                 // Merge findings persisted earlier in the run (which may have
                 // been truncated out of context since) back into the final
@@ -197,7 +268,6 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                 } else {
                     findings
                 };
-
                 return Ok(AgentResult {
                     messages,
                     findings,
@@ -285,7 +355,35 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
     // Length, failed truncation, ContentFilter/Other breaks, and iteration
     // exhaustion, none of which produced a complete final answer.
     truncated = true;
-    let findings = extract_findings_lenient(&last_content);
+    let mut findings = extract_findings_lenient(&last_content);
+
+    // One more bounded attempt can rescue the run: if nothing parseable came
+    // out, ask for a JSON-only findings reply. A successful recovery counts as
+    // a complete final answer (truncated=false), so gating evaluates it
+    // normally instead of the caller failing closed on `on_incomplete`.
+    if findings.is_empty() {
+        match recover_findings_json(
+            config.contract,
+            config.provider,
+            config.tools,
+            &mut messages,
+            2,
+            &start,
+            &mut running_tokens,
+            &mut total_usage,
+        )
+        .await
+        {
+            Ok(recovered) => {
+                findings = recovered;
+                truncated = false;
+            }
+            Err(_) => {
+                // Stay incomplete; the lenient (possibly ledger-merged)
+                // findings and the truncated flag drive the caller's policy.
+            }
+        }
+    }
 
     // Best-effort merge of ledger findings for the incomplete path too.
     let findings = if config.contract.findings_ledger {
@@ -1857,6 +1955,168 @@ mod tests {
                 "tool_call_id should match the assistant's tool call id"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // corrective findings recovery
+    // -----------------------------------------------------------------
+
+    fn valid_findings_json(message: &str) -> String {
+        format!(
+            r#"{{"findings": [{{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "{}", "evidence": "x"}}]}}"#,
+            message
+        )
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_recovers_malformed_final_json() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut mock = MockProvider::new("gpt-4o");
+        // Final answer that is prose, not findings JSON.
+        mock.add_response(ChatResponse {
+            message: Message::new(
+                Role::Assistant,
+                "The diff appears empty. Let me try different options.",
+            ),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+        // Corrective answer: valid findings JSON.
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, valid_findings_json("recovered")),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let contract = test_contract();
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root,
+            snapshot_mgr: None,
+        };
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(!result.truncated);
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].rule_id, "test");
+        assert!(result.findings[0].message.contains("recovered"));
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User
+                    && m.content.contains("did not contain valid findings")),
+            "the corrective exchange must be part of the transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_malformed_json_retries_exhausted() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut mock = MockProvider::new("gpt-4o");
+        // Main answer + 2 corrective attempts, all prose. The third call
+        // (second recovery attempt) must fail closed with MalformedFindings.
+        for _ in 0..3 {
+            mock.add_response(ChatResponse {
+                message: Message::new(Role::Assistant, "still not JSON"),
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                },
+                finish_reason: FinishReason::Stop,
+                tool_calls: None,
+            });
+        }
+
+        let contract = test_contract();
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root,
+            snapshot_mgr: None,
+        };
+        let result = run_agent_loop(config).await;
+        assert!(
+            matches!(result, Err(ProviderError::MalformedFindings(_))),
+            "exhausted recovery must fail closed, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_incomplete_path_recovers_findings() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut mock = MockProvider::new("gpt-4o");
+        // Two tool-call turns that never reach a clean Stop, so the loop
+        // exhausts max_iterations and falls through incomplete.
+        for i in 0..2 {
+            mock.add_response(ChatResponse {
+                message: Message::new(Role::Assistant, format!("Checking tool {i}...")),
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                },
+                finish_reason: FinishReason::ToolCalls,
+                tool_calls: Some(vec![ToolCall {
+                    id: format!("call_{i}"),
+                    name: "git_diff".into(),
+                    arguments: serde_json::json!({}),
+                }]),
+            });
+        }
+        // Corrective answer rescued from the incomplete fall-through.
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, valid_findings_json("recovered")),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let mut contract = test_contract();
+        contract.max_iterations = 2;
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root,
+            snapshot_mgr: None,
+        };
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(
+            !result.truncated,
+            "a successful corrective recovery counts as a complete final answer"
+        );
+        assert_eq!(result.findings.len(), 1);
+        assert!(result.findings[0].message.contains("recovered"));
     }
 
     // -----------------------------------------------------------------
