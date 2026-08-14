@@ -1,1 +1,955 @@
-// __PLACEHOLDER__
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Core type definitions for Clausura
+// ---------------------------------------------------------------------------
+
+/// Chat message role
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+/// Memory tier for layered context management.
+///
+/// Messages are classified into three layers; truncation treats them
+/// differently (see `ContextManager`):
+/// - `Pinned`: never dropped by truncation (task contract, key instructions).
+/// - `Conversation`: ordinary dialog; truncated oldest-first.
+/// - `Ephemeral`: bulky, re-derivable content (tool outputs); elided to a
+///   stub before any conversation message is dropped.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MemoryTier {
+    Pinned,
+    Conversation,
+    Ephemeral,
+}
+
+/// A chat message
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Message {
+    pub role: Role,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Explicit memory tier for layered context management. `None` means
+    /// auto-classify by role (see [`Message::memory_tier`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<MemoryTier>,
+}
+
+impl Message {
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: None,
+            tier: None,
+        }
+    }
+
+    pub fn with_tool_call(role: Role, content: impl Into<String>, tool_call_id: String) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: Some(tool_call_id),
+            tool_calls: None,
+            tier: None,
+        }
+    }
+
+    /// Set the explicit memory tier (builder style).
+    pub fn with_tier(mut self, tier: MemoryTier) -> Self {
+        self.tier = Some(tier);
+        self
+    }
+
+    /// Effective memory tier: the explicit `tier` when set, otherwise
+    /// classified by role — system messages are pinned (they carry the task
+    /// contract), tool outputs are ephemeral (bulky and re-derivable via
+    /// the archives), and everything else is ordinary conversation.
+    pub fn memory_tier(&self) -> MemoryTier {
+        self.tier.unwrap_or(match self.role {
+            Role::System => MemoryTier::Pinned,
+            Role::Tool => MemoryTier::Ephemeral,
+            Role::User | Role::Assistant => MemoryTier::Conversation,
+        })
+    }
+}
+
+/// Provider-agnostic finish reason
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    Other(String),
+}
+
+/// A tool call from the LLM
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// Result of executing a tool
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Tool definition for LLM tool calling
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// Chat response from a provider
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ChatResponse {
+    pub message: Message,
+    pub usage: Usage,
+    pub finish_reason: FinishReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// Token usage
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// Finding severity
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Severity {
+    Hint,
+    Info,
+    Warning,
+    Error,
+}
+
+/// Code location
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Location {
+    pub file: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub column_start: u32,
+    pub column_end: u32,
+}
+
+/// Structured finding from agent output
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Finding {
+    pub id: uuid::Uuid,
+    pub rule_id: String,
+    pub severity: Severity,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<Location>,
+    pub evidence: String,
+}
+
+/// Gate action for rule violations
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum GateAction {
+    Fail,
+    Warn,
+    Ignore,
+}
+
+/// A gating rule for deterministic pass/fail
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct GateRule {
+    pub rule_id: String,
+    pub description: String,
+    pub min_severity: Severity,
+    pub max_findings: u32,
+    pub action: GateAction,
+}
+
+/// Rule evaluation violation
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RuleViolation {
+    pub rule_id: String,
+    pub description: String,
+    pub actual_count: u32,
+    pub max_allowed: u32,
+    pub action: GateAction,
+}
+
+/// Result from rule engine evaluation
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct GateResult {
+    pub exit_code: u32,
+    pub violations: Vec<RuleViolation>,
+}
+
+/// Ambiguity policy
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AmbiguityPolicy {
+    FailClosed,
+    ProceedWithCaution,
+}
+
+/// Policy for handling incomplete agent runs (context truncated or the
+/// iteration limit exhausted without a clean `Stop`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OnIncompletePolicy {
+    /// Fail closed: treat the run as an error (exit code 2).
+    #[default]
+    Fail,
+    /// Continue with the partial result (warning + SARIF annotation).
+    Pass,
+}
+
+/// Supported LLM vendor API types.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum VendorType {
+    /// OpenAI-compatible API (OpenAI, DeepSeek, Groq, Ollama, vLLM, etc.)
+    #[serde(alias = "openai_compatible", alias = "openai")]
+    #[default]
+    OpenAiCompatible,
+    /// Anthropic Messages API (Claude)
+    #[serde(alias = "anthropic_compatible", alias = "anthropic", alias = "claude")]
+    AnthropicCompatible,
+    /// User-defined enterprise LLM with custom auth
+    Custom,
+}
+
+/// Vendor-specific configuration.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct VendorConfig {
+    /// Vendor API type
+    #[serde(rename = "type", default)]
+    pub vendor_type: VendorType,
+    /// Base URL override (for Anthropic, defaults to https://api.anthropic.com)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Auth header name (for Custom, defaults to "Authorization")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
+    /// Environment variable name for the API key (defaults to CLAUSURA_API_KEY)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+}
+
+impl Default for VendorConfig {
+    fn default() -> Self {
+        VendorConfig {
+            vendor_type: VendorType::OpenAiCompatible,
+            base_url: None,
+            auth_header: None,
+            api_key_env: None,
+        }
+    }
+}
+
+impl VendorConfig {
+    /// Create a VendorConfig from a vendor name string (e.g., "openai", "anthropic", "ollama").
+    /// This is used by the config loader to convert YAML/CLI string values into VendorConfig.
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "" => VendorConfig::default(),
+            "openai" | "openai_compatible" => VendorConfig::openai(),
+            "ollama" => VendorConfig::ollama(),
+            "anthropic" | "claude" | "anthropic_compatible" => VendorConfig::anthropic(),
+            "deepseek" => VendorConfig {
+                vendor_type: VendorType::OpenAiCompatible,
+                base_url: Some("https://api.deepseek.com/v1".into()),
+                ..Default::default()
+            },
+            "groq" => VendorConfig {
+                vendor_type: VendorType::OpenAiCompatible,
+                base_url: Some("https://api.groq.com/openai/v1".into()),
+                ..Default::default()
+            },
+            other => VendorConfig {
+                vendor_type: VendorType::OpenAiCompatible,
+                base_url: Some(format!("https://api.{}.com/v1", other)),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Create an OpenAI-compatible vendor config.
+    pub fn openai() -> Self {
+        VendorConfig {
+            vendor_type: VendorType::OpenAiCompatible,
+            base_url: Some("https://api.openai.com/v1".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Create an Anthropic-compatible vendor config.
+    pub fn anthropic() -> Self {
+        VendorConfig {
+            vendor_type: VendorType::AnthropicCompatible,
+            base_url: Some("https://api.anthropic.com".into()),
+            auth_header: Some("x-api-key".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Create an Ollama vendor config (OpenAI-compatible).
+    pub fn ollama() -> Self {
+        VendorConfig {
+            vendor_type: VendorType::OpenAiCompatible,
+            base_url: Some("http://localhost:11434/v1".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Get the effective base URL.
+    pub fn effective_base_url(&self) -> &str {
+        self.base_url.as_deref().unwrap_or(match self.vendor_type {
+            VendorType::OpenAiCompatible => "https://api.openai.com/v1",
+            VendorType::AnthropicCompatible => "https://api.anthropic.com",
+            VendorType::Custom => "",
+        })
+    }
+
+    /// Get the effective auth header name.
+    pub fn auth_header_name(&self) -> &str {
+        self.auth_header
+            .as_deref()
+            .unwrap_or(match self.vendor_type {
+                VendorType::AnthropicCompatible => "x-api-key",
+                _ => "Authorization",
+            })
+    }
+}
+
+/// A helper for deserializing VendorConfig from either a string or an object.
+/// String form: "openai", "ollama", "anthropic" → maps to the corresponding VendorConfig preset.
+/// Object form: { type: "openai_compatible", base_url: "...", auth_header: "..." }
+impl<'de> Deserialize<'de> for VendorConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        struct VendorConfigVisitor;
+
+        impl<'de> de::Visitor<'de> for VendorConfigVisitor {
+            type Value = VendorConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a vendor name string or a vendor config object")
+            }
+
+            // Handle string form: "openai", "ollama", "anthropic" — delegates to from_name
+            fn visit_str<E>(self, value: &str) -> Result<VendorConfig, E>
+            where
+                E: de::Error,
+            {
+                Ok(VendorConfig::from_name(value))
+            }
+
+            // Handle map form: { type: "...", base_url: "...", ... }
+            fn visit_map<M>(self, map: M) -> Result<VendorConfig, M::Error>
+            where
+                M: de::MapAccess<'de>,
+            {
+                #[derive(Deserialize)]
+                struct VendorConfigRaw {
+                    #[serde(rename = "type", default)]
+                    vendor_type: VendorType,
+                    #[serde(default)]
+                    base_url: Option<String>,
+                    #[serde(default)]
+                    auth_header: Option<String>,
+                    #[serde(default)]
+                    api_key_env: Option<String>,
+                }
+
+                let raw = VendorConfigRaw::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(VendorConfig {
+                    vendor_type: raw.vendor_type,
+                    base_url: raw.base_url,
+                    auth_header: raw.auth_header,
+                    api_key_env: raw.api_key_env,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(VendorConfigVisitor)
+    }
+}
+
+/// Task contract — defines what a task does, how it runs, and gating rules
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TaskContract {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub model: String,
+    #[serde(default)]
+    pub vendor: VendorConfig,
+    pub prompt_template: String,
+    #[serde(default)]
+    pub tool_allowlist: Vec<String>,
+    /// Context-window budget: drives truncation of the conversation.
+    pub token_budget: u64,
+    /// Optional cap on cumulative tokens billed across all LLM calls in one
+    /// run. When reached, the agent loop stops and the run is marked
+    /// incomplete. `None` means no cap.
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
+    /// When true, the agent loop summarizes messages dropped by context
+    /// truncation with an LLM call and injects the summary at the truncation
+    /// boundary instead of a bare "context trimmed" hint. Default false.
+    #[serde(default)]
+    pub auto_compact: bool,
+    /// Per-run cap on auto-compaction LLM calls. Guards against compaction
+    /// loops on long-running tasks. Default 3; 0 disables compaction even
+    /// when `auto_compact` is true.
+    #[serde(default = "default_max_compactions")]
+    pub max_compactions: u32,
+    /// When true, findings the agent emits during the run are appended to a
+    /// JSON-lines ledger on disk (`{workspace}/.clausura/archives/`). Before
+    /// returning, the final findings are merged with the ledger so findings
+    /// from earlier iterations survive context truncation/compaction. Default
+    /// true; costs no LLM calls and is deterministic.
+    #[serde(default = "default_findings_ledger")]
+    pub findings_ledger: bool,
+    /// Layered memory (opt-in): classify messages into memory tiers and
+    /// manage the context window per layer — pinned messages (the task
+    /// contract) are never truncated, and ephemeral tool outputs are elided
+    /// to stubs before any conversation message is dropped. Default false:
+    /// the classic uniform truncation is used.
+    #[serde(default)]
+    pub layered_memory: bool,
+    pub timeout_secs: u64,
+    #[serde(default = "default_shell_timeout_secs")]
+    pub shell_timeout_secs: u64,
+    #[serde(default)]
+    pub shell_env_passthrough: Vec<String>,
+    #[serde(default = "default_ambiguity_policy")]
+    pub ambiguity_policy: AmbiguityPolicy,
+    #[serde(default)]
+    pub gating_rules: Vec<GateRule>,
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+    #[serde(default)]
+    pub on_incomplete: OnIncompletePolicy,
+    /// External MCP servers whose tools should be available to the agent.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+    /// Preflight checks — MCP tool calls that run before the agent loop.
+    /// Their output is parsed into deterministic Findings and merged with
+    /// the agent's findings for gating.
+    #[serde(default)]
+    pub preflight: Vec<PreflightCheck>,
+}
+
+fn default_max_iterations() -> u32 {
+    10
+}
+
+fn default_max_compactions() -> u32 {
+    3
+}
+
+fn default_findings_ledger() -> bool {
+    true
+}
+
+fn default_shell_timeout_secs() -> u64 {
+    120
+}
+
+fn default_ambiguity_policy() -> AmbiguityPolicy {
+    AmbiguityPolicy::FailClosed
+}
+
+/// Snapshot metadata for checkpoints
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SnapshotMeta {
+    pub thread_id: String,
+    pub checkpoint_id: uuid::Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub version: u32,
+    pub truncated: bool,
+}
+
+/// A complete snapshot state
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    pub id: uuid::Uuid,
+    pub messages: Vec<Message>,
+    pub meta: SnapshotMeta,
+}
+
+/// Execution report — final output of a task run
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ExecutionReport {
+    pub task_id: String,
+    pub exit_code: u32,
+    pub findings: Vec<Finding>,
+    pub token_usage: Usage,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub violations: Vec<RuleViolation>,
+}
+
+/// Context about the CI environment
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct CiContext {
+    pub repo: Option<String>,
+    pub pr_number: Option<String>,
+    pub commit_sha: Option<String>,
+    pub branch: Option<String>,
+}
+
+/// Error types for provider operations
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderError {
+    #[error("Authentication failed: {0}")]
+    AuthError(String),
+    #[error("Rate limited: {0}")]
+    RateLimited(String),
+    #[error("Server error: {0}")]
+    ServerError(String),
+    #[error("Bad request: {0}")]
+    BadRequest(String),
+    #[error("Timeout: {0}")]
+    Timeout(String),
+    #[error("Network error: {0}")]
+    NetworkError(#[from] reqwest::Error),
+    #[error("JSON error: {0}")]
+    JsonError(#[from] serde_json::Error),
+    #[error("Agent response did not match the expected findings schema: {0}")]
+    MalformedFindings(String),
+}
+
+/// Error types for tool operations
+#[derive(Debug, thiserror::Error)]
+pub enum ToolError {
+    #[error("Tool not found: {0}")]
+    NotFound(String),
+    #[error("Execution failed: {0}")]
+    ExecutionFailed(String),
+    #[error("Sandbox violation: {0}")]
+    SandboxViolation(String),
+    #[error("Timeout")]
+    Timeout,
+}
+
+/// Error types for config operations
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("File not found: {0}")]
+    FileNotFound(String),
+    #[error("Parse error: {0}")]
+    ParseError(String),
+    #[error("Validation error: {0}")]
+    ValidationError(String),
+}
+
+/// Configuration for a single MCP (Model Context Protocol) server.
+///
+/// Describes how to spawn and communicate with an external MCP server
+/// process over stdio transport.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct McpServerConfig {
+    /// Unique name for this server (used as tool prefix).
+    pub name: String,
+    /// Command to spawn the MCP server process.
+    pub command: String,
+    /// Arguments passed to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables injected into the server process.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+}
+
+/// A preflight check — an MCP tool call that runs *before* the agent loop.
+///
+/// The tool's JSON output is parsed into `Finding` objects and passed
+/// through the gating rule engine alongside agent-produced findings.
+/// A summary is also injected into the agent's context.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PreflightCheck {
+    /// Name of the MCP server (must match an entry in `mcp_servers`).
+    pub mcp_server: String,
+    /// Tool name to call on that server.
+    pub tool: String,
+    /// Arguments to pass to the tool.
+    #[serde(default)]
+    pub args: serde_json::Value,
+    /// Prefix for the auto-generated `rule_id` on each Finding.
+    #[serde(default = "default_preflight_rule_prefix")]
+    pub rule_id_prefix: String,
+    /// JSON field name for severity in each result item.
+    #[serde(default = "default_preflight_severity_field")]
+    pub severity_field: String,
+    /// JSON field name for message text.
+    #[serde(default = "default_preflight_message_field")]
+    pub message_field: String,
+    /// JSON field name for file path.
+    #[serde(default = "default_preflight_file_field")]
+    pub file_field: String,
+    /// JSON field name for line number.
+    #[serde(default = "default_preflight_line_field")]
+    pub line_field: String,
+    /// JSON field name for column number.
+    #[serde(default = "default_preflight_column_field")]
+    pub column_field: String,
+    /// Default severity string when the source item lacks one.
+    #[serde(default = "default_preflight_default_severity")]
+    pub default_severity: String,
+}
+
+fn default_preflight_rule_prefix() -> String {
+    "preflight-".into()
+}
+fn default_preflight_severity_field() -> String {
+    "severity".into()
+}
+fn default_preflight_message_field() -> String {
+    "message".into()
+}
+fn default_preflight_file_field() -> String {
+    "file".into()
+}
+fn default_preflight_line_field() -> String {
+    "line".into()
+}
+fn default_preflight_column_field() -> String {
+    "column".into()
+}
+fn default_preflight_default_severity() -> String {
+    "warning".into()
+}
+
+impl Default for PreflightCheck {
+    fn default() -> Self {
+        Self {
+            mcp_server: String::new(),
+            tool: String::new(),
+            args: serde_json::json!({}),
+            rule_id_prefix: default_preflight_rule_prefix(),
+            severity_field: default_preflight_severity_field(),
+            message_field: default_preflight_message_field(),
+            file_field: default_preflight_file_field(),
+            line_field: default_preflight_line_field(),
+            column_field: default_preflight_column_field(),
+            default_severity: default_preflight_default_severity(),
+        }
+    }
+}
+
+/// Error types for checkpoint operations
+#[derive(Debug, thiserror::Error)]
+pub enum CheckpointError {
+    #[error("Database error: {0}")]
+    DbError(String),
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
+    #[error("Not found: {0}")]
+    NotFound(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_message_round_trip() {
+        let msg = Message {
+            role: Role::User,
+            content: "Hello".to_string(),
+            tool_call_id: None,
+            tool_calls: None,
+            tier: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_message_new_sets_tool_call_id_none() {
+        let msg = Message::new(Role::System, "prompt");
+        assert_eq!(msg.role, Role::System);
+        assert_eq!(msg.content, "prompt");
+        assert!(msg.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn test_message_with_tool_call_sets_id() {
+        let msg = Message::with_tool_call(Role::Tool, "result", "call_123".into());
+        assert_eq!(msg.role, Role::Tool);
+        assert_eq!(msg.content, "result");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_123"));
+    }
+
+    #[test]
+    fn test_tool_message_serializes_tool_call_id() {
+        let msg = Message::with_tool_call(Role::Tool, "tool output", "call_abc".into());
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("tool_call_id"));
+        assert!(json.contains("call_abc"));
+    }
+
+    #[test]
+    fn test_non_tool_message_omits_tool_call_id() {
+        let msg = Message::new(Role::User, "hello");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("tool_call_id"));
+    }
+
+    #[test]
+    fn test_deserialize_tool_message_with_tool_call_id() {
+        let json = r#"{"role":"tool","content":"result","tool_call_id":"call_xyz"}"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.role, Role::Tool);
+        assert_eq!(msg.content, "result");
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_xyz"));
+    }
+
+    #[test]
+    fn test_deserialize_message_without_tool_call_id() {
+        let json = r#"{"role":"user","content":"hello"}"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.role, Role::User);
+        assert_eq!(msg.content, "hello");
+        assert!(msg.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn test_finding_round_trip_with_location() {
+        let finding = Finding {
+            id: uuid::Uuid::new_v4(),
+            rule_id: "TEST".into(),
+            severity: Severity::Error,
+            message: "Test finding".into(),
+            location: Some(Location {
+                file: "src/main.rs".into(),
+                line_start: 10,
+                line_end: 12,
+                column_start: 1,
+                column_end: 5,
+            }),
+            evidence: "evidence text".into(),
+        };
+        let json = serde_json::to_string_pretty(&finding).unwrap();
+        let deserialized: Finding = serde_json::from_str(&json).unwrap();
+        assert_eq!(finding, deserialized);
+    }
+
+    #[test]
+    fn test_finding_round_trip_without_location() {
+        let finding = Finding {
+            id: uuid::Uuid::new_v4(),
+            rule_id: "TEST".into(),
+            severity: Severity::Warning,
+            message: "No location".into(),
+            location: None,
+            evidence: "".into(),
+        };
+        let json = serde_json::to_string(&finding).unwrap();
+        let deserialized: Finding = serde_json::from_str(&json).unwrap();
+        assert_eq!(finding, deserialized);
+        assert!(deserialized.location.is_none());
+    }
+
+    #[test]
+    fn test_task_contract_defaults() {
+        let contract = TaskContract {
+            id: "test".into(),
+            name: "Test".into(),
+            description: "".into(),
+            model: "gpt-4o".into(),
+            vendor: VendorConfig::openai(),
+            prompt_template: "Review: {{diff}}".into(),
+            tool_allowlist: vec![],
+            token_budget: 32000,
+            max_total_tokens: None,
+            auto_compact: false,
+            max_compactions: 3,
+            findings_ledger: true,
+            layered_memory: false,
+            timeout_secs: 300,
+            shell_timeout_secs: 120,
+            shell_env_passthrough: vec![],
+            ambiguity_policy: AmbiguityPolicy::FailClosed,
+            gating_rules: vec![],
+            max_iterations: 10,
+            on_incomplete: OnIncompletePolicy::Fail,
+            mcp_servers: vec![],
+            preflight: vec![],
+        };
+        assert_eq!(contract.ambiguity_policy, AmbiguityPolicy::FailClosed);
+        assert!(contract.gating_rules.is_empty());
+        assert_eq!(contract.on_incomplete, OnIncompletePolicy::Fail);
+        assert!(!contract.auto_compact);
+        assert_eq!(contract.max_compactions, 3);
+        assert!(contract.findings_ledger);
+        assert!(!contract.layered_memory);
+    }
+
+    #[test]
+    fn test_memory_tier_classification() {
+        // Explicit tier wins over role-based classification.
+        let pinned_user = Message::new(Role::User, "contract").with_tier(MemoryTier::Pinned);
+        assert_eq!(pinned_user.memory_tier(), MemoryTier::Pinned);
+        let conv_tool = Message::with_tool_call(Role::Tool, "out", "c1".into())
+            .with_tier(MemoryTier::Conversation);
+        assert_eq!(conv_tool.memory_tier(), MemoryTier::Conversation);
+
+        // Role-based defaults.
+        assert_eq!(
+            Message::new(Role::System, "s").memory_tier(),
+            MemoryTier::Pinned
+        );
+        assert_eq!(
+            Message::with_tool_call(Role::Tool, "o", "c".into()).memory_tier(),
+            MemoryTier::Ephemeral
+        );
+        assert_eq!(
+            Message::new(Role::User, "u").memory_tier(),
+            MemoryTier::Conversation
+        );
+        assert_eq!(
+            Message::new(Role::Assistant, "a").memory_tier(),
+            MemoryTier::Conversation
+        );
+    }
+
+    #[test]
+    fn test_tier_field_serde_round_trip_and_default() {
+        // Old snapshots/archives without a `tier` field still deserialize.
+        let msg: Message = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert!(msg.tier.is_none());
+        assert!(!serde_json::to_string(&msg).unwrap().contains("tier"));
+
+        let pinned = Message::new(Role::User, "hi").with_tier(MemoryTier::Pinned);
+        let json = serde_json::to_string(&pinned).unwrap();
+        assert!(json.contains(r#""tier":"pinned""#));
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, pinned);
+    }
+
+    #[test]
+    fn test_execution_report_round_trip() {
+        let report = ExecutionReport {
+            task_id: "task-1".into(),
+            exit_code: 0,
+            findings: vec![],
+            token_usage: Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                total_tokens: 150,
+            },
+            duration_ms: 5000,
+            snapshot_id: None,
+            errors: vec![],
+            violations: vec![],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let deserialized: ExecutionReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report, deserialized);
+    }
+
+    #[test]
+    fn test_usage_default() {
+        let usage = Usage::default();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn test_severity_ordering() {
+        assert!(Severity::Error > Severity::Warning);
+        assert!(Severity::Warning > Severity::Info);
+        assert!(Severity::Info > Severity::Hint);
+    }
+
+    #[test]
+    fn test_vendor_config_openai() {
+        let cfg = VendorConfig::openai();
+        assert_eq!(cfg.vendor_type, VendorType::OpenAiCompatible);
+        assert_eq!(cfg.effective_base_url(), "https://api.openai.com/v1");
+        assert_eq!(cfg.auth_header_name(), "Authorization");
+    }
+
+    #[test]
+    fn test_vendor_config_anthropic() {
+        let cfg = VendorConfig::anthropic();
+        assert_eq!(cfg.vendor_type, VendorType::AnthropicCompatible);
+        assert_eq!(cfg.effective_base_url(), "https://api.anthropic.com");
+        assert_eq!(cfg.auth_header_name(), "x-api-key");
+    }
+
+    #[test]
+    fn test_vendor_config_ollama() {
+        let cfg = VendorConfig::ollama();
+        assert_eq!(cfg.vendor_type, VendorType::OpenAiCompatible);
+        assert_eq!(cfg.effective_base_url(), "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn test_vendor_config_deser_from_string() {
+        let cfg: VendorConfig = serde_json::from_str(r#""openai""#).unwrap();
+        assert_eq!(cfg.vendor_type, VendorType::OpenAiCompatible);
+
+        let cfg: VendorConfig = serde_json::from_str(r#""anthropic""#).unwrap();
+        assert_eq!(cfg.vendor_type, VendorType::AnthropicCompatible);
+
+        let cfg: VendorConfig = serde_json::from_str(r#""ollama""#).unwrap();
+        assert_eq!(cfg.vendor_type, VendorType::OpenAiCompatible);
+    }
+
+    #[test]
+    fn test_vendor_config_deser_from_object() {
+        let cfg: VendorConfig = serde_json::from_str(
+            r#"{"type": "custom", "base_url": "https://llm.internal/v1", "auth_header": "X-API-Key"}"#
+        ).unwrap();
+        assert_eq!(cfg.vendor_type, VendorType::Custom);
+        assert_eq!(cfg.base_url.as_deref(), Some("https://llm.internal/v1"));
+        assert_eq!(cfg.auth_header.as_deref(), Some("X-API-Key"));
+    }
+}
