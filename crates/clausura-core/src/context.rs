@@ -249,7 +249,8 @@ impl<'a> ContextManager<'a> {
             }
             let original = std::mem::replace(
                 &mut messages[i].content,
-                "[tool output elided by layered memory; the full transcript is archived]",
+                "[tool output elided by layered memory; the full transcript is archived]"
+                    .to_string(),
             );
             elided.push((i, original));
         }
