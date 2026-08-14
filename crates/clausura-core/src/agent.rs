@@ -2,7 +2,9 @@ use crate::context::ContextManager;
 use crate::provider::Provider;
 use crate::snapshot::SnapshotManager;
 use crate::tools::ToolRegistry;
-use crate::types::{Finding, FinishReason, Message, ProviderError, Role, TaskContract, Usage};
+use crate::types::{
+    Finding, FinishReason, MemoryTier, Message, ProviderError, Role, TaskContract, Usage,
+};
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -107,6 +109,18 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 
     messages.insert(0, Message::new(Role::System, system_prompt));
 
+    // Layered memory (opt-in): the system prompt and the caller's initial
+    // messages carry the task contract — pin them so truncation never drops
+    // them, and let tool outputs be elided before any conversation message.
+    let layered_memory = config.contract.layered_memory;
+    if layered_memory {
+        for m in messages.iter_mut() {
+            if m.tier.is_none() && matches!(m.role, Role::System | Role::User) {
+                m.tier = Some(MemoryTier::Pinned);
+            }
+        }
+    }
+
     let cm = ContextManager::new(
         config.provider,
         config.contract.token_budget,
@@ -135,12 +149,63 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         }
 
         if cm.should_truncate(&messages) {
-            let snapshot = messages.clone();
-            let (was_truncated, count) = cm.truncate_to_budget(&mut messages);
-            if was_truncated && count > 0 {
-                let dropped_end = 1 + (snapshot.len() - messages.len());
-                let dropped: Vec<Message> = snapshot[1..dropped_end].to_vec();
+            // Layered memory phase 1: elide old ephemeral tool outputs to
+            // stubs before dropping any conversation message. Pairing stays
+            // intact; originals go to the archive.
+            if layered_memory {
+                let elided = cm.elide_ephemeral_outputs(&mut messages);
+                if !elided.is_empty() {
+                    let originals: Vec<Message> = elided
+                        .iter()
+                        .map(|(i, content)| {
+                            let mut m = messages[*i].clone();
+                            m.content = content.clone();
+                            m
+                        })
+                        .collect();
+                    match cm.archive(&originals, &config.contract.id).await {
+                        Ok(path) => {
+                            messages.insert(
+                                1,
+                                Message::new(
+                                    Role::User,
+                                    format!(
+                                        "ℹ️ Layered memory: {} older tool output(s) were elided to stubs.\n\
+                                         Their full contents are archived at:\n  {}\n\
+                                         Use read_file to inspect if you need the original output.",
+                                        elided.len(),
+                                        path.display(),
+                                    ),
+                                ),
+                            );
+                        }
+                        Err(_) => {
+                            tracing::debug!("layered memory: archive of elided outputs failed");
+                        }
+                    }
+                    if !cm.should_truncate(&messages) {
+                        continue;
+                    }
+                }
+            }
 
+            let snapshot = messages.clone();
+            let (dropped, was_truncated) = if layered_memory {
+                let dropped = cm.truncate_preserving_pinned(&mut messages);
+                let n = dropped.len();
+                (dropped, n > 0)
+            } else {
+                let (was_truncated, count) = cm.truncate_to_budget(&mut messages);
+                let dropped: Vec<Message> = if was_truncated && count > 0 {
+                    let dropped_end = 1 + (snapshot.len() - messages.len());
+                    snapshot[1..dropped_end].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let was_truncated = was_truncated && !dropped.is_empty();
+                (dropped, was_truncated)
+            };
+            if was_truncated && !dropped.is_empty() {
                 let archive_result = cm.archive(&dropped, &config.contract.id).await;
 
                 // Auto-compact: summarize the dropped messages with a single
@@ -280,6 +345,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
             FinishReason::ToolCalls => {
                 if let Some(tool_calls) = response.tool_calls {
                     messages.push(Message {
+                        tier: None,
                         role: Role::Assistant,
                         // Preserve the assistant's text: models commonly emit
                         // reasoning/progress (and findings drafts) alongside
@@ -896,6 +962,7 @@ mod tests {
             auto_compact: false,
             max_compactions: 3,
             findings_ledger: true,
+            layered_memory: false,
             timeout_secs: 60,
             shell_timeout_secs: 120,
             shell_env_passthrough: vec![],
@@ -1663,6 +1730,7 @@ mod tests {
                 role: Role::Assistant,
                 content: String::new(),
                 tool_call_id: None,
+                tier: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_1".into(),
                     name: "git_diff".into(),
@@ -2327,5 +2395,174 @@ mod tests {
              not silently succeed with 0 findings",
         );
         assert!(matches!(err, ProviderError::MalformedFindings(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Layered memory
+    // -----------------------------------------------------------------
+
+    /// With layered memory on, an oversized early tool output is elided to a
+    /// stub (not dropped) once it falls behind the recent working context,
+    /// the pinned contract survives, and the run still completes cleanly.
+    #[tokio::test]
+    async fn test_agent_loop_layered_memory_elides_tool_outputs() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut contract = test_contract();
+        contract.layered_memory = true;
+        contract.token_budget = 6000;
+
+        let big = "y".repeat(8000); // ~2000 tokens by the mock heuristic
+        std::fs::write(root.join("big1.txt"), &big).unwrap();
+        std::fs::write(root.join("big2.txt"), &big).unwrap();
+        std::fs::write(root.join("small.txt"), "ok").unwrap();
+
+        let read_call = |id: &str, path: &str| ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": path}),
+        };
+
+        let mut mock = MockProvider::new("test-model");
+        // Round 1: read a big file. Round 2: small file. Round 3: big file.
+        // After round 3 the context crosses 80% of the budget; the round-1
+        // output is then old enough (>4 messages from the tail) to elide.
+        for (i, (id, path)) in [
+            ("call_1", "big1.txt"),
+            ("call_2", "small.txt"),
+            ("call_3", "big2.txt"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mock.add_response(ChatResponse {
+                message: Message::new(Role::Assistant, format!("Reading file {i}...")),
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 5,
+                    total_tokens: 10,
+                },
+                finish_reason: FinishReason::ToolCalls,
+                tool_calls: Some(vec![read_call(id, path)]),
+            });
+        }
+        mock.add_response(ChatResponse {
+            message: Message::new(
+                Role::Assistant,
+                r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "m", "evidence": "e"}]}"#,
+            ),
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review these files")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(!result.truncated, "elision should avoid an incomplete run");
+
+        // The initial user message (the contract) is pinned and survived.
+        assert_eq!(result.messages[0].role, Role::System);
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|m| m.tier == Some(MemoryTier::Pinned)
+                    && m.content.contains("Review these files")),
+            "pinned contract must survive"
+        );
+
+        // The oldest bulky tool output was elided to a stub, not dropped —
+        // its assistant-tool pair is still present and intact. The most
+        // recent big output stays verbatim.
+        let tool_msgs: Vec<&Message> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 3, "tool messages must not be dropped");
+        assert!(
+            tool_msgs.iter().any(|m| m.content.contains("elided")),
+            "expected an elided stub, got: {:?}",
+            tool_msgs.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+        assert!(
+            tool_msgs.iter().any(|m| m.content.len() > 7000),
+            "the most recent big output must stay verbatim"
+        );
+        for (i, m) in result.messages.iter().enumerate() {
+            if m.role == Role::Tool {
+                assert_eq!(
+                    result.messages[i - 1].role,
+                    Role::Assistant,
+                    "elision must preserve assistant-tool pairing"
+                );
+            }
+        }
+    }
+
+    /// With layered memory off (default), nothing is pinned and no elision
+    /// stub is ever injected — the classic truncation path is untouched.
+    #[tokio::test]
+    async fn test_agent_loop_layered_memory_off_by_default() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[]);
+
+        let mut contract = test_contract();
+        contract.token_budget = 10000;
+        assert!(!contract.layered_memory);
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, "Running tool..."),
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                name: "git_diff".into(),
+                arguments: serde_json::json!({}),
+            }]),
+        });
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, r#"{"findings": []}"#),
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "x".repeat(40000))],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(result
+            .messages
+            .iter()
+            .all(|m| !m.content.contains("elided") && m.tier.is_none()));
     }
 }
