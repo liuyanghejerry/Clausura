@@ -1,8 +1,10 @@
 use crate::context::ContextManager;
-use crate::provider::Provider;
+use crate::eventlog::{EventLog, RunEvent};
+use crate::provider::{is_context_overflow_err, Provider};
 use crate::snapshot::SnapshotManager;
 use crate::tools::ToolRegistry;
 use crate::types::{Finding, FinishReason, Message, ProviderError, Role, TaskContract, Usage};
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -29,6 +31,10 @@ pub struct AgentConfig<'a> {
     pub initial_messages: Vec<Message>,
     pub workspace_root: PathBuf,
     pub snapshot_mgr: Option<&'a SnapshotManager>,
+    /// Append-only run event log (LLM requests/responses, tool calls,
+    /// truncation and checkpoint events). Optional — tests and callers that
+    /// don't need the audit trail pass `None`.
+    pub event_log: Option<&'a EventLog>,
 }
 
 /// Number of corrective "reply with JSON only" attempts per recovery point.
@@ -39,7 +45,10 @@ const MAX_RECOVERY_RETRIES: usize = 2;
 /// schema'd `findings` JSON; a nudge asking for a JSON-only reply recovers the
 /// run instead of failing it. Returns the first parseable findings or the last
 /// extraction error. Each attempt is a billed LLM call and respects the
-/// cumulative token cap and the task deadline.
+/// cumulative token cap and the task deadline. The corrective prompt carries
+/// the specific parse error and the expected schema, and every attempt is
+/// recorded in the run event log when present.
+#[allow(clippy::too_many_arguments)]
 async fn recover_findings_json(
     contract: &TaskContract,
     provider: &dyn Provider,
@@ -48,8 +57,10 @@ async fn recover_findings_json(
     start: &Instant,
     running_tokens: &mut u64,
     total_usage: &mut Usage,
+    event_log: Option<&EventLog>,
+    first_err: &str,
 ) -> Result<Vec<Finding>, String> {
-    let mut last_err = "no corrective attempts made".to_string();
+    let mut last_err = first_err.to_string();
     for _ in 0..MAX_RECOVERY_RETRIES {
         if start.elapsed() > Duration::from_secs(contract.timeout_secs) {
             break;
@@ -59,17 +70,8 @@ async fn recover_findings_json(
                 break;
             }
         }
-        messages.push(Message::new(
-            Role::User,
-            "Your last response did not contain valid findings JSON. Reply with \
-             ONLY the JSON object that holds the `findings` array — no prose, \
-             no markdown fences, no other text."
-                .to_string(),
-        ));
-        let retry = match provider
-            .chat_with_tools(messages, tools.list_definitions().as_slice())
-            .await
-        {
+        messages.push(Message::new(Role::User, findings_retry_prompt(&last_err)));
+        let retry = match call_llm(provider, tools, messages, event_log).await {
             Ok(r) => r,
             Err(e) => {
                 last_err = format!("corrective call failed: {e}");
@@ -107,6 +109,14 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 
     messages.insert(0, Message::new(Role::System, system_prompt));
 
+    if let Some(log) = config.event_log {
+        log.append(&RunEvent::RunStart {
+            task_id: config.contract.id.clone(),
+            model: config.contract.model.clone(),
+            workspace: config.workspace_root.display().to_string(),
+        });
+    }
+
     let cm = ContextManager::new(
         config.provider,
         config.contract.token_budget,
@@ -118,6 +128,10 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
     let auto_compact = config.contract.auto_compact;
     let max_compactions = config.contract.max_compactions;
     let mut compactions_used: u32 = 0;
+
+    // Loop hygiene: consecutive identical (tool, args) call counts, keyed by
+    // the canonical invocation. See `repeat_reminder_text` for thresholds.
+    let mut repeat_counts: HashMap<String, u32> = HashMap::new();
 
     for _iteration in 0..max_iterations {
         if start.elapsed() > Duration::from_secs(config.contract.timeout_secs) {
@@ -135,85 +149,78 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         }
 
         if cm.should_truncate(&messages) {
-            let snapshot = messages.clone();
-            let (was_truncated, count) = cm.truncate_to_budget(&mut messages);
-            if was_truncated && count > 0 {
-                let dropped_end = 1 + (snapshot.len() - messages.len());
-                let dropped: Vec<Message> = snapshot[1..dropped_end].to_vec();
-
-                let archive_result = cm.archive(&dropped, &config.contract.id).await;
-
-                // Auto-compact: summarize the dropped messages with a single
-                // no-tool LLM call and inject the summary at the truncation
-                // boundary. Any guard failure or LLM error falls back to the
-                // bare "context trimmed" hint — compaction must never fail
-                // the run.
-                let compact_summary: Option<String> = match &archive_result {
-                    Ok(path) if auto_compact && compactions_used < max_compactions => {
-                        let tail_tokens = cm.count_tokens(&messages);
-                        match try_compact(
-                            config.provider,
-                            &cm,
-                            &dropped,
-                            path,
-                            config.contract.token_budget,
-                            config.contract.max_total_tokens,
-                            tail_tokens,
-                            &mut running_tokens,
-                            &mut total_usage,
-                        )
-                        .await
-                        {
-                            CompactOutcome::Ok { summary } => {
-                                compactions_used += 1;
-                                Some(summary)
-                            }
-                            CompactOutcome::Skipped | CompactOutcome::Failed => None,
-                        }
-                    }
-                    _ => None,
-                };
-
-                let hint = match (&archive_result, compact_summary) {
-                    // Insert at the truncation boundary (right after the
-                    // system message), not at the end: appending a User
-                    // message after an assistant message with tool_calls
-                    // would leave those calls without results, which the
-                    // OpenAI/Anthropic APIs reject.
-                    (Ok(path), Some(summary)) => compact_hint(dropped.len(), path, &summary),
-                    (Ok(path), None) => format!(
-                        "⚠️ Context was trimmed to stay within token budget.\n\
-                         {} earlier messages are archived at:\n  {}\n\
-                         Use read_file to inspect if you need context from earlier iterations.",
-                        dropped.len(),
-                        path.display(),
-                    ),
-                    (Err(_), _) => format!(
-                        "⚠️ Context was trimmed to stay within token budget.\n\
-                         {} earlier messages were dropped (archive unavailable).",
-                        dropped.len(),
-                    ),
-                };
-
-                messages.insert(1, Message::new(Role::User, hint));
-
-                if cm.should_truncate(&messages) {
-                    // Last resort: the summary budget was computed against the
-                    // tail's token count, so this only fires on heuristic
-                    // counter drift. Fall-through below marks the run
-                    // truncated (findings still survive via the ledger).
-                    break;
-                }
-                continue;
-            } else {
+            // Proactive compaction: the heuristic counter says we're closing
+            // in on the budget. Truncate now, before the provider rejects the
+            // request outright.
+            if !truncate_and_hint(
+                config.provider,
+                &cm,
+                &mut messages,
+                &config.contract.id,
+                config.contract.token_budget,
+                config.contract.max_total_tokens,
+                auto_compact,
+                max_compactions,
+                &mut compactions_used,
+                &mut running_tokens,
+                &mut total_usage,
+                config.event_log,
+                false,
+            )
+            .await
+            {
+                // Context could not be reduced further: fall-through below
+                // marks the run truncated.
                 break;
             }
+            continue;
         }
 
-        let response = config
-            .provider
-            .chat_with_tools(&messages, config.tools.list_definitions().as_slice())
-            .await?;
+        let response = match call_llm(config.provider, config.tools, &messages, config.event_log)
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) if is_context_overflow_err(&e) => {
+                // Reactive compaction: the provider rejected the request as
+                // over the context window. Truncate + archive (optionally
+                // auto-compact) and retry the same request exactly once.
+                tracing::warn!(
+                    reason = %e,
+                    "provider reported context overflow; compacting and retrying once"
+                );
+                if !truncate_and_hint(
+                    config.provider,
+                    &cm,
+                    &mut messages,
+                    &config.contract.id,
+                    config.contract.token_budget,
+                    config.contract.max_total_tokens,
+                    auto_compact,
+                    max_compactions,
+                    &mut compactions_used,
+                    &mut running_tokens,
+                    &mut total_usage,
+                    config.event_log,
+                    true,
+                )
+                .await
+                {
+                    break;
+                }
+                match call_llm(config.provider, config.tools, &messages, config.event_log).await {
+                    Ok(resp) => resp,
+                    Err(e2) if is_context_overflow_err(&e2) => {
+                        tracing::warn!(
+                            reason = %e2,
+                            "context overflow persisted after compaction; marking run truncated"
+                        );
+                        break;
+                    }
+                    Err(e2) => return Err(e2),
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
@@ -241,10 +248,11 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                 ));
 
                 // Strict parse; on failure, ask for a JSON-only reply before
-                // giving up (bounded, billed, budget-respecting).
+                // giving up (bounded, billed, budget-respecting). The prompt
+                // carries the specific parse error and the expected schema.
                 let findings = match extract_findings(&response.message.content) {
                     Ok(findings) => findings,
-                    Err(_) => recover_findings_json(
+                    Err(err) => recover_findings_json(
                         config.contract,
                         config.provider,
                         config.tools,
@@ -252,6 +260,8 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                         &start,
                         &mut running_tokens,
                         &mut total_usage,
+                        config.event_log,
+                        &err,
                     )
                     .await
                     .map_err(ProviderError::MalformedFindings)?,
@@ -269,6 +279,14 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                 } else {
                     findings
                 };
+
+                if let Some(log) = config.event_log {
+                    log.append(&RunEvent::RunEnd {
+                        truncated,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+
                 return Ok(AgentResult {
                     messages,
                     findings,
@@ -278,6 +296,10 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                 });
             }
             FinishReason::ToolCalls => {
+                // Loop hygiene: track identical (tool, args) repetitions
+                // across iterations and inject an escalating advisory
+                // reminder after this batch's tool results.
+                let mut repeat_reminders: Vec<String> = Vec::new();
                 if let Some(tool_calls) = response.tool_calls {
                     messages.push(Message {
                         role: Role::Assistant,
@@ -291,11 +313,34 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                     });
 
                     for tc in &tool_calls {
+                        if let Some(log) = config.event_log {
+                            log.append(&RunEvent::ToolCall {
+                                call_id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                arguments: tc.arguments.clone(),
+                            });
+                        }
+                        let key = repeat_key(&tc.name, &tc.arguments);
+                        let count = repeat_counts
+                            .entry(key)
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
+                        if REPEAT_REMINDER_THRESHOLDS.contains(count) {
+                            repeat_reminders.push(repeat_reminder_text(&tc.name, *count));
+                        }
                         match config.tools.get(&tc.name) {
                             Some(tool) => {
                                 let result = tool.execute(tc.arguments.clone()).await;
                                 match result {
                                     Ok(output) => {
+                                        if let Some(log) = config.event_log {
+                                            log.append(&RunEvent::ToolResult {
+                                                call_id: tc.id.clone(),
+                                                name: tc.name.clone(),
+                                                output: output.clone(),
+                                                error: None,
+                                            });
+                                        }
                                         messages.push(Message::with_tool_call(
                                             Role::Tool,
                                             output,
@@ -303,6 +348,14 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                                         ));
                                     }
                                     Err(e) => {
+                                        if let Some(log) = config.event_log {
+                                            log.append(&RunEvent::ToolResult {
+                                                call_id: tc.id.clone(),
+                                                name: tc.name.clone(),
+                                                output: format!("Error: {}", e),
+                                                error: Some(format!("{}", e)),
+                                            });
+                                        }
                                         messages.push(Message::with_tool_call(
                                             Role::Tool,
                                             format!("Error: {}", e),
@@ -312,6 +365,14 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                                 }
                             }
                             None => {
+                                if let Some(log) = config.event_log {
+                                    log.append(&RunEvent::ToolResult {
+                                        call_id: tc.id.clone(),
+                                        name: tc.name.clone(),
+                                        output: format!("Error: Tool '{}' not found", tc.name),
+                                        error: Some(format!("Tool '{}' not found", tc.name)),
+                                    });
+                                }
                                 messages.push(Message::with_tool_call(
                                     Role::Tool,
                                     format!("Error: Tool '{}' not found", tc.name),
@@ -322,6 +383,13 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                     }
                 } else {
                     break;
+                }
+
+                // Inject any repeat-call reminders after all tool results of
+                // this batch, so tool-call/result pairing stays valid for the
+                // next request.
+                if !repeat_reminders.is_empty() {
+                    messages.push(Message::new(Role::User, repeat_reminders.join("\n\n")));
                 }
             }
             FinishReason::Length => {
@@ -337,7 +405,17 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         if let Some(mgr) = config.snapshot_mgr {
             let iteration = _iteration + 1;
             if mgr.should_auto_save(iteration) {
-                let _ = mgr.save_snapshot(&config.contract.id, &messages, truncated);
+                if let Ok(checkpoint_id) =
+                    mgr.save_snapshot(&config.contract.id, &messages, truncated)
+                {
+                    if let Some(log) = config.event_log {
+                        log.append(&RunEvent::Checkpoint {
+                            checkpoint_id: checkpoint_id.to_string(),
+                            messages: messages.clone(),
+                            truncated,
+                        });
+                    }
+                }
             }
         }
     }
@@ -371,6 +449,8 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
             &start,
             &mut running_tokens,
             &mut total_usage,
+            config.event_log,
+            "no findings JSON could be extracted from the final answer",
         )
         .await
         {
@@ -394,6 +474,13 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         findings
     };
 
+    if let Some(log) = config.event_log {
+        log.append(&RunEvent::RunEnd {
+            truncated,
+            duration_ms: start.elapsed().as_millis() as u64,
+        });
+    }
+
     Ok(AgentResult {
         messages,
         findings,
@@ -401,6 +488,214 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         duration_ms: start.elapsed().as_millis() as u64,
         truncated,
     })
+}
+
+/// Dispatch one LLM request with tool definitions, recording the full
+/// request and response in the run event log when present.
+async fn call_llm(
+    provider: &dyn Provider,
+    tools: &ToolRegistry,
+    messages: &[Message],
+    event_log: Option<&EventLog>,
+) -> Result<crate::types::ChatResponse, ProviderError> {
+    if let Some(log) = event_log {
+        log.append(&RunEvent::LlmRequest {
+            messages: messages.to_vec(),
+        });
+    }
+    let response = provider
+        .chat_with_tools(messages, tools.list_definitions().as_slice())
+        .await?;
+    if let Some(log) = event_log {
+        log.append(&RunEvent::LlmResponse {
+            message: response.message.clone(),
+            usage: response.usage.clone(),
+            finish_reason: response.finish_reason.clone(),
+            tool_calls: response.tool_calls.clone(),
+        });
+    }
+    Ok(response)
+}
+
+/// Truncate the conversation to fit the budget, archive the dropped messages,
+/// optionally summarize them (auto-compact), and inject the hint at the
+/// truncation boundary.
+///
+/// When `force` is true (reactive path — the provider already rejected the
+/// request as over its context window), truncation targets 50% of the budget
+/// even if the heuristic counter thinks the context fits: the 4-chars/token
+/// estimate systematically underestimates code. The proactive path keeps the
+/// normal 75% target.
+///
+/// Returns `true` when truncation was applied and the context is back under
+/// the truncation threshold; `false` when the context could not be reduced
+/// further (the caller must stop and mark the run truncated).
+#[allow(clippy::too_many_arguments)]
+async fn truncate_and_hint(
+    provider: &dyn Provider,
+    cm: &ContextManager<'_>,
+    messages: &mut Vec<Message>,
+    task_id: &str,
+    token_budget: u64,
+    max_total_tokens: Option<u64>,
+    auto_compact: bool,
+    max_compactions: u32,
+    compactions_used: &mut u32,
+    running_tokens: &mut u64,
+    total_usage: &mut Usage,
+    event_log: Option<&EventLog>,
+    force: bool,
+) -> bool {
+    let snapshot = messages.clone();
+    let (was_truncated, count) = if force {
+        // Reactive: reduce to 50% of the budget, not 75% — the provider's
+        // rejection is stronger evidence than our heuristic estimate.
+        let dropped = cm.truncate_to(messages, 0.5);
+        (dropped > 0, dropped)
+    } else {
+        cm.truncate_to_budget(messages)
+    };
+    if !was_truncated || count == 0 {
+        return false;
+    }
+
+    let dropped_end = 1 + (snapshot.len() - messages.len());
+    let dropped: Vec<Message> = snapshot[1..dropped_end].to_vec();
+
+    let archive_result = cm.archive(&dropped, task_id).await;
+
+    // Auto-compact: summarize the dropped messages with a single
+    // no-tool LLM call and inject the summary at the truncation
+    // boundary. Any guard failure or LLM error falls back to the
+    // bare "context trimmed" hint — compaction must never fail
+    // the run.
+    let compact_summary: Option<String> = match &archive_result {
+        Ok(path) if auto_compact && *compactions_used < max_compactions => {
+            let tail_tokens = cm.count_tokens(messages);
+            match try_compact(
+                provider,
+                cm,
+                &dropped,
+                path,
+                token_budget,
+                max_total_tokens,
+                tail_tokens,
+                running_tokens,
+                total_usage,
+            )
+            .await
+            {
+                CompactOutcome::Ok { summary } => {
+                    *compactions_used += 1;
+                    Some(summary)
+                }
+                CompactOutcome::Skipped | CompactOutcome::Failed => None,
+            }
+        }
+        _ => None,
+    };
+
+    let hint = match (&archive_result, &compact_summary) {
+        // Insert at the truncation boundary (right after the
+        // system message), not at the end: appending a User
+        // message after an assistant message with tool_calls
+        // would leave those calls without results, which the
+        // OpenAI/Anthropic APIs reject.
+        (Ok(path), Some(summary)) => compact_hint(dropped.len(), path, summary),
+        (Ok(path), None) => format!(
+            "⚠️ Context was trimmed to stay within token budget.\n\
+             {} earlier messages are archived at:\n  {}\n\
+             Use read_file to inspect if you need context from earlier iterations.",
+            dropped.len(),
+            path.display(),
+        ),
+        (Err(_), _) => format!(
+            "⚠️ Context was trimmed to stay within token budget.\n\
+             {} earlier messages were dropped (archive unavailable).",
+            dropped.len(),
+        ),
+    };
+
+    messages.insert(1, Message::new(Role::User, hint));
+
+    if let Some(log) = event_log {
+        log.append(&RunEvent::ContextTruncated {
+            dropped_count: dropped.len(),
+            archive_path: archive_result
+                .as_ref()
+                .ok()
+                .map(|p| p.display().to_string()),
+            compacted_summary: compact_summary.clone(),
+        });
+    }
+
+    // False when the summary/hint pushed the context back over the threshold
+    // (heuristic drift) — the caller stops and marks the run truncated.
+    !cm.should_truncate(messages)
+}
+
+// ---------------------------------------------------------------------------
+// Repeat tool-call reminder (loop hygiene)
+// ---------------------------------------------------------------------------
+
+/// Call counts at which an escalating reminder is injected. Pure advisory:
+/// the agent may legitimately repeat a call (e.g. paging a file), so the
+/// reminder never blocks execution — it only nudges the model to re-evaluate.
+const REPEAT_REMINDER_THRESHOLDS: [u32; 3] = [3, 5, 8];
+
+/// Canonical identity of a tool invocation: name plus arguments with object
+/// keys sorted recursively, so argument order differences don't mask repeats.
+fn repeat_key(name: &str, args: &serde_json::Value) -> String {
+    format!("{}|{}", name, canonical_json(args))
+}
+
+/// Render a JSON value with object keys sorted recursively. Values are
+/// compared for repeat-detection purposes only.
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut pairs: Vec<(String, String)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), canonical_json(v)))
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let inner = pairs
+                .iter()
+                .map(|(k, v)| {
+                    let key = serde_json::to_string(k).unwrap_or_default();
+                    format!("{key}:{v}")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+        serde_json::Value::Array(arr) => {
+            let inner = arr.iter().map(canonical_json).collect::<Vec<_>>().join(",");
+            format!("[{inner}]")
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Build the escalating reminder for repeat count `count` of tool `name`.
+fn repeat_reminder_text(name: &str, count: u32) -> String {
+    match count {
+        3 => format!(
+            "⚠️ Repeat-call reminder: you have called `{name}` with identical \
+             arguments 3 times in a row. If the result is not changing, try a \
+             narrower query, different arguments, or another tool."
+        ),
+        5 => format!(
+            "⚠️ Repeat-call reminder: you have called `{name}` with identical \
+             arguments 5 times in a row. This looks like a loop — stop and \
+             re-evaluate your approach before the iteration budget runs out."
+        ),
+        _ => format!(
+            "⚠️ Repeat-call reminder: you have called `{name}` with identical \
+             arguments {count} times in a row. You appear stuck in a loop. \
+             Change the inputs, switch tools, or conclude the review now."
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -872,6 +1167,22 @@ fn extract_findings_lenient(content: &str) -> Vec<Finding> {
     }
 }
 
+/// Corrective prompt sent when a Stop response's findings JSON fails to
+/// parse. States the expected schema and the exact parse error so the model
+/// can fix its answer on the next attempt.
+fn findings_retry_prompt(err: &str) -> String {
+    format!(
+        "Your previous answer could not be parsed as findings JSON.\n\
+         Error: {err}\n\n\
+         Please answer again with ONLY a JSON object of the form:\n\
+         {{\"findings\": [{{\"rule_id\": \"...\", \"severity\": \"hint|info|warning|error\", \
+         \"message\": \"...\", \"evidence\": \"...\", \"location\": {{\"file\": \"...\", \
+         \"line_start\": 1, \"line_end\": 1, \"column_start\": 1, \"column_end\": 1}}}}]}}\n\
+         The \"location\" field is optional — omit it when the finding has no \
+         file location. Do not wrap the JSON in prose or markdown fences."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,6 +1207,7 @@ mod tests {
             auto_compact: false,
             max_compactions: 3,
             findings_ledger: true,
+            skills: vec![],
             timeout_secs: 60,
             shell_timeout_secs: 120,
             shell_env_passthrough: vec![],
@@ -912,7 +1224,7 @@ mod tests {
     async fn test_agent_loop_with_tool_calls() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut mock = MockProvider::new("gpt-4o");
         mock.add_response(ChatResponse {
@@ -948,6 +1260,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Review the diff")],
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -956,9 +1269,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_agent_loop_records_event_log() {
+        use crate::eventlog::{EventLog, RunEvent};
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+        let event_log = EventLog::new(&root, "test");
+
+        let mut mock = MockProvider::new("gpt-4o");
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, "Checking code..."),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                name: "git_diff".into(),
+                arguments: serde_json::json!({}),
+            }]),
+        });
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, r#"{"findings": []}"#),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let contract = test_contract();
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+            event_log: Some(&event_log),
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(!result.truncated);
+
+        let content = std::fs::read_to_string(event_log.path()).unwrap();
+        let events: Vec<RunEvent> = content
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let has = |name: &str| events.iter().any(|e| event_name(e) == name);
+        assert!(has("run_start"), "missing run_start: {content}");
+        assert!(has("llm_request"), "missing llm_request: {content}");
+        assert!(has("llm_response"), "missing llm_response: {content}");
+        assert!(has("tool_call"), "missing tool_call: {content}");
+        assert!(has("tool_result"), "missing tool_result: {content}");
+        assert!(has("run_end"), "missing run_end: {content}");
+
+        // The event log can restore state from checkpoint events.
+        event_log.append(&RunEvent::Checkpoint {
+            checkpoint_id: "c-test".into(),
+            messages: vec![Message::new(Role::User, "restored")],
+            truncated: false,
+        });
+        assert_eq!(
+            event_log.last_checkpoint(),
+            Some(vec![Message::new(Role::User, "restored")])
+        );
+    }
+
+    /// Tag name of a `RunEvent` (mirrors the serde `type` field).
+    fn event_name(e: &RunEvent) -> &'static str {
+        match e {
+            RunEvent::RunStart { .. } => "run_start",
+            RunEvent::LlmRequest { .. } => "llm_request",
+            RunEvent::LlmResponse { .. } => "llm_response",
+            RunEvent::ToolCall { .. } => "tool_call",
+            RunEvent::ToolResult { .. } => "tool_result",
+            RunEvent::ContextTruncated { .. } => "context_truncated",
+            RunEvent::Checkpoint { .. } => "checkpoint",
+            RunEvent::RunEnd { .. } => "run_end",
+        }
+    }
+
+    #[tokio::test]
     async fn test_agent_loop_halts_on_timeout() {
         let tmp = TempDir::new().unwrap();
-        let tools = default_tools(tmp.path().to_path_buf(), &[], 120, &[]);
+        let tools = default_tools(tmp.path().to_path_buf(), &[], 120, &[], None);
 
         let mut mock = MockProvider::new("slow-model");
         mock.add_slow_response(Duration::from_secs(10));
@@ -973,6 +1374,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Hi")],
             workspace_root: tmp.path().to_path_buf(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await;
@@ -988,7 +1390,7 @@ mod tests {
     #[tokio::test]
     async fn test_agent_loop_truncates_on_budget_exceeded() {
         let (_tmp, root) = setup_agent_env();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut contract = test_contract();
         contract.token_budget = 10000;
@@ -1029,6 +1431,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, huge_content)],
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1059,7 +1462,7 @@ mod tests {
     #[tokio::test]
     async fn test_agent_loop_breaks_when_cannot_truncate() {
         let (_tmp, root) = setup_agent_env();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut contract = test_contract();
         contract.token_budget = 1;
@@ -1087,12 +1490,131 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Review")],
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
         assert!(
             result.truncated,
             "Expected truncated=true when context cannot be reduced further"
+        );
+    }
+
+    /// Reactive compaction: the heuristic counter thinks the context fits
+    /// (under 80%), but the provider rejects the request as over its context
+    /// window. The loop must truncate more aggressively (50% of budget) and
+    /// retry the same request once.
+    #[tokio::test]
+    async fn test_agent_loop_reactive_compact_on_context_overflow() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+
+        // 40000 chars ≈ 10000 tokens by the mock heuristic: under the 80%
+        // threshold (12000) of a 15000 budget, so the proactive check stays
+        // quiet — the provider error below is what triggers compaction.
+        let mut contract = test_contract();
+        contract.token_budget = 15000;
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_error_response(ProviderError::BadRequest(
+            "This model's maximum context length is 8192 tokens. \
+             However, your request has 10000 tokens."
+                .into(),
+        ));
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "test", "severity": "warning", "message": "recovered after compaction", "evidence": "e"}]}"#),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "x".repeat(40000))],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+            event_log: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(
+            !result.truncated,
+            "reactive compaction must recover the run, got truncated=true"
+        );
+        assert_eq!(
+            result.findings[0].message, "recovered after compaction",
+            "the retried request's findings must be extracted"
+        );
+        // The compaction dropped messages and archived them.
+        let archive_dir = root.join(".clausura").join("archives");
+        let mut found = false;
+        if let Ok(entries) = std::fs::read_dir(&archive_dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("context-dump-test-")
+                {
+                    found = true;
+                }
+            }
+        }
+        assert!(
+            found,
+            "dropped messages must be archived during reactive compaction"
+        );
+    }
+
+    /// Reactive compaction that cannot reduce the context further must not
+    /// retry forever: the run stops marked truncated after the failed
+    /// truncation (no second LLM call is spent).
+    #[tokio::test]
+    async fn test_agent_loop_reactive_compact_gives_up_when_unable_to_reduce() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+
+        let mut contract = test_contract();
+        contract.token_budget = 1;
+
+        let mut mock = MockProvider::new("test-model");
+        mock.add_error_response(ProviderError::BadRequest(
+            "This model's maximum context length is 10 tokens.".into(),
+        ));
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, r#"{"findings": []}"#),
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                total_tokens: 10,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+            event_log: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(
+            result.truncated,
+            "unable to reduce → run must be marked truncated"
+        );
+        assert_eq!(
+            result.usage.total_tokens, 0,
+            "no retry LLM call may be spent after a failed reactive compaction"
         );
     }
 
@@ -1104,7 +1626,7 @@ mod tests {
     #[tokio::test]
     async fn test_agent_loop_ignores_cumulative_tokens_for_context_budget() {
         let (_tmp, root) = setup_agent_env();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut contract = test_contract();
         contract.token_budget = 100000;
@@ -1146,6 +1668,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Review")],
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1164,7 +1687,7 @@ mod tests {
     #[tokio::test]
     async fn test_agent_loop_breaks_on_max_total_tokens() {
         let (_tmp, root) = setup_agent_env();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut contract = test_contract();
         contract.token_budget = 100000;
@@ -1197,6 +1720,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Review")],
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1210,7 +1734,7 @@ mod tests {
     #[tokio::test]
     async fn test_hint_message_injected_after_truncation() {
         let (_tmp, root) = setup_agent_env();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut contract = test_contract();
         contract.token_budget = 10000;
@@ -1251,6 +1775,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, huge_content)],
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1382,7 +1907,7 @@ mod tests {
     async fn test_agent_loop_auto_compact_injects_summary() {
         let (tmp, contract, tool_call, initial) = auto_compact_setup(10000, None, true, 3);
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut mock = MockProvider::new("test-model");
         mock.add_response(tool_call_response(&tool_call));
@@ -1398,6 +1923,7 @@ mod tests {
             initial_messages: initial,
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1448,7 +1974,7 @@ mod tests {
     async fn test_agent_loop_auto_compact_falls_back_on_llm_error() {
         let (tmp, contract, tool_call, initial) = auto_compact_setup(10000, None, true, 3);
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut mock = MockProvider::new("test-model");
         mock.add_response(tool_call_response(&tool_call));
@@ -1462,6 +1988,7 @@ mod tests {
             initial_messages: initial,
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1493,7 +2020,7 @@ mod tests {
         // on: the queued summary response must never be consumed.
         let (tmp, contract, tool_call, initial) = auto_compact_setup(10000, None, true, 0);
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut mock = MockProvider::new("test-model");
         mock.add_response(tool_call_response(&tool_call));
@@ -1507,6 +2034,7 @@ mod tests {
             initial_messages: initial,
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1531,7 +2059,7 @@ mod tests {
         // never consumed.
         let (tmp, contract, tool_call, initial) = auto_compact_setup(10000, Some(500), true, 3);
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut mock = MockProvider::new("test-model");
         mock.add_response(tool_call_response(&tool_call));
@@ -1545,6 +2073,7 @@ mod tests {
             initial_messages: initial,
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1571,7 +2100,7 @@ mod tests {
         // context back over the threshold and mark the run incomplete.
         let (tmp, contract, tool_call, initial) = auto_compact_setup(10000, None, true, 3);
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         // ~1500 tokens by the mock heuristic — far above the summary budget,
         // which is the headroom under the 80% truncation threshold.
@@ -1587,6 +2116,7 @@ mod tests {
             initial_messages: initial,
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1702,6 +2232,283 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Repeat-call reminder
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_repeat_key_is_order_insensitive() {
+        let a = serde_json::json!({"base": "main", "staged": false});
+        let b = serde_json::json!({"staged": false, "base": "main"});
+        assert_eq!(repeat_key("git_diff", &a), repeat_key("git_diff", &b));
+        // Different arguments are different keys.
+        assert_ne!(
+            repeat_key("git_diff", &serde_json::json!({"base": "main"})),
+            repeat_key("git_diff", &serde_json::json!({"staged": true}))
+        );
+        // Different tools are different keys.
+        assert_ne!(
+            repeat_key("git_diff", &serde_json::json!({})),
+            repeat_key("grep", &serde_json::json!({}))
+        );
+    }
+
+    #[test]
+    fn test_repeat_reminder_text_escalates() {
+        assert!(repeat_reminder_text("git_diff", 3).contains("3 times"));
+        assert!(repeat_reminder_text("git_diff", 5).contains("looks like a loop"));
+        assert!(repeat_reminder_text("git_diff", 8).contains("stuck in a loop"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_injects_repeat_call_reminder() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+
+        let contract = test_contract();
+
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            name: "git_diff".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let mut mock = MockProvider::new("test-model");
+        // Three identical tool-call iterations — the third crosses the
+        // threshold and must produce an advisory user message.
+        for _ in 0..3 {
+            mock.add_response(ChatResponse {
+                message: Message::new(Role::Assistant, "Running tool..."),
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 5,
+                    total_tokens: 10,
+                },
+                finish_reason: FinishReason::ToolCalls,
+                tool_calls: Some(vec![tool_call.clone()]),
+            });
+        }
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, r#"{"findings": []}"#),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+            event_log: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(!result.truncated);
+
+        let reminder = result
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("Repeat-call reminder"))
+            .expect("a repeat-call reminder must be injected");
+        assert!(
+            reminder.content.contains("3 times"),
+            "expected the first-threshold reminder, got: {}",
+            reminder.content
+        );
+        assert!(
+            reminder.content.contains("`git_diff`"),
+            "reminder must name the tool, got: {}",
+            reminder.content
+        );
+
+        // The reminder must follow the tool results (valid API pairing).
+        let tool_msgs = result
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .count();
+        assert_eq!(tool_msgs, 3, "all three tool calls must have results");
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_no_reminder_below_threshold() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+
+        let contract = test_contract();
+
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            name: "git_diff".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let mut mock = MockProvider::new("test-model");
+        // Two identical calls — below the threshold, no reminder.
+        for _ in 0..2 {
+            mock.add_response(ChatResponse {
+                message: Message::new(Role::Assistant, "Running tool..."),
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 5,
+                    total_tokens: 10,
+                },
+                finish_reason: FinishReason::ToolCalls,
+                tool_calls: Some(vec![tool_call.clone()]),
+            });
+        }
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, r#"{"findings": []}"#),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+            event_log: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(!result.truncated);
+        assert!(
+            !result
+                .messages
+                .iter()
+                .any(|m| m.content.contains("Repeat-call reminder")),
+            "no reminder may be injected below the threshold"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Findings-schema retry
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_agent_loop_retries_on_malformed_findings() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+
+        let contract = test_contract();
+
+        let mut mock = MockProvider::new("test-model");
+        // First Stop answer is not parseable JSON.
+        mock.add_response(ChatResponse {
+            message: Message::new(
+                Role::Assistant,
+                "I found nothing worth reporting.".to_string(),
+            ),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+        // The corrective prompt yields a valid answer on the second attempt.
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, r#"{"findings": [{"id": "00000000-0000-0000-0000-000000000000", "rule_id": "r", "severity": "error", "message": "fixed", "evidence": "e"}]}"#),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                total_tokens: 30,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+            event_log: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(
+            !result.truncated,
+            "a corrected retry must not mark the run truncated"
+        );
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].message, "fixed");
+
+        let retry_prompt = result
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("could not be parsed"))
+            .expect("the corrective retry prompt must be in the conversation");
+        assert!(retry_prompt.content.contains("findings"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_gives_up_after_malformed_findings_retries() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+
+        let contract = test_contract();
+
+        let mut mock = MockProvider::new("test-model");
+        // Three malformed Stop answers exhaust the bounded retry budget.
+        for i in 0..3 {
+            mock.add_response(ChatResponse {
+                message: Message::new(Role::Assistant, format!("still not json {i}")),
+                usage: Usage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    total_tokens: 30,
+                },
+                finish_reason: FinishReason::Stop,
+                tool_calls: None,
+            });
+        }
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+            event_log: None,
+        };
+
+        let err = run_agent_loop(config).await.unwrap_err();
+        assert!(
+            matches!(err, ProviderError::MalformedFindings(_)),
+            "expected MalformedFindings after retries exhausted, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_findings_retry_prompt_names_schema() {
+        let prompt = findings_retry_prompt("1 of 1 finding(s) failed: bad");
+        assert!(prompt.contains("could not be parsed"));
+        assert!(prompt.contains("1 of 1 finding(s) failed: bad"));
+        assert!(prompt.contains("rule_id"));
+        assert!(prompt.contains("severity"));
+        assert!(prompt.contains("location"));
+    }
+
+    // -----------------------------------------------------------------
     // Findings ledger
     // -----------------------------------------------------------------
 
@@ -1722,7 +2529,7 @@ mod tests {
         // Stop response only reports later findings. The ledger must preserve
         // the early ones and merge them back into the final result.
         let (_tmp, root) = setup_agent_env();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut contract = test_contract();
         contract.findings_ledger = true;
@@ -1775,6 +2582,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Review the diff")],
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1806,7 +2614,7 @@ mod tests {
         // findings_ledger = false: interim findings are not persisted and the
         // final result contains only the Stop response findings.
         let (_tmp, root) = setup_agent_env();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut contract = test_contract();
         contract.findings_ledger = false;
@@ -1855,6 +2663,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Review the diff")],
             workspace_root: root.clone(),
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1889,7 +2698,7 @@ mod tests {
     async fn test_agent_loop_propagates_tool_call_id() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut mock = MockProvider::new("gpt-4o");
         mock.add_response(ChatResponse {
@@ -1928,6 +2737,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Run git diff")],
             workspace_root: root,
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await.unwrap();
@@ -1972,7 +2782,7 @@ mod tests {
     async fn test_agent_loop_recovers_malformed_final_json() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut mock = MockProvider::new("gpt-4o");
         // Final answer that is prose, not findings JSON.
@@ -2009,6 +2819,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Review the diff")],
             workspace_root: root,
             snapshot_mgr: None,
+            event_log: None,
         };
         let result = run_agent_loop(config).await.unwrap();
         assert!(!result.truncated);
@@ -2016,11 +2827,8 @@ mod tests {
         assert_eq!(result.findings[0].rule_id, "test");
         assert!(result.findings[0].message.contains("recovered"));
         assert!(
-            result
-                .messages
-                .iter()
-                .any(|m| m.role == Role::User
-                    && m.content.contains("did not contain valid findings")),
+            result.messages.iter().any(|m| m.role == Role::User
+                && m.content.contains("could not be parsed as findings JSON")),
             "the corrective exchange must be part of the transcript"
         );
     }
@@ -2029,7 +2837,7 @@ mod tests {
     async fn test_agent_loop_malformed_json_retries_exhausted() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut mock = MockProvider::new("gpt-4o");
         // Main answer + 2 corrective attempts, all prose. The third call
@@ -2055,6 +2863,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Review the diff")],
             workspace_root: root,
             snapshot_mgr: None,
+            event_log: None,
         };
         let result = run_agent_loop(config).await;
         assert!(
@@ -2067,7 +2876,7 @@ mod tests {
     async fn test_agent_loop_incomplete_path_recovers_findings() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
         let mut mock = MockProvider::new("gpt-4o");
         // Two tool-call turns that never reach a clean Stop, so the loop
@@ -2109,6 +2918,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Review the diff")],
             workspace_root: root,
             snapshot_mgr: None,
+            event_log: None,
         };
         let result = run_agent_loop(config).await.unwrap();
         assert!(
@@ -2294,22 +3104,28 @@ mod tests {
     async fn test_agent_loop_errors_on_schema_mismatch_instead_of_empty_findings() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        let tools = default_tools(root.clone(), &[], 120, &[]);
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
 
+        // The schema-mismatched answer is retried with a corrective prompt
+        // (bounded), so feed the retries equally malformed answers — after
+        // the retry budget is exhausted the run must still error, never
+        // silently succeed with 0 findings.
         let mut mock = MockProvider::new("gpt-4o");
-        mock.add_response(ChatResponse {
-            message: Message::new(
-                Role::Assistant,
-                r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t", "description": "d"}]}"#.to_string(),
-            ),
-            usage: Usage {
-                input_tokens: 10,
-                output_tokens: 5,
-                total_tokens: 15,
-            },
-            finish_reason: FinishReason::Stop,
-            tool_calls: None,
-        });
+        for _ in 0..3 {
+            mock.add_response(ChatResponse {
+                message: Message::new(
+                    Role::Assistant,
+                    r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t", "description": "d"}]}"#.to_string(),
+                ),
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                },
+                finish_reason: FinishReason::Stop,
+                tool_calls: None,
+            });
+        }
 
         let contract = test_contract();
         let config = AgentConfig {
@@ -2319,6 +3135,7 @@ mod tests {
             initial_messages: vec![Message::new(Role::User, "Review the diff")],
             workspace_root: root,
             snapshot_mgr: None,
+            event_log: None,
         };
 
         let result = run_agent_loop(config).await;

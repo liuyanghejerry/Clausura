@@ -112,36 +112,36 @@ description: 安全代码审查，检查 SQL 注入、XSS、硬编码密钥
 ```
 
 Clausura 读取时：
-- 如果有 frontmatter（`---` 包裹），剥离后只取 body 作为 prompt 内容
-- 如果没有 frontmatter，整个文件即为 prompt 内容
-- 多个 skill 按声明顺序拼接，各自标明来源
+- 如果有 frontmatter（`---` 包裹），剥离后取 body 作为 skill 正文，`name`/`description` 进入目录
+- 如果没有 frontmatter，整个文件即为 skill 正文，名称回退为引用 basename、描述回退为正文首行
+- 多个 skill 各自独立，按需加载
 
-## 注入格式
+## 注入格式（渐进式披露）
 
-多个 skill 的 prompt 内容合并后注入到 system prompt，格式如下：
+只有 skill 目录（name + description）注入到 system prompt，正文不注入：
 
 ```
-[Skill: community/security-review]
-<skill 内容>
+Available review skills:
+Before reporting findings, load every skill relevant to the task with
+the `read_skill` tool (by name) and apply its instructions.
 
-[Skill: team/vue-best-practices]
-<skill 内容>
-
----
+- security-review — 安全代码审查，检查 SQL 注入、XSS、硬编码密钥
+- vue-best-practices — Vue 最佳实践
 
 <用户 prompt_template>
 ```
 
-当 `prompt_template` 为空或为默认值 `{{task_description}}` 时，用户模板段省略。
+agent 通过 `read_skill` 工具按需加载完整正文，省下 token 预算用于审查本身。当 `prompt_template` 为空或为默认值 `{{task_description}}` 时，用户模板段省略。
 
 ## 实现总结
 
 | 模块 | 改动 |
 |------|------|
-| `skills.rs` | 新增模块：`resolve_skill()` 三级解析（本地→workspace→命名引用）、`strip_frontmatter()` YAML frontmatter 剥离、`merge_prompts()` 多 skill 拼接 |
-| `config.rs` | `YamlTaskConfig` 加 `skill_prompts: Vec<String>` 字段；`resolve_config()` 在加载时解析所有 skill 引用并合并到 `prompt_template` |
-| `types.rs` | 无需改动 — skill 内容直接合并到现有的 `prompt_template` 字段 |
-| `agent.rs` | 无需改动 — system prompt 构建逻辑不变 |
+| `skills.rs` | 新增 `Skill` 结构（name/description/body）、`resolve_skills()` 解析全部引用并读取 frontmatter 元数据、`build_skill_catalog()` 生成目录；保留 `resolve_skill()` 三级解析（本地→workspace→命名引用）与 `strip_frontmatter()` |
+| `config.rs` | `YamlTaskConfig` 加 `skill_prompts: Vec<String>` 字段；加载时解析为 `Vec<Skill>` 存入 `TaskContract.skills`，目录合并进 `prompt_template` |
+| `types.rs` | `TaskContract` 加 `skills: Vec<Skill>` 字段 |
+| `tools.rs` | 新增 `SkillTool`（`read_skill`）：按 name 返回正文，无文件系统访问（内容在配置加载时已解析） |
+| `executor.rs` | `skills` 非空时注册 `read_skill` 工具 |
 
 ### 关键实现细节
 
@@ -156,10 +156,9 @@ Clausura 读取时：
 - 提取 body 部分并 `trim_start`
 - 无 frontmatter 或格式不正确时返回原内容（不报错，容错处理）
 
-**`merge_prompts(skill_contents, template)`** — 合并格式：
-- 每个 skill 前加 `[Skill: <name>]` 头
-- skill 之间以 `\n\n---\n\n` 分隔
-- 用户 `prompt_template` 追加在末尾（仅当非空且非 `{{task_description}}` 默认值时）
+**`build_skill_catalog(skills)`** — 目录格式：
+- 每条 `- <name> — <description>`
+- 附带 `read_skill` 使用指引
 
 ## 非目标
 

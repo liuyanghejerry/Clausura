@@ -12,6 +12,24 @@ Clausura is a platform-agnostic agent CLI tool built for CI/CD pipelines. It run
 
 **Key philosophy: closed-loop execution with deterministic gating.** The LLM finds issues. The rule engine decides if they matter. Your pipeline gets a binary answer.
 
+## Clausura vs. generic agent harnesses
+
+General-purpose agent harnesses (DeepSeek Harness, Claude Code, Codex and similar) optimize for open-ended interactive work: flexible plugin stacks, long-lived sessions, sub-agent orchestration, and human-in-the-loop approvals. They deliberately leave verdicts, structured output and resource bounds to the caller — their "success" means "the agent stopped", not "the task is done".
+
+Clausura occupies the other side of the same problem and is deliberately *not* a general harness:
+
+| | Generic agent harness | Clausura |
+|---|---|---|
+| Success semantics | last turn ended cleanly | gating rules evaluated over structured findings |
+| Verdict | none (bare text output) | exit code 0/1/2/3 + SARIF v2.1.0 |
+| Run bounds | unbounded (waits for quiescence) | `max_iterations`, `timeout_secs`, `token_budget`, `max_total_tokens` |
+| Incomplete run | silent partial result | fail-closed by default (`on_incomplete: fail`) |
+| Extensibility | plugin framework (everything swappable) | skills + MCP tools + preflight checks; static single binary |
+| Deployment | runtime + plugins to install | one static binary, zero runtime dependencies |
+| Audit trail | session event log (append-only) | append-only run event log + findings ledger + context archives |
+
+If you are building an interactive coding agent, use a generic harness. If you need a *deterministic gate in CI* — an agent that must finish within bounds and produce a pass/fail answer a pipeline can trust — that is what Clausura is for.
+
 **Use cases**
 
 - **Code review gating** -- flag violations in pull requests before merge
@@ -176,6 +194,8 @@ clausura run --dry-run  # show the execution plan
 
 Clausura 1.2.0+ can reuse community skill files (Markdown) as review prompts. Skills answer "what and how to review", while gating rules answer "how many findings is too many" — the two are cleanly separated.
 
+Skills use **progressive disclosure**: only a catalog (name + one-line description per skill) is inlined into the system prompt. The agent loads a skill's full body on demand via the `read_skill` tool, which saves token budget for the review itself instead of spending it on instructions up front.
+
 ### Skill file format
 
 A skill is a Markdown file, optionally with YAML frontmatter:
@@ -194,7 +214,7 @@ description: 检查 SQL 注入、XSS、硬编码密钥
 - severity: `error`
 ```
 
-The frontmatter is stripped automatically; only the Markdown body is injected into the agent's system prompt.
+The frontmatter is stripped from the body; `name` and `description` feed the catalog. Without frontmatter, the name falls back to the reference's basename and the description to the first body line.
 
 ### Referencing skills
 
@@ -566,6 +586,10 @@ With `auto_compact: true`, the dropped messages are instead **summarized with a 
 - Summaries are sized to the headroom the retained context leaves under the truncation threshold (capped at 10% of `token_budget`); oversized output is trimmed. A compacted context always stays within budget, so a successful compaction can never push the run into "incomplete".
 - `max_compactions` bounds the number of summary calls per run (default 3) to prevent compaction loops on very long tasks.
 
+### Reactive compaction
+
+Proactive truncation relies on a token-count heuristic, which underestimates code-heavy contexts. When a provider **rejects a request as over its context window** (HTTP 400 with a context-length error), Clausura compacts reactively: it truncates to 50% of the budget (archiving the dropped messages, with auto-compact if enabled) and **retries the same request once**. A second overflow after compaction marks the run incomplete instead of retrying forever.
+
 ### Findings ledger (disk-backed memory)
 
 Compaction is lossy by design, so Clausura also keeps a **lossless, deterministic memory** on disk: whenever the agent emits findings in a response, they are appended to `{workspace}/.clausura/archives/findings-ledger-{task_id}.jsonl` (one JSON object per line). When the run finishes, the final findings are **merged with the ledger** — the final response wins on conflicts, and findings from iterations that were truncated out of context are appended back. No extra LLM calls are involved; the merge is plain deduplication keyed on `rule_id` + location + message. Disable with `findings_ledger: false` (env `CLAUSURA_FINDINGS_LEDGER=false`).
@@ -575,6 +599,10 @@ On successful completion (exit code 0), archive files are automatically cleaned 
 ### Incomplete runs fail closed
 
 If the agent loop ends without a clean stop — the context could not be truncated further, the model hit a length limit, the `max_total_tokens` cap was reached, or `max_iterations` was exhausted — the extracted findings may be partial. By default (`on_incomplete: fail`) Clausura fails closed: the run exits with code 2 and a clear error message, so an incomplete review can never silently pass a `max_findings: 0` gate. With `on_incomplete: pass`, the previous behavior is kept (gating rules evaluate the partial findings), but a warning is logged and the SARIF output is annotated with `"properties": {"incomplete": true}` on the run.
+
+### Findings schema retries
+
+A Stop response whose findings JSON fails to parse no longer fails the run immediately. Clausura sends the parse error plus the expected schema back to the model as a corrective prompt and gives it up to **2 retries**; a persistently malformed final answer still errors (`MalformedFindings`, exit 2).
 
 ### Deterministic rule engine
 
@@ -595,7 +623,7 @@ Each LLM request has its own per-request timeout (default 120s), independent of 
 
 ### Tool sandboxing
 
-Five built-in tools:
+Five built-in tools plus on-demand skill loading:
 
 | Tool          | Description                                      | Restrictions                           |
 |---------------|--------------------------------------------------|----------------------------------------|
@@ -604,6 +632,7 @@ Five built-in tools:
 | `grep`        | Search text patterns across files with literal or regex mode, extension filtering, and binary-skip | Auto-excludes `.git`, `target`, `.clausura`, `node_modules` |
 | `git_diff`    | Run `git diff` with optional base ref or staged  | Operates inside workspace only         |
 | `shell_exec`  | Execute an allowed command (argv form, no shell) | Restricted to `tool_allowlist` argv prefixes; dangerous flags denied; scrubbed env |
+| `read_skill`  | Load a configured review skill's full body by name (progressive disclosure) | Only serves skills resolved from `skill_prompts` at config load; no filesystem access |
 
 The `shell_exec` tool is locked by default (empty allowlist = no commands). Explicitly list allowed commands to enable it. It takes an `argv` array (e.g. `{"argv": ["git", "status"]}`) and executes `argv[0]` directly **without a shell** — shell metacharacters like `;`, `|`, `$()` or `>` are passed through as literal arguments and have no effect, so they cannot be used to bypass the allowlist. Commands run with `current_dir` set to the workspace root, but allowed commands can access paths outside the workspace via arguments.
 
@@ -615,15 +644,19 @@ The `shell_exec` tool is locked by default (empty allowlist = no commands). Expl
 
 **Per-command timeout.** Each command is killed after `shell_timeout_secs` (default 120; override with `--shell-timeout` or `CLAUSURA_SHELL_TIMEOUT`) and the tool returns a `Command timed out after Ns and was killed` result.
 
-Tool outputs are truncated at 32 KB or 1000 lines (whichever comes first) to stay within token budgets; a `[output truncated ...]` marker is appended when this happens — narrow the query or use `read_file`'s `offset`/`limit` to page through large outputs.
+Tool outputs are truncated at 32 KB or 1000 lines (whichever comes first). When a spill store is attached (always, in `clausura run`), the *full* output is first written to `{workspace}/.clausura/archives/tool-output-{task_id}-{seq}.txt`, and the truncated result carries a locator hint — the agent can page through the rest with `read_file`'s `offset`/`limit` instead of losing it. Without truncation, a `[output truncated ...]` marker is still appended — narrow the query or use `read_file`'s `offset`/`limit` to page through large outputs.
+
+The agent loop also detects **repeat tool calls** (same tool, same arguments — argument order normalized): at 3/5/8 identical consecutive invocations it injects an escalating advisory reminder, so the model breaks out of loops before `max_iterations` expires.
+
+### Run event log (append-only)
+
+Every run writes an append-only JSON-lines event log at `{workspace}/.clausura/archives/run-{task_id}.events.jsonl`: the full LLM request/response at each step, every tool call and result, context-truncation events (with archive paths and compaction summaries), and checkpoints carrying the complete message state. Failed CI runs can be audited and partially replayed from this log alone; successful runs clean it up with the other archives.
 
 ### Memory snapshots (SQLite checkpoints)
 
-On every run, the agent's message history is serialized (MessagePack) and saved to `~/.clausura/checkpoints.db`. You can resume a truncated or interrupted run with `--resume`. Snapshots include a thread ID, version number, and truncation flag.
+On every run, the agent's message history is serialized (MessagePack) and saved to `~/.clausura/checkpoints.db`. You can resume a truncated or interrupted run with `--resume`. Snapshots include a thread ID, version number, and truncation flag. The same state is also recorded as a `checkpoint` event in the workspace's append-only run event log, so `--resume` **falls back to the event log** when the SQLite store is unavailable — e.g. in ephemeral CI containers without a persistent home/volume, where checkpoints previously did not survive between runs.
 
-Note that checkpoints live under the user's home directory (`~/.clausura/`), not the workspace. In ephemeral CI containers without a persistent home/volume, checkpoints do not survive between runs, so `--resume` has nothing to restore from.
-
-Use `clausura snapshot list` and `clausura snapshot show` to inspect saved state.
+Use `clausura snapshot list` and `clausura snapshot show` to inspect saved state (SQLite store only).
 
 ### SARIF output
 

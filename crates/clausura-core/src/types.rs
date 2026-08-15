@@ -407,6 +407,11 @@ pub struct TaskContract {
     /// true; costs no LLM calls and is deterministic.
     #[serde(default = "default_findings_ledger")]
     pub findings_ledger: bool,
+    /// Resolved review skills for progressive disclosure. Only a catalog
+    /// (name + description) is inlined in the system prompt; full bodies are
+    /// served on demand by the `read_skill` tool.
+    #[serde(default)]
+    pub skills: Vec<crate::skills::Skill>,
     pub timeout_secs: u64,
     #[serde(default = "default_shell_timeout_secs")]
     pub shell_timeout_secs: u64,
@@ -761,6 +766,7 @@ mod tests {
             auto_compact: false,
             max_compactions: 3,
             findings_ledger: true,
+            skills: vec![],
             timeout_secs: 300,
             shell_timeout_secs: 120,
             shell_env_passthrough: vec![],

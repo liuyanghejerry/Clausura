@@ -1,6 +1,7 @@
 use crate::agent::{run_agent_loop, AgentConfig};
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
+use crate::eventlog::{EventLog, RunEvent};
 use crate::provider::create_provider;
 use crate::rules::RuleEngine;
 use crate::sarif::SarifFormatter;
@@ -47,7 +48,13 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         &config.task.tool_allowlist,
         config.task.shell_timeout_secs,
         &config.task.shell_env_passthrough,
+        Some(&task_id),
     );
+
+    // Progressive skill disclosure: bodies served by read_skill on demand.
+    if !config.task.skills.is_empty() {
+        tools.register(crate::tools::SkillTool::new(config.task.skills.clone()));
+    }
 
     // Start MCP servers and register their tools.
     // Kept alive in `_mcp_manager` for the duration of this task;
@@ -123,14 +130,29 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
     };
     let snapshot_mgr = SnapshotManager::new(checkpoint_store);
 
+    // Append-only run event log: audit trail + checkpoint fallback for
+    // resume in ephemeral CI environments where ~/.clausura does not survive.
+    let event_log = EventLog::new(&config.workspace, &task_id);
+
     let mut initial_messages = if config.resume {
         match snapshot_mgr.restore_snapshot(&task_id, true) {
             Ok(Some(snapshot)) => snapshot.messages,
             _ => {
-                vec![Message::new(
-                    Role::User,
-                    config.task.prompt_template.clone(),
-                )]
+                // SQLite store empty or unavailable — fall back to the last
+                // checkpoint event recorded in the workspace event log.
+                let from_event_log = event_log.last_checkpoint().map(|mut messages| {
+                    messages.push(Message::new(
+                        Role::User,
+                        "You were interrupted. Continue from where you left off.".to_string(),
+                    ));
+                    messages
+                });
+                from_event_log.unwrap_or_else(|| {
+                    vec![Message::new(
+                        Role::User,
+                        config.task.prompt_template.clone(),
+                    )]
+                })
             }
         }
     } else {
@@ -157,6 +179,7 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         initial_messages,
         workspace_root: config.workspace.clone(),
         snapshot_mgr: Some(&snapshot_mgr),
+        event_log: Some(&event_log),
     };
 
     let agent_result = match run_agent_loop(agent_config).await {
@@ -190,6 +213,16 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
     let snapshot_id = snapshot_mgr
         .save_snapshot(&task_id, &agent_result.messages, agent_result.truncated)
         .ok();
+
+    // Record the final state as a checkpoint event in the run log, so
+    // `--resume` can restore from the workspace even without the SQLite store.
+    if let Some(id) = snapshot_id {
+        event_log.append(&RunEvent::Checkpoint {
+            checkpoint_id: id.to_string(),
+            messages: agent_result.messages.clone(),
+            truncated: agent_result.truncated,
+        });
+    }
 
     // Merge preflight findings (deterministic) with agent findings.
     let all_findings = [preflight_findings, agent_result.findings].concat();
@@ -288,13 +321,18 @@ pub fn cleanup_archives(workspace: &Path, task_id: &str) {
     }
     let dump_prefix = format!("context-dump-{}-{}", task_id, "");
     let ledger_prefix = format!("findings-ledger-{}", task_id);
+    let spill_prefix = format!("tool-output-{}", task_id);
+    let event_prefix = format!("run-{}", task_id);
     if let Ok(entries) = std::fs::read_dir(&archives_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             let is_dump = name_str.starts_with(&dump_prefix) && name_str.ends_with(".log");
             let is_ledger = name_str.starts_with(&ledger_prefix) && name_str.ends_with(".jsonl");
-            if is_dump || is_ledger {
+            let is_spill = name_str.starts_with(&spill_prefix) && name_str.ends_with(".txt");
+            let is_event =
+                name_str.starts_with(&event_prefix) && name_str.ends_with(".events.jsonl");
+            if is_dump || is_ledger || is_spill || is_event {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -526,12 +564,14 @@ mod tests {
 
         std::fs::write(archives_dir.join("context-dump-test-task-1.log"), "data1").unwrap();
         std::fs::write(archives_dir.join("context-dump-test-task-2.log"), "data2").unwrap();
+        std::fs::write(archives_dir.join("run-test-task.events.jsonl"), "{}").unwrap();
         std::fs::write(archives_dir.join("some-other-file.txt"), "other").unwrap();
 
         cleanup_archives(tmp.path(), "test-task");
 
         assert!(!archives_dir.join("context-dump-test-task-1.log").exists());
         assert!(!archives_dir.join("context-dump-test-task-2.log").exists());
+        assert!(!archives_dir.join("run-test-task.events.jsonl").exists());
         assert!(archives_dir.join("some-other-file.txt").exists());
         assert!(archives_dir.exists());
     }
@@ -705,7 +745,7 @@ mod tests {
     fn test_detect_lsp_tools_no_lsp_tools_returns_none() {
         // Only built-in tools (read_file, git_diff, etc.) — no LSP hint.
         let tmp = TempDir::new().unwrap();
-        let registry = default_tools(tmp.path().to_path_buf(), &[], 120, &[]);
+        let registry = default_tools(tmp.path().to_path_buf(), &[], 120, &[], None);
         let hint = detect_lsp_tools(&registry);
         assert!(hint.is_none(), "no LSP tools configured → no hint");
     }
