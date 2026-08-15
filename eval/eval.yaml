@@ -160,3 +160,7 @@ scenarios:
         config_overrides:
           task:
             auto_compact: true
+      - name: big-budget
+        config_overrides:
+          task:
+            token_budget: 60000

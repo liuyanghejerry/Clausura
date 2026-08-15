@@ -1129,10 +1129,11 @@ fn fix_finding_uuid(el: &mut serde_json::Value) {
     }
 }
 
-/// Promote a `description`/`detail` field to `message` when `message` is
-/// missing or not a string. Several models emit these natively in their
-/// agentic output schema; failing the whole batch over the field name would
-/// burn a corrective recovery call for a purely mechanical mismatch.
+/// Promote a `description`/`detail`/`reason`/`note` field to `message` when
+/// `message` is missing or not a string. Several models emit these natively
+/// in their agentic output schema; failing the whole batch over the field
+/// name would burn a corrective recovery call for a purely mechanical
+/// mismatch.
 fn fix_finding_message(el: &mut serde_json::Value) {
     let Some(obj) = el.as_object_mut() else {
         return;
@@ -1141,7 +1142,7 @@ fn fix_finding_message(el: &mut serde_json::Value) {
     if has_message {
         return;
     }
-    for alias in ["description", "detail", "reason"] {
+    for alias in ["description", "detail", "reason", "note"] {
         if let Some(text) = obj.get(alias).and_then(|v| v.as_str()) {
             obj.insert(
                 "message".to_string(),
@@ -3194,6 +3195,17 @@ mod tests {
         let findings = extract_findings(content).expect("reason should be promoted");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].message, "the reason");
+    }
+
+    #[test]
+    fn test_extract_findings_promotes_note_to_message() {
+        // `note` is another observed alias (deepseek-v4-flash).
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "note": "the note", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("note should be promoted");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "the note");
     }
 
     #[test]

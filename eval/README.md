@@ -73,3 +73,16 @@ in `eval.yaml`. Workspaces are copied to a temp dir per run (with a throwaway
 Eval costs real LLM calls and is nondeterministic, so it does not run in CI by
 default. Run it locally per release/PR that changes agent behavior, and paste
 the comparison into the PR.
+
+## Committed baselines
+
+`eval/baselines/` holds canonical report snapshots per model+date. Diff any
+later run against them:
+
+```bash
+clausura eval --config eval.yaml --model <model> \
+  --baseline eval/baselines/deepseek-v4-flash-2026-08-15.json
+```
+
+Commit a new baseline when the corpus or the implementation changes
+materially, so comparisons stay anchored.
