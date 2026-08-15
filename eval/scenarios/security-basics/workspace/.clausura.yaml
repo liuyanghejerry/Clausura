@@ -14,14 +14,17 @@ task:
     - git
   gating:
     - rule: sql-injection
+      description: Block on SQL injection
       min_severity: error
       max_findings: 0
       action: fail
     - rule: hardcoded-secret
+      description: Block on hardcoded secrets
       min_severity: error
       max_findings: 0
       action: fail
     - rule: xss
+      description: Block on XSS
       min_severity: error
       max_findings: 0
       action: fail

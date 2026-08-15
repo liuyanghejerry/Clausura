@@ -5,3 +5,4 @@ target/
 .sisyphus/
 .codegraph/
 .env
+eval-results/

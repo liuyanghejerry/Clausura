@@ -17,6 +17,7 @@ task:
     - git
   gating:
     - rule: hardcoded-secret
+      description: Block on hardcoded secrets
       min_severity: error
       max_findings: 0
       action: fail

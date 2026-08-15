@@ -558,8 +558,10 @@ fn copy_dir_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Initialize a throwaway git repo in `ws` so `git_diff` has a HEAD to diff
-/// against. Best-effort: fixtures also work when git is unavailable.
+/// Initialize a throwaway git repo in `ws` so `git_diff` has a base to diff
+/// against. The first commit is empty; the fixture files land in the second,
+/// so `git_diff` with `base: HEAD~1` shows the whole fixture as the "diff".
+/// Best-effort: fixtures also work when git is unavailable.
 fn init_git_repo(ws: &Path) {
     let git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -569,6 +571,16 @@ fn init_git_repo(ws: &Path) {
             .is_ok()
     };
     if git(&["init", "-q"]) {
+        let _ = git(&[
+            "-c",
+            "user.email=eval@clausura.invalid",
+            "-c",
+            "user.name=Clausura Eval",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "empty base",
+        ]);
         let _ = git(&["add", "-A"]);
         let _ = git(&[
             "-c",
@@ -702,14 +714,17 @@ async fn run_once(
     copy_dir_tree(ws_src, &ws_copy)?;
     init_git_repo(&ws_copy);
 
-    // Materialize the merged config inside the copy.
+    // Materialize the merged config inside the copy. A null override (the
+    // default when a variant declares no config_overrides) is a no-op.
     let cfg_src = ws_src.join(&scenario.config);
     let mut merged: serde_yaml::Value = serde_yaml::from_str(
         &std::fs::read_to_string(&cfg_src)
             .map_err(|e| EvalError::Config(format!("{}: {e}", cfg_src.display())))?,
     )
     .map_err(|e| EvalError::Config(format!("{}: {e}", cfg_src.display())))?;
-    deep_merge(&mut merged, variant.config_overrides.clone());
+    if !variant.config_overrides.is_null() {
+        deep_merge(&mut merged, variant.config_overrides.clone());
+    }
     let merged_path = temp.path().join("merged-config.yaml");
     std::fs::write(
         &merged_path,
@@ -992,6 +1007,73 @@ scenarios:
         .unwrap();
         let events = read_run_events(&p);
         assert_eq!(events.len(), 2);
+    }
+
+    /// Committed eval scenarios must load: schema errors in fixture configs
+    /// should fail CI, not a live eval run. Skipped when the eval corpus is
+    /// not shipped with the crate (published tarballs).
+    #[test]
+    fn test_committed_scenario_configs_are_valid() {
+        let eval_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/eval.yaml");
+        if !eval_path.exists() {
+            return;
+        }
+        let (cfg, base) = load_eval_config(&eval_path).expect("eval.yaml must parse");
+        assert!(
+            !cfg.scenarios.is_empty(),
+            "eval.yaml must declare scenarios"
+        );
+        for s in &cfg.scenarios {
+            let ws = base.join(&s.workspace);
+            let cfg_path = ws.join(&s.config);
+            Config::load(
+                Some(&cfg_path),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ws.clone(),
+                PathBuf::from("/tmp/eval-output.sarif"),
+                false,
+                LogFormat::Json,
+            )
+            .unwrap_or_else(|e| panic!("scenario '{}' config invalid: {e}", s.name));
+            for v in s.effective_variants() {
+                if !v.config_overrides.is_null() {
+                    // Merged overrides must still parse as a full config.
+                    let mut merged: serde_yaml::Value = serde_yaml::from_str(
+                        &std::fs::read_to_string(&cfg_path).expect("scenario config readable"),
+                    )
+                    .expect("scenario config is YAML");
+                    deep_merge(&mut merged, v.config_overrides.clone());
+                    let tmp = tempfile::NamedTempFile::new().unwrap();
+                    std::fs::write(tmp.path(), serde_yaml::to_string(&merged).unwrap()).unwrap();
+                    Config::load(
+                        Some(tmp.path()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        ws.clone(),
+                        PathBuf::from("/tmp/eval-output.sarif"),
+                        false,
+                        LogFormat::Json,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "scenario '{}' variant '{}' overrides produce invalid config: {e}",
+                            s.name, v.name
+                        )
+                    });
+                }
+            }
+        }
     }
 
     #[test]

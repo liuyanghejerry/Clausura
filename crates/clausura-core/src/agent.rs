@@ -1061,6 +1061,11 @@ fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
         // to SARIF), we can safely auto-generate it server-side.
         fix_finding_uuid(el);
 
+        // `description` is a widespread alias for `message` in agent output
+        // schemas (several models emit it natively). Promote it instead of
+        // failing the whole batch and burning a corrective recovery call.
+        fix_finding_message(el);
+
         match serde_json::from_value::<Finding>(el.clone()) {
             Ok(f) => parsed.push(f),
             Err(e) => errors.push(format!("findings[{i}]: {e} (raw: {el})")),
@@ -1115,6 +1120,29 @@ fn fix_finding_uuid(el: &mut serde_json::Value) {
         None => {
             let new_id = uuid::Uuid::new_v4().to_string();
             obj.insert("id".to_string(), serde_json::Value::String(new_id));
+        }
+    }
+}
+
+/// Promote a `description`/`detail` field to `message` when `message` is
+/// missing or not a string. Several models emit these natively in their
+/// agentic output schema; failing the whole batch over the field name would
+/// burn a corrective recovery call for a purely mechanical mismatch.
+fn fix_finding_message(el: &mut serde_json::Value) {
+    let Some(obj) = el.as_object_mut() else {
+        return;
+    };
+    let has_message = obj.get("message").map(|v| v.is_string()).unwrap_or(false);
+    if has_message {
+        return;
+    }
+    for alias in ["description", "detail"] {
+        if let Some(text) = obj.get(alias).and_then(|v| v.as_str()) {
+            obj.insert(
+                "message".to_string(),
+                serde_json::Value::String(text.to_string()),
+            );
+            return;
         }
     }
 }
@@ -3032,11 +3060,13 @@ mod tests {
 
     #[test]
     fn test_extract_findings_schema_mismatch_is_error_not_silently_dropped() {
-        // Old field names (file/line/title/description) instead of the real
-        // Finding schema (id/message/evidence/location) -- this is exactly
-        // the painttyServer bug: every element fails to deserialize, and
-        // that must surface as an error, not as an empty, "successful" result.
-        let content = r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t", "description": "d", "recommendation": "r"}]}"#;
+        // Old field names (file/line/title) instead of the real Finding
+        // schema (id/message/location) and no description alias — this is
+        // exactly the painttyServer bug: every element fails to deserialize,
+        // and that must surface as an error, not as an empty, "successful"
+        // result. (Tolerant aliases: `description` promotes to `message` and
+        // `evidence` defaults, so this payload deliberately omits both.)
+        let content = r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t", "recommendation": "r"}]}"#;
         let err = extract_findings(content).unwrap_err();
         assert!(err.contains("1 of 1 finding(s) failed"), "got: {err}");
         assert!(err.contains("findings[0]"), "got: {err}");
@@ -3085,6 +3115,51 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_findings_promotes_description_to_message() {
+        // Some models emit `description` instead of `message` natively
+        // (observed with deepseek-v4-flash). The alias must be promoted
+        // without a corrective recovery call.
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "description": "the real message", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("description should be promoted");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "the real message");
+    }
+
+    #[test]
+    fn test_extract_findings_promotes_detail_to_message() {
+        // `detail` is another observed alias (deepseek-v4-flash).
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "detail": "detailed text", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("detail should be promoted");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "detailed text");
+    }
+
+    #[test]
+    fn test_extract_findings_message_wins_over_description() {
+        // When both fields exist, `message` is authoritative.
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "message": "keep me", "description": "ignore me", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("should parse");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "keep me");
+    }
+
+    #[test]
+    fn test_extract_findings_missing_message_still_errors() {
+        // Neither message nor a string description → schema error preserved.
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "description": 42, "evidence": "e"}
+        ]}"#;
+        let err = extract_findings(content).unwrap_err();
+        assert!(err.contains("1 of 1 finding(s) failed"), "got: {err}");
+    }
+
+    #[test]
     fn test_extract_findings_fixes_malformed_uuid() {
         // Agent supplied an invalid UUID (11-char group 4 instead of 12).
         // Regression test for painttyServer PR #547.
@@ -3130,7 +3205,7 @@ mod tests {
             mock.add_response(ChatResponse {
                 message: Message::new(
                     Role::Assistant,
-                    r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t", "description": "d"}]}"#.to_string(),
+                    r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t"}]}"#.to_string(),
                 ),
                 usage: Usage {
                     input_tokens: 10,
