@@ -923,7 +923,20 @@ fn search_file(
             *remaining += 1;
             continue;
         }
-        let truncated = if line.len() > 200 { &line[..200] } else { line };
+        // Truncate to at most 200 BYTES on a UTF-8 char boundary: a naive
+        // `&line[..200]` panics when byte 200 falls inside a multi-byte
+        // character (e.g. CJK lines, observed in production as
+        // "byte index 200 is not a char boundary").
+        let cut = if line.len() > 200 {
+            let mut cut = 200;
+            while !line.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            cut
+        } else {
+            line.len()
+        };
+        let truncated = &line[..cut];
         results.push(format!("{}:{}: {}", rel.display(), line_num + 1, truncated));
     }
     true
@@ -2075,6 +2088,27 @@ mod tests {
     // -----------------------------------------------------------------------
     // GrepTool tests
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_grep_truncates_multibyte_line_without_panic() {
+        let (_tmp, root) = setup_workspace();
+        // "key " (4 bytes) + 100 x '析' (3 bytes each, 300 bytes). Byte 200
+        // falls inside a multi-byte character, which used to panic with
+        // "byte index 200 is not a char boundary".
+        let line = format!("key {}", "析".repeat(100));
+        std::fs::write(root.join("zh.txt"), &line).unwrap();
+
+        let tool = GrepTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "zh.txt", "pattern": "key"}))
+            .await
+            .unwrap();
+        assert!(
+            result.starts_with("zh.txt:1: key "),
+            "expected a truncated match line, got: {result}"
+        );
+        assert!(!result.contains("panicked"));
+    }
 
     #[tokio::test]
     async fn test_grep_literal_basic() {
