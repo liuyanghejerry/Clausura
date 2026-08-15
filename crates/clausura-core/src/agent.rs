@@ -1066,6 +1066,11 @@ fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
         // failing the whole batch and burning a corrective recovery call.
         fix_finding_message(el);
 
+        // Several models emit `location` as a "file:line" string instead of
+        // the object form. Normalize it so the finding keeps its location
+        // instead of failing schema validation.
+        fix_finding_location(el);
+
         match serde_json::from_value::<Finding>(el.clone()) {
             Ok(f) => parsed.push(f),
             Err(e) => errors.push(format!("findings[{i}]: {e} (raw: {el})")),
@@ -1136,7 +1141,7 @@ fn fix_finding_message(el: &mut serde_json::Value) {
     if has_message {
         return;
     }
-    for alias in ["description", "detail"] {
+    for alias in ["description", "detail", "reason"] {
         if let Some(text) = obj.get(alias).and_then(|v| v.as_str()) {
             obj.insert(
                 "message".to_string(),
@@ -1145,6 +1150,48 @@ fn fix_finding_message(el: &mut serde_json::Value) {
             return;
         }
     }
+}
+
+/// Normalize a `location` given as a `"file:line"` string (optionally with a
+/// column: `"file:line:col"`) into the structured object form.
+fn fix_finding_location(el: &mut serde_json::Value) {
+    let Some(obj) = el.as_object_mut() else {
+        return;
+    };
+    let Some(raw) = obj.get("location").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let raw = raw.to_string();
+    // Parse the last two `:`-separated segments as line/col, the rest is the
+    // file (files may contain colons, e.g. Windows drives or URL-ish paths).
+    let (file, line, col) = match raw.rfind(':') {
+        Some(colon) => {
+            let (head, tail) = raw.split_at(colon);
+            let tail = &tail[1..];
+            match tail.parse::<u32>() {
+                Ok(n) => match head.rfind(':') {
+                    Some(c2) => {
+                        let (f, l) = head.split_at(c2);
+                        match l[1..].parse::<u32>() {
+                            Ok(line) => (f.to_string(), line, n),
+                            Err(_) => (head.to_string(), n, 0),
+                        }
+                    }
+                    None => (head.to_string(), n, 0),
+                },
+                Err(_) => (raw, 0, 0),
+            }
+        }
+        None => (raw, 0, 0),
+    };
+    let loc = serde_json::json!({
+        "file": file,
+        "line_start": line,
+        "line_end": line,
+        "column_start": col,
+        "column_end": col,
+    });
+    obj.insert("location".to_string(), loc);
 }
 
 /// Find the last top-level balanced `open`/`close` delimited block in `s`
@@ -3136,6 +3183,56 @@ mod tests {
         let findings = extract_findings(content).expect("detail should be promoted");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].message, "detailed text");
+    }
+
+    #[test]
+    fn test_extract_findings_promotes_reason_to_message() {
+        // `reason` is another observed alias (deepseek-v4-flash).
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "reason": "the reason", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("reason should be promoted");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "the reason");
+    }
+
+    #[test]
+    fn test_extract_findings_normalizes_string_location() {
+        // Models emit `location` as "file:line" strings (observed live).
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "message": "m", "evidence": "e",
+             "location": "src/login.js:15"}
+        ]}"#;
+        let findings = extract_findings(content).expect("string location should normalize");
+        let loc = findings[0].location.as_ref().expect("location kept");
+        assert_eq!(loc.file, "src/login.js");
+        assert_eq!(loc.line_start, 15);
+        assert_eq!(loc.line_end, 15);
+
+        // With column too.
+        let content2 = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "message": "m", "evidence": "e",
+             "location": "app/db.py:20:4"}
+        ]}"#;
+        let findings2 = extract_findings(content2).expect("string location with col");
+        let loc2 = findings2[0].location.as_ref().expect("location kept");
+        assert_eq!(loc2.file, "app/db.py");
+        assert_eq!(loc2.line_start, 20);
+        assert_eq!(loc2.column_start, 4);
+    }
+
+    #[test]
+    fn test_extract_findings_keeps_object_location() {
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "message": "m", "evidence": "e",
+             "location": {"file": "a.ts", "line_start": 1, "line_end": 2, "column_start": 3, "column_end": 4}}
+        ]}"#;
+        let findings = extract_findings(content).expect("object location preserved");
+        let loc = findings[0].location.as_ref().unwrap();
+        assert_eq!(loc.file, "a.ts");
+        assert_eq!(loc.line_start, 1);
+        assert_eq!(loc.line_end, 2);
+        assert_eq!(loc.column_start, 3);
     }
 
     #[test]

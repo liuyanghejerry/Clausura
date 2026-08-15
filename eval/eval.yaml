@@ -115,15 +115,15 @@ scenarios:
 
   - name: legacy-refactor
     description: >
-      A legacy Python service. Bare excepts (4), f-string SQL injection (2),
-      pickle deserialization (3), one hardcoded payment API key, and six
+      A legacy Python service. Bare excepts (5), f-string SQL injection (2),
+      pickle deserialization (3), one hardcoded payment API key, and eight
       debug prints as low-severity distractors. Tests precision under noise.
     workspace: scenarios/legacy-refactor/workspace
     config: .clausura.yaml
     ground_truth:
       - rule_id: bare-except
-        min_findings: 3
-        max_findings: 4
+        min_findings: 4
+        max_findings: 5
       - rule_id: sql-injection
         min_findings: 2
       - rule_id: unsafe-deserialization
