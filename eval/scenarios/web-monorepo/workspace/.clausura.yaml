@@ -1,0 +1,40 @@
+version: "1"
+task:
+  name: web-monorepo
+  model: gpt-4o
+  vendor: openai
+  skill_prompts:
+    - ts-review
+  token_budget: 16000
+  timeout_secs: 300
+  max_iterations: 12
+  ambiguity_policy: fail_closed
+  on_incomplete: fail
+  tool_allowlist:
+    - git
+  gating:
+    - rule: xss
+      description: Block on XSS
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: sql-injection
+      description: Block on SQL injection
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: hardcoded-secret
+      description: Block on hardcoded secrets
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: no-explicit-any
+      description: Warn on excessive any casts
+      min_severity: warning
+      max_findings: 2
+      action: warn
+    - rule: console-log
+      description: Warn on debug logging
+      min_severity: info
+      max_findings: 2
+      action: warn

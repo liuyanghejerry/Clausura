@@ -1,0 +1,40 @@
+version: "1"
+task:
+  name: rust-service
+  model: gpt-4o
+  vendor: openai
+  skill_prompts:
+    - rust-review
+  token_budget: 16000
+  timeout_secs: 300
+  max_iterations: 12
+  ambiguity_policy: fail_closed
+  on_incomplete: fail
+  tool_allowlist:
+    - git
+  gating:
+    - rule: panic-unwrap
+      description: Block on panicking unwrap/expect
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: sql-injection
+      description: Block on SQL injection
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: hardcoded-secret
+      description: Block on hardcoded secrets
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: swallowed-error
+      description: Block on silently discarded errors
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: todo-marker
+      description: Warn on leftover todo!/unimplemented!
+      min_severity: warning
+      max_findings: 0
+      action: warn

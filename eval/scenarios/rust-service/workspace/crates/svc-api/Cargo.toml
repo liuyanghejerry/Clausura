@@ -1,0 +1,8 @@
+[package]
+name = "svc-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+svc-core = { path = "../svc-core" }
+svc-store = { path = "../svc-store" }

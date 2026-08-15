@@ -1,0 +1,2 @@
+# svc-b
+Fixture service.

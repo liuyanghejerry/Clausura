@@ -62,11 +62,15 @@ fn default_runs() -> u32 {
 }
 
 /// A ground-truth expectation: at least `min_findings` findings with this
-/// rule_id must be reported.
+/// rule_id must be reported. An optional `max_findings` bounds over-reporting
+/// (precision): reporting more than that many counts as overreported —
+/// useful for sweeps with decoy values that must NOT be flagged.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GroundTruthRule {
     pub rule_id: String,
     pub min_findings: u32,
+    #[serde(default)]
+    pub max_findings: Option<u32>,
 }
 
 /// A config variant: a name plus a partial YAML object merged over the
@@ -129,6 +133,8 @@ pub struct RunMetrics {
     pub truth_matched: u32,
     /// Total ground-truth rules for this scenario.
     pub truth_total: u32,
+    /// Rules whose reported findings exceeded `max_findings` (over-reporting).
+    pub truth_overreported: u32,
     /// Findings whose rule_id has no ground-truth entry.
     pub unexpected_rule_ids: Vec<String>,
 }
@@ -207,6 +213,11 @@ pub fn metrics_from_run(
         if count >= rule.min_findings {
             m.truth_matched += 1;
         }
+        if let Some(max) = rule.max_findings {
+            if count > max {
+                m.truth_overreported += 1;
+            }
+        }
     }
     let mut unexpected: Vec<String> = report
         .findings
@@ -261,6 +272,8 @@ pub struct VariantSummary {
     pub recovery_success_rate: f64,
     /// Recall over ground-truth rules (all runs pooled).
     pub recall: f64,
+    /// Ground-truth rules over-reported across runs (findings > max_findings).
+    pub truth_overreported: u32,
     /// Unexpected rule_ids seen across runs.
     pub unexpected_rule_ids: Vec<String>,
 }
@@ -335,6 +348,7 @@ pub fn summarize_variant(runs: &[RunMetrics]) -> VariantSummary {
     } else {
         matched as f64 / total as f64
     };
+    s.truth_overreported = runs.iter().map(|m| m.truth_overreported).sum();
     let mut unexpected: Vec<String> = runs
         .iter()
         .flat_map(|m| m.unexpected_rule_ids.clone())
@@ -380,19 +394,20 @@ impl EvalReport {
             self.generated_at, self.branch, self.commit, self.model
         ));
         out.push_str(
-            "| scenario | variant | runs | success | recall | mean tokens | mean LLM calls | \
+            "| scenario | variant | runs | success | recall | over-report | mean tokens | mean LLM calls | \
              mean time (s) | compactions | spills | reminders | recovery success |\n\
-             |----------|---------|------|---------|--------|-------------|----------------|--------------|-------------|--------|-----------|-------------------|\n",
+             |----------|---------|------|---------|--------|-------------|-------------|----------------|--------------|-------------|--------|-----------|-------------------|\n",
         );
         for s in &self.scenarios {
             for v in &s.variants {
                 out.push_str(&format!(
-                    "| {} | {} | {} | {:.0}% | {:.0}% | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0}%\n",
+                    "| {} | {} | {} | {:.0}% | {:.0}% | {} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0}%\n",
                     s.name,
                     v.variant,
                     v.runs,
                     v.success_rate * 100.0,
                     v.recall * 100.0,
+                    v.truth_overreported,
                     v.mean_total_tokens,
                     v.mean_llm_requests,
                     v.mean_duration_ms / 1000.0,
@@ -428,8 +443,8 @@ pub fn compare_reports(baseline: &EvalReport, current: &EvalReport) -> String {
         baseline.commit, current.commit
     ));
     out.push_str(
-        "| scenario | variant | success | recall | mean tokens | mean LLM calls | compactions | spills | recovery success |\n\
-         |----------|---------|---------|--------|-------------|----------------|-------------|--------|------------------|\n",
+        "| scenario | variant | success | recall | over-report | mean tokens | mean LLM calls | compactions | spills | recovery success |\n\
+         |----------|---------|---------|--------|-------------|-------------|----------------|-------------|--------|------------------|\n",
     );
     for s in &current.scenarios {
         for v in &s.variants {
@@ -442,14 +457,17 @@ pub fn compare_reports(baseline: &EvalReport, current: &EvalReport) -> String {
                     let (cd, ca) = delta(v.mean_compactions, b.mean_compactions);
                     let (pd, pa) = delta(v.mean_tool_spills, b.mean_tool_spills);
                     let (yd, ya) = delta(v.recovery_success_rate, b.recovery_success_rate);
+                    let (od, oa) = delta(v.truth_overreported as f64, b.truth_overreported as f64);
                     out.push_str(&format!(
-                        "| {} | {} | {}{:+.1}pp | {}{:+.1}pp | {}{:+.0} | {}{:+.1} | {}{:+.1} | {}{:+.1} | {}{:+.1}pp\n",
+                        "| {} | {} | {}{:+.1}pp | {}{:+.1}pp | {}{:+.0} | {}{:+.0} | {}{:+.1} | {}{:+.1} | {}{:+.1} | {}{:+.1}pp\n",
                         s.name,
                         v.variant,
                         sa,
                         sd * 100.0,
                         ra,
                         rd * 100.0,
+                        oa,
+                        od,
                         ta,
                         td,
                         la,
@@ -463,7 +481,7 @@ pub fn compare_reports(baseline: &EvalReport, current: &EvalReport) -> String {
                     ));
                 }
                 None => out.push_str(&format!(
-                    "| {} | {} | — (new variant, no baseline) | | | | | | |\n",
+                    "| {} | {} | — (new variant, no baseline) | | | | | | | |\n",
                     s.name, v.variant
                 )),
             }
@@ -830,10 +848,12 @@ mod tests {
             GroundTruthRule {
                 rule_id: "sql-injection".into(),
                 min_findings: 1,
+                max_findings: None,
             },
             GroundTruthRule {
                 rule_id: "hardcoded-secret".into(),
                 min_findings: 2,
+                max_findings: Some(2),
             },
         ];
         let mut report = empty_report();
@@ -847,7 +867,18 @@ mod tests {
         assert_eq!(m.truth_matched, 2);
         assert_eq!(m.truth_total, 2);
         assert_eq!(m.recall(), 1.0);
+        assert_eq!(m.truth_overreported, 0);
         assert_eq!(m.unexpected_rule_ids, vec!["unexpected-rule"]);
+
+        // Over-reporting: 3 hardcoded-secret findings against max 2.
+        report.findings = vec![
+            finding("sql-injection"),
+            finding("hardcoded-secret"),
+            finding("hardcoded-secret"),
+            finding("hardcoded-secret"),
+        ];
+        let m3 = metrics_from_run("s", "v", 0, &report, &[], &truth);
+        assert_eq!(m3.truth_overreported, 1, "findings above max must count");
 
         report.findings = vec![finding("sql-injection"), finding("hardcoded-secret")];
         let m2 = metrics_from_run("s", "v", 0, &report, &[], &truth);
