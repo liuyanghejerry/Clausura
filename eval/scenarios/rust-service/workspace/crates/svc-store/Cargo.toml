@@ -1,0 +1,8 @@
+[package]
+name = "svc-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+svc-core = { path = "../svc-core" }
+rusqlite = { version = "0.31", features = ["bundled"] }

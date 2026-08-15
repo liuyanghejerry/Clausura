@@ -378,6 +378,15 @@ clausura snapshot show --id <UUID> [--thread <ID>]     Show a specific checkpoin
 clausura snapshot delete --thread <ID>                  Delete all checkpoints for a thread
 ```
 
+Effect-oriented evaluation:
+
+```
+clausura eval --config eval.yaml                          Run all scenarios (needs CLAUSURA_API_KEY)
+clausura eval --baseline eval-results/eval-report.json    Diff against a previous run
+```
+
+See [`eval/`](eval/) and [`docs/guide/eval.md`](docs/guide/eval.md).
+
 ## CI Integration
 
 Clausura auto-detects your CI environment using well-known environment variables. It gathers repo, PR number, commit SHA, and branch context for template rendering and SARIF output.

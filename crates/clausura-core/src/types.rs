@@ -131,6 +131,9 @@ pub struct Finding {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
+    /// Best-effort supporting evidence; not gate-critical. Several models
+    /// omit it, so it defaults to empty instead of failing schema validation.
+    #[serde(default)]
     pub evidence: String,
 }
 

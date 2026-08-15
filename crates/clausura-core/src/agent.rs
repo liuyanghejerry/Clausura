@@ -61,7 +61,7 @@ async fn recover_findings_json(
     first_err: &str,
 ) -> Result<Vec<Finding>, String> {
     let mut last_err = first_err.to_string();
-    for _ in 0..MAX_RECOVERY_RETRIES {
+    for attempt in 0..MAX_RECOVERY_RETRIES {
         if start.elapsed() > Duration::from_secs(contract.timeout_secs) {
             break;
         }
@@ -69,6 +69,12 @@ async fn recover_findings_json(
             if *running_tokens >= max_total {
                 break;
             }
+        }
+        if let Some(log) = event_log {
+            log.append(&RunEvent::FindingsRecoveryAttempt {
+                attempt: (attempt + 1) as u32,
+                error: last_err.clone(),
+            });
         }
         messages.push(Message::new(Role::User, findings_retry_prompt(&last_err)));
         let retry = match call_llm(provider, tools, messages, event_log).await {
@@ -327,6 +333,12 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                             .or_insert(1);
                         if REPEAT_REMINDER_THRESHOLDS.contains(count) {
                             repeat_reminders.push(repeat_reminder_text(&tc.name, *count));
+                            if let Some(log) = config.event_log {
+                                log.append(&RunEvent::RepeatReminder {
+                                    tool_name: tc.name.clone(),
+                                    count: *count,
+                                });
+                            }
                         }
                         match config.tools.get(&tc.name) {
                             Some(tool) => {
@@ -1049,6 +1061,16 @@ fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
         // to SARIF), we can safely auto-generate it server-side.
         fix_finding_uuid(el);
 
+        // `description` is a widespread alias for `message` in agent output
+        // schemas (several models emit it natively). Promote it instead of
+        // failing the whole batch and burning a corrective recovery call.
+        fix_finding_message(el);
+
+        // Several models emit `location` as a "file:line" string instead of
+        // the object form. Normalize it so the finding keeps its location
+        // instead of failing schema validation.
+        fix_finding_location(el);
+
         match serde_json::from_value::<Finding>(el.clone()) {
             Ok(f) => parsed.push(f),
             Err(e) => errors.push(format!("findings[{i}]: {e} (raw: {el})")),
@@ -1105,6 +1127,72 @@ fn fix_finding_uuid(el: &mut serde_json::Value) {
             obj.insert("id".to_string(), serde_json::Value::String(new_id));
         }
     }
+}
+
+/// Promote a `description`/`detail`/`reason`/`note` field to `message` when
+/// `message` is missing or not a string. Several models emit these natively
+/// in their agentic output schema; failing the whole batch over the field
+/// name would burn a corrective recovery call for a purely mechanical
+/// mismatch.
+fn fix_finding_message(el: &mut serde_json::Value) {
+    let Some(obj) = el.as_object_mut() else {
+        return;
+    };
+    let has_message = obj.get("message").map(|v| v.is_string()).unwrap_or(false);
+    if has_message {
+        return;
+    }
+    for alias in ["description", "detail", "reason", "note"] {
+        if let Some(text) = obj.get(alias).and_then(|v| v.as_str()) {
+            obj.insert(
+                "message".to_string(),
+                serde_json::Value::String(text.to_string()),
+            );
+            return;
+        }
+    }
+}
+
+/// Normalize a `location` given as a `"file:line"` string (optionally with a
+/// column: `"file:line:col"`) into the structured object form.
+fn fix_finding_location(el: &mut serde_json::Value) {
+    let Some(obj) = el.as_object_mut() else {
+        return;
+    };
+    let Some(raw) = obj.get("location").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let raw = raw.to_string();
+    // Parse the last two `:`-separated segments as line/col, the rest is the
+    // file (files may contain colons, e.g. Windows drives or URL-ish paths).
+    let (file, line, col) = match raw.rfind(':') {
+        Some(colon) => {
+            let (head, tail) = raw.split_at(colon);
+            let tail = &tail[1..];
+            match tail.parse::<u32>() {
+                Ok(n) => match head.rfind(':') {
+                    Some(c2) => {
+                        let (f, l) = head.split_at(c2);
+                        match l[1..].parse::<u32>() {
+                            Ok(line) => (f.to_string(), line, n),
+                            Err(_) => (head.to_string(), n, 0),
+                        }
+                    }
+                    None => (head.to_string(), n, 0),
+                },
+                Err(_) => (raw, 0, 0),
+            }
+        }
+        None => (raw, 0, 0),
+    };
+    let loc = serde_json::json!({
+        "file": file,
+        "line_start": line,
+        "line_end": line,
+        "column_start": col,
+        "column_end": col,
+    });
+    obj.insert("location".to_string(), loc);
 }
 
 /// Find the last top-level balanced `open`/`close` delimited block in `s`
@@ -1351,6 +1439,9 @@ mod tests {
             RunEvent::ToolCall { .. } => "tool_call",
             RunEvent::ToolResult { .. } => "tool_result",
             RunEvent::ContextTruncated { .. } => "context_truncated",
+            RunEvent::ToolSpill { .. } => "tool_spill",
+            RunEvent::RepeatReminder { .. } => "repeat_reminder",
+            RunEvent::FindingsRecoveryAttempt { .. } => "findings_recovery_attempt",
             RunEvent::Checkpoint { .. } => "checkpoint",
             RunEvent::RunEnd { .. } => "run_end",
         }
@@ -3017,11 +3108,13 @@ mod tests {
 
     #[test]
     fn test_extract_findings_schema_mismatch_is_error_not_silently_dropped() {
-        // Old field names (file/line/title/description) instead of the real
-        // Finding schema (id/message/evidence/location) -- this is exactly
-        // the painttyServer bug: every element fails to deserialize, and
-        // that must surface as an error, not as an empty, "successful" result.
-        let content = r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t", "description": "d", "recommendation": "r"}]}"#;
+        // Old field names (file/line/title) instead of the real Finding
+        // schema (id/message/location) and no description alias — this is
+        // exactly the painttyServer bug: every element fails to deserialize,
+        // and that must surface as an error, not as an empty, "successful"
+        // result. (Tolerant aliases: `description` promotes to `message` and
+        // `evidence` defaults, so this payload deliberately omits both.)
+        let content = r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t", "recommendation": "r"}]}"#;
         let err = extract_findings(content).unwrap_err();
         assert!(err.contains("1 of 1 finding(s) failed"), "got: {err}");
         assert!(err.contains("findings[0]"), "got: {err}");
@@ -3070,6 +3163,112 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_findings_promotes_description_to_message() {
+        // Some models emit `description` instead of `message` natively
+        // (observed with deepseek-v4-flash). The alias must be promoted
+        // without a corrective recovery call.
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "description": "the real message", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("description should be promoted");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "the real message");
+    }
+
+    #[test]
+    fn test_extract_findings_promotes_detail_to_message() {
+        // `detail` is another observed alias (deepseek-v4-flash).
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "detail": "detailed text", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("detail should be promoted");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "detailed text");
+    }
+
+    #[test]
+    fn test_extract_findings_promotes_reason_to_message() {
+        // `reason` is another observed alias (deepseek-v4-flash).
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "reason": "the reason", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("reason should be promoted");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "the reason");
+    }
+
+    #[test]
+    fn test_extract_findings_promotes_note_to_message() {
+        // `note` is another observed alias (deepseek-v4-flash).
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "note": "the note", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("note should be promoted");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "the note");
+    }
+
+    #[test]
+    fn test_extract_findings_normalizes_string_location() {
+        // Models emit `location` as "file:line" strings (observed live).
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "message": "m", "evidence": "e",
+             "location": "src/login.js:15"}
+        ]}"#;
+        let findings = extract_findings(content).expect("string location should normalize");
+        let loc = findings[0].location.as_ref().expect("location kept");
+        assert_eq!(loc.file, "src/login.js");
+        assert_eq!(loc.line_start, 15);
+        assert_eq!(loc.line_end, 15);
+
+        // With column too.
+        let content2 = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "message": "m", "evidence": "e",
+             "location": "app/db.py:20:4"}
+        ]}"#;
+        let findings2 = extract_findings(content2).expect("string location with col");
+        let loc2 = findings2[0].location.as_ref().expect("location kept");
+        assert_eq!(loc2.file, "app/db.py");
+        assert_eq!(loc2.line_start, 20);
+        assert_eq!(loc2.column_start, 4);
+    }
+
+    #[test]
+    fn test_extract_findings_keeps_object_location() {
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "message": "m", "evidence": "e",
+             "location": {"file": "a.ts", "line_start": 1, "line_end": 2, "column_start": 3, "column_end": 4}}
+        ]}"#;
+        let findings = extract_findings(content).expect("object location preserved");
+        let loc = findings[0].location.as_ref().unwrap();
+        assert_eq!(loc.file, "a.ts");
+        assert_eq!(loc.line_start, 1);
+        assert_eq!(loc.line_end, 2);
+        assert_eq!(loc.column_start, 3);
+    }
+
+    #[test]
+    fn test_extract_findings_message_wins_over_description() {
+        // When both fields exist, `message` is authoritative.
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "message": "keep me", "description": "ignore me", "evidence": "e"}
+        ]}"#;
+        let findings = extract_findings(content).expect("should parse");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "keep me");
+    }
+
+    #[test]
+    fn test_extract_findings_missing_message_still_errors() {
+        // Neither message nor a string description → schema error preserved.
+        let content = r#"{"findings": [
+            {"rule_id": "r", "severity": "error", "description": 42, "evidence": "e"}
+        ]}"#;
+        let err = extract_findings(content).unwrap_err();
+        assert!(err.contains("1 of 1 finding(s) failed"), "got: {err}");
+    }
+
+    #[test]
     fn test_extract_findings_fixes_malformed_uuid() {
         // Agent supplied an invalid UUID (11-char group 4 instead of 12).
         // Regression test for painttyServer PR #547.
@@ -3115,7 +3314,7 @@ mod tests {
             mock.add_response(ChatResponse {
                 message: Message::new(
                     Role::Assistant,
-                    r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t", "description": "d"}]}"#.to_string(),
+                    r#"{"findings": [{"rule_id": "no-new-any", "severity": "error", "file": "a.ts", "line": 1, "title": "t"}]}"#.to_string(),
                 ),
                 usage: Usage {
                     input_tokens: 10,

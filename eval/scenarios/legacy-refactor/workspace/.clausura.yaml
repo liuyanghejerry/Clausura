@@ -1,0 +1,40 @@
+version: "1"
+task:
+  name: legacy-refactor
+  model: gpt-4o
+  vendor: openai
+  skill_prompts:
+    - python-review
+  token_budget: 16000
+  timeout_secs: 300
+  max_iterations: 12
+  ambiguity_policy: fail_closed
+  on_incomplete: fail
+  tool_allowlist:
+    - git
+  gating:
+    - rule: bare-except
+      description: Block on bare except clauses
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: sql-injection
+      description: Block on SQL injection
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: unsafe-deserialization
+      description: Block on unsafe deserialization
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: hardcoded-secret
+      description: Block on hardcoded secrets
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: debug-print
+      description: Warn on leftover debug prints
+      min_severity: info
+      max_findings: 3
+      action: warn

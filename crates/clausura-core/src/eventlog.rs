@@ -62,6 +62,13 @@ pub enum RunEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compacted_summary: Option<String>,
     },
+    /// An oversized tool result was spilled to disk (full output preserved
+    /// at the locator path).
+    ToolSpill { locator: String },
+    /// An advisory repeat-call reminder was injected into the conversation.
+    RepeatReminder { tool_name: String, count: u32 },
+    /// A corrective findings-recovery prompt was sent (attempt is 1-based).
+    FindingsRecoveryAttempt { attempt: u32, error: String },
     /// A message-state checkpoint (written alongside SQLite snapshot saves).
     Checkpoint {
         checkpoint_id: String,

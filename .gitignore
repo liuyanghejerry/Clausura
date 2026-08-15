@@ -1,7 +1,11 @@
 target/
 .clausura/
+# Eval scenario skills live under workspace/.clausura/ — they are fixtures,
+# not runtime state.
+!eval/scenarios/*/workspace/.clausura/
 *.db
 *.sarif
 .sisyphus/
 .codegraph/
 .env
+eval-results/

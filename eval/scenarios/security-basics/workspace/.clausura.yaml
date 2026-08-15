@@ -1,0 +1,30 @@
+version: "1"
+task:
+  name: security-basics
+  model: gpt-4o
+  vendor: openai
+  skill_prompts:
+    - security-review
+  token_budget: 16000
+  timeout_secs: 300
+  max_iterations: 10
+  ambiguity_policy: fail_closed
+  on_incomplete: fail
+  tool_allowlist:
+    - git
+  gating:
+    - rule: sql-injection
+      description: Block on SQL injection
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: hardcoded-secret
+      description: Block on hardcoded secrets
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: xss
+      description: Block on XSS
+      min_severity: error
+      max_findings: 0
+      action: fail

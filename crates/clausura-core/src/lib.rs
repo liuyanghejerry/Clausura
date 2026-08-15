@@ -4,6 +4,7 @@ pub mod checkpoint;
 pub mod ci;
 pub mod config;
 pub mod context;
+pub mod eval;
 pub mod eventlog;
 pub mod executor;
 pub mod logging;

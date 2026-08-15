@@ -12,6 +12,7 @@ use crate::types::{
     Severity, Usage,
 };
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Execute a full task lifecycle.
@@ -43,12 +44,22 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         }
     };
 
+    // Append-only run event log: audit trail + checkpoint fallback for
+    // resume in ephemeral CI environments where ~/.clausura does not survive.
+    // Created before the tools so the spill store can record ToolSpill events.
+    let event_log = Arc::new(EventLog::new(&config.workspace, &task_id));
+
+    let spill_store = Arc::new(
+        crate::tools::SpillStore::new(config.workspace.clone(), &task_id)
+            .with_event_log(event_log.clone()),
+    );
+
     let mut tools = default_tools(
         config.workspace.clone(),
         &config.task.tool_allowlist,
         config.task.shell_timeout_secs,
         &config.task.shell_env_passthrough,
-        Some(&task_id),
+        Some(spill_store),
     );
 
     // Progressive skill disclosure: bodies served by read_skill on demand.
@@ -129,10 +140,6 @@ pub async fn execute_task(config: &Config) -> ExecutionReport {
         }
     };
     let snapshot_mgr = SnapshotManager::new(checkpoint_store);
-
-    // Append-only run event log: audit trail + checkpoint fallback for
-    // resume in ephemeral CI environments where ~/.clausura does not survive.
-    let event_log = EventLog::new(&config.workspace, &task_id);
 
     let mut initial_messages = if config.resume {
         match snapshot_mgr.restore_snapshot(&task_id, true) {

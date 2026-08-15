@@ -1,0 +1,278 @@
+{
+  "generated_at": "2026-08-15T14:14:14.728330+00:00",
+  "commit": "70d4700",
+  "branch": "feat/eval-harness",
+  "model": "deepseek-v4-flash",
+  "scenarios": [
+    {
+      "name": "security-basics",
+      "variants": [
+        {
+          "scenario": "security-basics",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 14243.666666666666,
+          "mean_llm_requests": 3.6666666666666665,
+          "mean_duration_ms": 8407.666666666666,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 1.0,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        },
+        {
+          "scenario": "security-basics",
+          "variant": "compact",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 12552.0,
+          "mean_llm_requests": 3.3333333333333335,
+          "mean_duration_ms": 8061.666666666667,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 1.0,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        },
+        {
+          "scenario": "security-basics",
+          "variant": "no-ledger",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 13721.333333333334,
+          "mean_llm_requests": 3.6666666666666665,
+          "mean_duration_ms": 10471.333333333334,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 1.0,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "context-stress",
+      "variants": [
+        {
+          "scenario": "context-stress",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 0.0,
+          "mean_total_tokens": 21693.333333333332,
+          "mean_llm_requests": 8.0,
+          "mean_duration_ms": 14158.666666666666,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 5.333333333333333,
+          "mean_repeat_reminders": 0.3333333333333333,
+          "recovery_success_rate": 0.0,
+          "recall": 0.0,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        },
+        {
+          "scenario": "context-stress",
+          "variant": "compact",
+          "runs": 3,
+          "success_rate": 0.6666666666666666,
+          "mean_total_tokens": 69474.33333333333,
+          "mean_llm_requests": 8.0,
+          "mean_duration_ms": 68460.66666666667,
+          "mean_compactions": 3.0,
+          "mean_tool_spills": 4.0,
+          "mean_repeat_reminders": 1.3333333333333333,
+          "recovery_success_rate": 0.5,
+          "recall": 0.6666666666666666,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        },
+        {
+          "scenario": "context-stress",
+          "variant": "big-budget",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 99082.66666666667,
+          "mean_llm_requests": 6.0,
+          "mean_duration_ms": 14707.0,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 2.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 1.0,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "rust-service",
+      "variants": [
+        {
+          "scenario": "rust-service",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 38495.333333333336,
+          "mean_llm_requests": 4.0,
+          "mean_duration_ms": 60320.666666666664,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 1.0,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        },
+        {
+          "scenario": "rust-service",
+          "variant": "compact",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 52068.666666666664,
+          "mean_llm_requests": 4.666666666666667,
+          "mean_duration_ms": 60897.333333333336,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 1.0,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "web-monorepo",
+      "variants": [
+        {
+          "scenario": "web-monorepo",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 37919.666666666664,
+          "mean_llm_requests": 4.333333333333333,
+          "mean_duration_ms": 31842.0,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 1.0,
+          "recall": 1.0,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        },
+        {
+          "scenario": "web-monorepo",
+          "variant": "compact",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 28376.333333333332,
+          "mean_llm_requests": 4.0,
+          "mean_duration_ms": 20106.666666666668,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 1.0,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "legacy-refactor",
+      "variants": [
+        {
+          "scenario": "legacy-refactor",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 28937.666666666668,
+          "mean_llm_requests": 4.333333333333333,
+          "mean_duration_ms": 25242.333333333332,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 1.0,
+          "recall": 1.0,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        },
+        {
+          "scenario": "legacy-refactor",
+          "variant": "compact",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 24100.0,
+          "mean_llm_requests": 2.6666666666666665,
+          "mean_duration_ms": 23063.0,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 0.6666666666666666,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "secret-sweep",
+      "variants": [
+        {
+          "scenario": "secret-sweep",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 0.3333333333333333,
+          "mean_total_tokens": 66700.66666666667,
+          "mean_llm_requests": 9.0,
+          "mean_duration_ms": 22041.333333333332,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 2.6666666666666665,
+          "mean_repeat_reminders": 1.3333333333333333,
+          "recovery_success_rate": 0.2,
+          "recall": 0.3333333333333333,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        },
+        {
+          "scenario": "secret-sweep",
+          "variant": "compact",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 105975.33333333333,
+          "mean_llm_requests": 7.666666666666667,
+          "mean_duration_ms": 71706.66666666667,
+          "mean_compactions": 2.3333333333333335,
+          "mean_tool_spills": 1.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.75,
+          "recall": 1.0,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        },
+        {
+          "scenario": "secret-sweep",
+          "variant": "big-budget",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 83171.0,
+          "mean_llm_requests": 6.0,
+          "mean_duration_ms": 28481.0,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 1.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 0.3333333333333333,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    }
+  ]
+}
