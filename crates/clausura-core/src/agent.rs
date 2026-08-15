@@ -61,7 +61,7 @@ async fn recover_findings_json(
     first_err: &str,
 ) -> Result<Vec<Finding>, String> {
     let mut last_err = first_err.to_string();
-    for _ in 0..MAX_RECOVERY_RETRIES {
+    for attempt in 0..MAX_RECOVERY_RETRIES {
         if start.elapsed() > Duration::from_secs(contract.timeout_secs) {
             break;
         }
@@ -69,6 +69,12 @@ async fn recover_findings_json(
             if *running_tokens >= max_total {
                 break;
             }
+        }
+        if let Some(log) = event_log {
+            log.append(&RunEvent::FindingsRecoveryAttempt {
+                attempt: (attempt + 1) as u32,
+                error: last_err.clone(),
+            });
         }
         messages.push(Message::new(Role::User, findings_retry_prompt(&last_err)));
         let retry = match call_llm(provider, tools, messages, event_log).await {
@@ -327,6 +333,12 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                             .or_insert(1);
                         if REPEAT_REMINDER_THRESHOLDS.contains(count) {
                             repeat_reminders.push(repeat_reminder_text(&tc.name, *count));
+                            if let Some(log) = config.event_log {
+                                log.append(&RunEvent::RepeatReminder {
+                                    tool_name: tc.name.clone(),
+                                    count: *count,
+                                });
+                            }
                         }
                         match config.tools.get(&tc.name) {
                             Some(tool) => {
@@ -1351,6 +1363,9 @@ mod tests {
             RunEvent::ToolCall { .. } => "tool_call",
             RunEvent::ToolResult { .. } => "tool_result",
             RunEvent::ContextTruncated { .. } => "context_truncated",
+            RunEvent::ToolSpill { .. } => "tool_spill",
+            RunEvent::RepeatReminder { .. } => "repeat_reminder",
+            RunEvent::FindingsRecoveryAttempt { .. } => "findings_recovery_attempt",
             RunEvent::Checkpoint { .. } => "checkpoint",
             RunEvent::RunEnd { .. } => "run_end",
         }

@@ -301,6 +301,7 @@ dependencies = [
  "clausura-core",
  "colored",
  "predicates",
+ "serde_json",
  "tokio",
  "uuid",
 ]

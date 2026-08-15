@@ -48,6 +48,7 @@ pub struct SpillStore {
     workspace_root: PathBuf,
     task_id: String,
     seq: std::sync::atomic::AtomicU32,
+    event_log: Option<Arc<crate::eventlog::EventLog>>,
 }
 
 impl SpillStore {
@@ -56,7 +57,14 @@ impl SpillStore {
             workspace_root,
             task_id: task_id.to_string(),
             seq: std::sync::atomic::AtomicU32::new(0),
+            event_log: None,
         }
+    }
+
+    /// Record spills in the run event log (evaluation telemetry).
+    pub fn with_event_log(mut self, log: Arc<crate::eventlog::EventLog>) -> Self {
+        self.event_log = Some(log);
+        self
     }
 
     /// Write the full output to the archives dir and return the
@@ -68,7 +76,13 @@ impl SpillStore {
         let name = format!("tool-output-{}-{}.txt", self.task_id, seq);
         let full = dir.join(&name);
         std::fs::write(&full, output).ok()?;
-        Some(PathBuf::from(".clausura").join("archives").join(name))
+        let locator = PathBuf::from(".clausura").join("archives").join(&name);
+        if let Some(log) = &self.event_log {
+            log.append(&crate::eventlog::RunEvent::ToolSpill {
+                locator: locator.display().to_string(),
+            });
+        }
+        Some(locator)
     }
 }
 
@@ -1201,18 +1215,17 @@ impl Tool for SkillTool {
 /// Create the default set of tools for the given workspace root.
 /// If allowlist is empty, shell_exec is disabled (no commands allowed).
 ///
-/// When `spill_task_id` is provided, all tools share a [`SpillStore`] for
-/// that task: oversized outputs are written to the workspace archives and
-/// the truncated result carries a locator hint instead of losing the tail.
+/// When `spill` is provided, all tools share the [`SpillStore`]: oversized
+/// outputs are written to the workspace archives and the truncated result
+/// carries a locator hint instead of losing the tail.
 pub fn default_tools(
     workspace_root: PathBuf,
     allowlist: &[String],
     shell_timeout_secs: u64,
     shell_env_passthrough: &[String],
-    spill_task_id: Option<&str>,
+    spill: Option<Arc<SpillStore>>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    let spill = spill_task_id.map(|id| Arc::new(SpillStore::new(workspace_root.clone(), id)));
     registry.register(ReadFileTool::new(workspace_root.clone()).with_spill_maybe(spill.clone()));
     registry.register(GitDiffTool::new(workspace_root.clone()).with_spill_maybe(spill.clone()));
     registry.register(

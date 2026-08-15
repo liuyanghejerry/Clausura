@@ -45,3 +45,34 @@ fn test_snapshot_list() {
     let mut cmd = Command::cargo_bin("clausura").unwrap();
     cmd.args(["snapshot", "list"]).assert().success();
 }
+
+#[test]
+fn test_eval_help() {
+    let mut cmd = Command::cargo_bin("clausura").unwrap();
+    cmd.args(["eval", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--config"))
+        .stdout(predicate::str::contains("--baseline"))
+        .stdout(predicate::str::contains("--runs"));
+}
+
+#[test]
+fn test_eval_missing_key_fails_loud() {
+    let tmp = std::env::temp_dir().join(format!("clausura-eval-smoke-{}", std::process::id()));
+    let mut cmd = Command::cargo_bin("clausura").unwrap();
+    cmd.args([
+        "eval",
+        "--config",
+        "../../eval/eval.yaml",
+        "--scenario",
+        "security-basics",
+        "--out-dir",
+        tmp.to_str().unwrap(),
+    ])
+    .env_remove("CLAUSURA_API_KEY")
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("Missing API key"));
+    let _ = std::fs::remove_dir_all(&tmp);
+}

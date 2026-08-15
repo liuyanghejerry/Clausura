@@ -26,6 +26,7 @@ tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt", "time"] }
 tracing-appender = "0.2"
 regex-lite = "0.1"
+tempfile = "3"
 
 [dev-dependencies]
 tokio-test = "0.4"

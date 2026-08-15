@@ -1,0 +1,60 @@
+# Effect-oriented evaluation scenarios for Clausura.
+#
+# Run with:
+#   clausura eval --config eval.yaml --model <model> [--baseline eval-results/eval-report.json]
+#
+# Every scenario has a fixture workspace with a seeded ground truth.
+# Variants are partial YAML overrides merged over the scenario's
+# .clausura.yaml — use them to compare implementation/config choices
+# with numbers instead of assertions.
+
+scenarios:
+  - name: security-basics
+    description: >
+      A small web project with three seeded security issues (SQL injection,
+      hardcoded API key, XSS). The review must report all three; the gate
+      then fails, which is the *correct* outcome — recall is the metric that
+      matters here, not the exit code.
+    workspace: scenarios/security-basics/workspace
+    config: .clausura.yaml
+    ground_truth:
+      - rule_id: sql-injection
+        min_findings: 1
+      - rule_id: hardcoded-secret
+        min_findings: 1
+      - rule_id: xss
+        min_findings: 1
+    runs: 3
+    variants:
+      - name: default
+      - name: compact
+        config_overrides:
+          task:
+            auto_compact: true
+      - name: no-ledger
+        config_overrides:
+          task:
+            findings_ledger: false
+
+  - name: context-stress
+    description: >
+      A single large diff (~120KB) with one seeded hardcoded secret near the
+      tail. A small token budget forces context truncation (and tool-output
+      spill) mid-review. Measures whether findings near the end of a large
+      diff survive truncation, with and without auto-compact.
+    workspace: scenarios/context-stress/workspace
+    config: .clausura.yaml
+    ground_truth:
+      - rule_id: hardcoded-secret
+        min_findings: 1
+    runs: 3
+    variants:
+      - name: default
+      - name: compact
+        config_overrides:
+          task:
+            auto_compact: true
+      - name: big-budget
+        config_overrides:
+          task:
+            token_budget: 60000

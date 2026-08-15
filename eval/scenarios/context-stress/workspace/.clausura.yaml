@@ -1,0 +1,22 @@
+version: "1"
+task:
+  name: context-stress
+  model: gpt-4o
+  vendor: openai
+  skill_prompts:
+    - secret-scan
+  # Deliberately small: the ~330KB diff exceeds it, forcing truncation
+  # (and tool-output spill) mid-review. The seeded secret sits near the
+  # tail of the diff — findings must survive the pressure.
+  token_budget: 4000
+  timeout_secs: 300
+  max_iterations: 10
+  ambiguity_policy: fail_closed
+  on_incomplete: fail
+  tool_allowlist:
+    - git
+  gating:
+    - rule: hardcoded-secret
+      min_severity: error
+      max_findings: 0
+      action: fail

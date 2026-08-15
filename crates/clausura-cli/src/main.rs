@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use colored::*;
+use commands::eval::EvalArgs;
 use commands::run::RunArgs;
 use commands::snapshot::SnapshotArgs;
 
@@ -16,6 +17,7 @@ mod commands;
                    clausura run --config .clausura.yaml    Run a task\n  \
                    clausura run --dry-run                   Validate config and print plan\n  \
                    clausura snapshot list                   List checkpoints\n  \
+                   clausura eval --config eval.yaml         Effect-oriented evaluation\n  \
                    clausura --version                       Show version"
 )]
 struct Cli {
@@ -29,6 +31,8 @@ enum Commands {
     Run(Box<RunArgs>),
     /// Manage checkpoints
     Snapshot(SnapshotArgs),
+    /// Effect-oriented evaluation across scenarios and config variants
+    Eval(EvalArgs),
 }
 
 #[tokio::main]
@@ -49,5 +53,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             Ok(())
         }
+        Commands::Eval(args) => commands::eval::execute(args).await,
     }
 }
