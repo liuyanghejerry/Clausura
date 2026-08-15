@@ -33,6 +33,38 @@ pub trait Provider: Send + Sync {
     fn vendor(&self) -> &str;
 }
 
+/// True when a provider error looks like a context-window overflow (the
+/// request exceeded the model's input length limit).
+///
+/// Providers surface this as HTTP 400 with a descriptive body; there is no
+/// standardized error code, so we match the well-known phrasings from the
+/// OpenAI-compatible and Anthropic APIs. Used by the agent loop to trigger a
+/// reactive compaction (truncate + retry once) instead of failing the run.
+pub fn is_context_overflow_err(err: &ProviderError) -> bool {
+    let text = match err {
+        ProviderError::BadRequest(text) => text,
+        _ => return false,
+    };
+    let lower = text.to_lowercase();
+    [
+        "context length",
+        "context_length_exceeded",
+        "maximum context",
+        "context window",
+        "too many tokens",
+        "input length",
+        "input is too long",
+        "prompt is too long",
+        "reduce the length",
+        "token limit",
+        "exceeds the limit",
+        "maximum token",
+        "max_tokens",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 // ---------------------------------------------------------------------------
 // Retry helpers
 // ---------------------------------------------------------------------------
@@ -914,6 +946,36 @@ pub mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn test_is_context_overflow_err_matches_known_phrasings() {
+        let cases = [
+            "This model's maximum context length is 8192 tokens.",
+            "invalid_request_error: context_length_exceeded",
+            "Requested token count exceeds the maximum context window of 128k",
+            "input is too long, reduce the length of the prompt",
+            "prompt is too long",
+            "this request exceeds the limit: too many tokens",
+            "maximum token limit exceeded",
+        ];
+        for (i, text) in cases.iter().enumerate() {
+            let err = ProviderError::BadRequest((*text).to_string());
+            assert!(
+                is_context_overflow_err(&err),
+                "case {i} should match: {text}"
+            );
+        }
+        // Non-overflow errors must not match.
+        assert!(!is_context_overflow_err(&ProviderError::BadRequest(
+            "Invalid model name".into()
+        )));
+        assert!(!is_context_overflow_err(&ProviderError::RateLimited(
+            "slow down".into()
+        )));
+        assert!(!is_context_overflow_err(&ProviderError::Timeout(
+            "took too long".into()
+        )));
+    }
+
     /// Mock provider for testing agent loop
     pub struct MockProvider {
         model: String,
@@ -934,6 +996,11 @@ pub mod tests {
 
         pub fn add_response(&mut self, response: ChatResponse) {
             self.responses.lock().unwrap().push_back(Ok(response));
+        }
+
+        /// Queue a provider error for the next `chat_with_tools` call.
+        pub fn add_error_response(&mut self, err: ProviderError) {
+            self.responses.lock().unwrap().push_back(Err(err));
         }
 
         /// Queue a response for a no-tool `chat` call (auto-compact summary).

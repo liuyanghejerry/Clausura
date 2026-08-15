@@ -37,19 +37,20 @@ task:
       action: fail
 ```
 
-When the agent runs, skill content is injected into the system prompt before your `prompt_template`:
+When the agent runs, only a skill **catalog** (name + description) is injected into the system prompt, followed by your `prompt_template`:
 
 ```
-[Skill: security-review]
-...skill content...
+Available review skills:
+Before reporting findings, load every skill relevant to the task with
+the `read_skill` tool (by name) and apply its instructions.
 
-[Skill: team/vue-best-practices]
-...skill content...
-
----
+- security-review — Check for SQL injection, XSS, hardcoded secrets...
+- team/vue-best-practices — Vue best practices
 
 Your prompt_template content
 ```
+
+The agent loads full skill bodies on demand via the `read_skill` tool (progressive disclosure), so the token budget goes to the review instead of up-front instructions.
 
 ## Skill File Format
 
@@ -98,7 +99,7 @@ For each finding, output:
 ```
 ```
 
-**Frontmatter** (`---` delimited YAML at the top) is stripped automatically. Only the Markdown body is injected into the prompt.
+**Frontmatter** (`---` delimited YAML at the top) feeds the catalog (`name`, `description`) and is stripped from the body. Skill bodies are served on demand by the `read_skill` tool, not inlined into the prompt.
 
 **No gating in skills.** Skills define what and how to review, never the pass/fail threshold. That belongs in `.clausura.yaml` under `gating:`.
 

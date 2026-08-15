@@ -108,12 +108,20 @@ impl<'a> ContextManager<'a> {
     /// Returns the number of messages dropped.
     /// Preserves system message (index 0) and assistant-tool pairs.
     pub fn truncate(&self, messages: &mut Vec<Message>) -> usize {
+        self.truncate_to(messages, 0.75)
+    }
+
+    /// Truncate messages to fit within `ratio` of the budget (e.g. 0.5 for
+    /// aggressive reactive compaction). Returns the number of messages
+    /// dropped. Preserves the system message (index 0) and assistant-tool
+    /// pairs.
+    pub fn truncate_to(&self, messages: &mut Vec<Message>, ratio: f64) -> usize {
         if messages.is_empty() {
             return 0;
         }
 
         // Binary search for the maximum number of messages that fit
-        let target = (self.token_budget as f64 * 0.75) as u64;
+        let target = (self.token_budget as f64 * ratio) as u64;
 
         let mut low = 1usize; // At least keep system message
         let mut high = messages.len();

@@ -434,16 +434,24 @@ impl Config {
             })
             .collect();
 
-        // ---- Resolve skill prompts ----
-        let prompt_template = if yaml_task.skill_prompts.is_empty() {
-            yaml_task.prompt_template
+        // ---- Resolve skill prompts (progressive disclosure) ----
+        // Only a catalog (name + description) is inlined into the system
+        // prompt; skill bodies are served on demand by the `read_skill` tool.
+        let (prompt_template, skills) = if yaml_task.skill_prompts.is_empty() {
+            (yaml_task.prompt_template, Vec::new())
         } else {
-            let mut skill_contents: Vec<(String, String)> = Vec::new();
-            for skill_ref in &yaml_task.skill_prompts {
-                let content = crate::skills::resolve_skill(skill_ref, &workspace)?;
-                skill_contents.push((skill_ref.clone(), content));
+            let resolved = crate::skills::resolve_skills(&yaml_task.skill_prompts, &workspace)?;
+            let catalog = crate::skills::build_skill_catalog(&resolved);
+            let mut parts = Vec::new();
+            if !catalog.is_empty() {
+                parts.push(catalog);
             }
-            crate::skills::merge_prompts(&skill_contents, &yaml_task.prompt_template)
+            let has_user_template = !yaml_task.prompt_template.is_empty()
+                && yaml_task.prompt_template != "{{task_description}}";
+            if has_user_template {
+                parts.push(yaml_task.prompt_template);
+            }
+            (parts.join("\n"), resolved)
         };
 
         Ok(Config {
@@ -461,6 +469,7 @@ impl Config {
                 auto_compact,
                 max_compactions,
                 findings_ledger,
+                skills,
                 timeout_secs: timeout,
                 shell_timeout_secs: shell_timeout,
                 shell_env_passthrough: yaml_task.shell_env_passthrough,
@@ -1864,9 +1873,24 @@ task:
             LogFormat::Json,
         )
         .unwrap();
-        assert!(config.task.prompt_template.contains("[Skill:"));
-        assert!(config.task.prompt_template.contains("# Check for bugs"));
+        assert!(
+            config
+                .task
+                .prompt_template
+                .contains("Available review skills"),
+            "catalog should be injected, got: {}",
+            config.task.prompt_template
+        );
+        assert!(config
+            .task
+            .prompt_template
+            .contains("- my-check — Check for bugs"));
+        // Progressive disclosure: the body itself is NOT inlined.
+        assert!(!config.task.prompt_template.contains("# Check for bugs"));
         assert!(!config.task.prompt_template.contains("{{task_description}}"));
+        assert_eq!(config.task.skills.len(), 1);
+        assert_eq!(config.task.skills[0].name, "my-check");
+        assert_eq!(config.task.skills[0].body, "# Check for bugs");
     }
 
     #[test]
@@ -1916,11 +1940,12 @@ task:
             LogFormat::Json,
         )
         .unwrap();
-        assert!(config
-            .task
-            .prompt_template
-            .contains("[Skill: team/vue-check]"));
-        assert!(config.task.prompt_template.contains("# Vue best practices"));
+        assert!(config.task.prompt_template.contains("- vue-check"));
+        // Body served by read_skill, not inlined into the system prompt.
+        assert!(!config.task.prompt_template.contains("# Vue best practices"));
+        assert_eq!(config.task.skills.len(), 1);
+        assert_eq!(config.task.skills[0].name, "vue-check");
+        assert_eq!(config.task.skills[0].body, "# Vue best practices");
     }
 
     #[test]
@@ -1963,9 +1988,10 @@ task:
             LogFormat::Json,
         )
         .unwrap();
-        assert!(config.task.prompt_template.contains("[Skill:"));
-        assert!(config.task.prompt_template.contains("Skill body"));
+        assert!(config.task.prompt_template.contains("read_skill"));
         assert!(config.task.prompt_template.contains("User extra check."));
+        assert_eq!(config.task.skills.len(), 1);
+        assert_eq!(config.task.skills[0].body, "Skill body");
     }
 
     #[test]

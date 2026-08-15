@@ -36,9 +36,45 @@ const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 /// Max lines of tool output before truncation.
 const MAX_OUTPUT_LINES: usize = 1000;
 
+/// Disk sink for tool outputs that exceed the inline limits.
+///
+/// Truncation used to destroy the tail of oversized tool outputs, which the
+/// agent could never recover. With a spill store attached, the *full* output
+/// is written to `{workspace}/.clausura/archives/tool-output-{task_id}-{seq}.txt`
+/// and the truncated result carries a locator hint, so the agent can page
+/// through the rest with `read_file` (offset/limit). Best-effort by design:
+/// a failed write simply falls back to the plain truncation marker.
+pub struct SpillStore {
+    workspace_root: PathBuf,
+    task_id: String,
+    seq: std::sync::atomic::AtomicU32,
+}
+
+impl SpillStore {
+    pub fn new(workspace_root: PathBuf, task_id: &str) -> Self {
+        Self {
+            workspace_root,
+            task_id: task_id.to_string(),
+            seq: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Write the full output to the archives dir and return the
+    /// workspace-relative locator path on success.
+    fn spill(&self, output: &str) -> Option<PathBuf> {
+        let dir = self.workspace_root.join(".clausura").join("archives");
+        std::fs::create_dir_all(&dir).ok()?;
+        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let name = format!("tool-output-{}-{}.txt", self.task_id, seq);
+        let full = dir.join(&name);
+        std::fs::write(&full, output).ok()?;
+        Some(PathBuf::from(".clausura").join("archives").join(name))
+    }
+}
+
 /// Truncate tool output to at most 32 KB or 1000 lines, whichever comes first.
 /// Appends a marker when truncation occurs.
-pub(crate) fn truncate_output(output: String) -> String {
+fn truncate_output_with_spill(output: String, spill: Option<&SpillStore>) -> String {
     let mut keep_end = output.len();
     let mut offset = 0usize;
     for (lines_kept, line) in output.split_inclusive('\n').enumerate() {
@@ -54,9 +90,19 @@ pub(crate) fn truncate_output(output: String) -> String {
     }
     let mut truncated = output[..keep_end].to_string();
     truncated.truncate(truncated.trim_end_matches('\n').len());
-    truncated.push_str(
-        "\n... [output truncated: limit is 32KB or 1000 lines, use offset/limit or a narrower query]",
-    );
+    match spill.and_then(|s| s.spill(&output)) {
+        Some(loc) => truncated.push_str(&format!(
+            "\n... [output truncated: limit is 32KB or 1000 lines; \
+             full output ({} bytes, {} lines) saved to {} — read it with \
+             read_file (offset/limit) to page through]",
+            output.len(),
+            output.lines().count(),
+            loc.display(),
+        )),
+        None => truncated.push_str(
+            "\n... [output truncated: limit is 32KB or 1000 lines, use offset/limit or a narrower query]",
+        ),
+    }
     truncated
 }
 
@@ -113,6 +159,7 @@ impl Default for ToolRegistry {
 /// Reads a file relative to the workspace root. Path traversal is rejected.
 pub struct ReadFileTool {
     workspace_root: PathBuf,
+    spill: Option<Arc<SpillStore>>,
 }
 
 /// Resolve a path relative to the workspace root, enforcing sandbox restrictions.
@@ -153,7 +200,15 @@ impl ReadFileTool {
         let canonical_root = workspace_root.canonicalize().unwrap_or(workspace_root);
         Self {
             workspace_root: canonical_root,
+            spill: None,
         }
+    }
+
+    /// Attach a spill store (if any) so oversized outputs are saved to disk
+    /// instead of being lost to truncation.
+    pub fn with_spill_maybe(mut self, store: Option<Arc<SpillStore>>) -> Self {
+        self.spill = store;
+        self
     }
 
     fn resolve_path(&self, path_str: &str) -> Result<PathBuf, ToolError> {
@@ -232,7 +287,10 @@ impl Tool for ReadFileTool {
             }
         }
 
-        Ok(truncate_output(result_lines.join("\n")))
+        Ok(truncate_output_with_spill(
+            result_lines.join("\n"),
+            self.spill.as_deref(),
+        ))
     }
 }
 
@@ -243,11 +301,22 @@ impl Tool for ReadFileTool {
 /// Runs git diff to get code changes.
 pub struct GitDiffTool {
     workspace_root: PathBuf,
+    spill: Option<Arc<SpillStore>>,
 }
 
 impl GitDiffTool {
     pub fn new(workspace_root: PathBuf) -> Self {
-        Self { workspace_root }
+        Self {
+            workspace_root,
+            spill: None,
+        }
+    }
+
+    /// Attach a spill store (if any) so oversized outputs are saved to disk
+    /// instead of being lost to truncation.
+    pub fn with_spill_maybe(mut self, store: Option<Arc<SpillStore>>) -> Self {
+        self.spill = store;
+        self
     }
 
     async fn run_git(&self, args: &[&str]) -> Result<String, ToolError> {
@@ -309,7 +378,7 @@ impl Tool for GitDiffTool {
         };
 
         let output = self.run_git(git_args).await?;
-        Ok(truncate_output(output))
+        Ok(truncate_output_with_spill(output, self.spill.as_deref()))
     }
 }
 
@@ -323,6 +392,7 @@ pub struct ShellExecTool {
     allowlist: Vec<String>,
     shell_timeout_secs: u64,
     shell_env_passthrough: Vec<String>,
+    spill: Option<Arc<SpillStore>>,
 }
 
 /// Per-program dangerous-flag denylist, keyed by the basename of argv[0].
@@ -409,7 +479,15 @@ impl ShellExecTool {
             allowlist,
             shell_timeout_secs,
             shell_env_passthrough,
+            spill: None,
         }
+    }
+
+    /// Attach a spill store (if any) so oversized outputs are saved to disk
+    /// instead of being lost to truncation.
+    pub fn with_spill_maybe(mut self, store: Option<Arc<SpillStore>>) -> Self {
+        self.spill = store;
+        self
     }
 
     /// Allowlist entries are argv prefixes split on whitespace: an invocation
@@ -567,14 +645,20 @@ impl Tool for ShellExecTool {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if output.status.success() {
-            Ok(truncate_output(stdout.to_string()))
+            Ok(truncate_output_with_spill(
+                stdout.to_string(),
+                self.spill.as_deref(),
+            ))
         } else {
             // Return stderr as the output even on failure (tool result, not error)
-            Ok(truncate_output(format!(
-                "Exit code: {}\nStderr: {}",
-                output.status.code().unwrap_or(-1),
-                stderr
-            )))
+            Ok(truncate_output_with_spill(
+                format!(
+                    "Exit code: {}\nStderr: {}",
+                    output.status.code().unwrap_or(-1),
+                    stderr
+                ),
+                self.spill.as_deref(),
+            ))
         }
     }
 }
@@ -586,6 +670,7 @@ impl Tool for ShellExecTool {
 /// List files and directories within the workspace.
 pub struct ListFilesTool {
     workspace_root: PathBuf,
+    spill: Option<Arc<SpillStore>>,
 }
 
 /// Simple glob-like filename matching.
@@ -686,7 +771,15 @@ impl ListFilesTool {
         let canonical_root = workspace_root.canonicalize().unwrap_or(workspace_root);
         Self {
             workspace_root: canonical_root,
+            spill: None,
         }
+    }
+
+    /// Attach a spill store (if any) so oversized outputs are saved to disk
+    /// instead of being lost to truncation.
+    pub fn with_spill_maybe(mut self, store: Option<Arc<SpillStore>>) -> Self {
+        self.spill = store;
+        self
     }
 }
 
@@ -758,7 +851,10 @@ impl Tool for ListFilesTool {
             include_size,
         );
 
-        Ok(truncate_output(lines.join("\n")))
+        Ok(truncate_output_with_spill(
+            lines.join("\n"),
+            self.spill.as_deref(),
+        ))
     }
 }
 
@@ -891,6 +987,7 @@ fn grep_directory(
 /// literal and regex matching.
 pub struct GrepTool {
     workspace_root: PathBuf,
+    spill: Option<Arc<SpillStore>>,
 }
 
 impl GrepTool {
@@ -898,7 +995,15 @@ impl GrepTool {
         let canonical_root = workspace_root.canonicalize().unwrap_or(workspace_root);
         Self {
             workspace_root: canonical_root,
+            spill: None,
         }
+    }
+
+    /// Attach a spill store (if any) so oversized outputs are saved to disk
+    /// instead of being lost to truncation.
+    pub fn with_spill_maybe(mut self, store: Option<Arc<SpillStore>>) -> Self {
+        self.spill = store;
+        self
     }
 }
 
@@ -1013,29 +1118,101 @@ impl Tool for GrepTool {
             ));
         }
 
-        Ok(truncate_output(output))
+        Ok(truncate_output_with_spill(output, self.spill.as_deref()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SkillTool
+// ---------------------------------------------------------------------------
+
+/// Serves resolved skill bodies on demand (progressive disclosure).
+///
+/// Only the skill catalog (name + description) is inlined in the system
+/// prompt; the agent calls `read_skill` to load a full body when it needs it.
+/// The tool has no filesystem access — content was resolved and validated at
+/// config load time, so it cannot read anything beyond the configured skills.
+pub struct SkillTool {
+    skills: Vec<crate::skills::Skill>,
+}
+
+impl SkillTool {
+    pub fn new(skills: Vec<crate::skills::Skill>) -> Self {
+        Self { skills }
+    }
+}
+
+#[async_trait]
+impl Tool for SkillTool {
+    fn name(&self) -> &str {
+        "read_skill"
+    }
+
+    fn description(&self) -> &str {
+        "Load the full instructions of a review skill by name. The system prompt \
+         only lists skill names and descriptions; call this before reporting \
+         findings to apply a skill's rules."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Skill name exactly as listed in the system prompt catalog"
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let name = args["name"]
+            .as_str()
+            .ok_or_else(|| ToolError::ExecutionFailed("Missing 'name' argument".into()))?;
+        let skill = self.skills.iter().find(|s| s.name == name).ok_or_else(|| {
+            let known: Vec<&str> = self.skills.iter().map(|s| s.name.as_str()).collect();
+            ToolError::ExecutionFailed(format!(
+                "Unknown skill '{name}'. Available skills: {}",
+                known.join(", ")
+            ))
+        })?;
+        Ok(format!(
+            "<skill name=\"{}\">\n{}\n</skill>",
+            skill.name, skill.body
+        ))
     }
 }
 
 /// Create the default set of tools for the given workspace root.
 /// If allowlist is empty, shell_exec is disabled (no commands allowed).
+///
+/// When `spill_task_id` is provided, all tools share a [`SpillStore`] for
+/// that task: oversized outputs are written to the workspace archives and
+/// the truncated result carries a locator hint instead of losing the tail.
 pub fn default_tools(
     workspace_root: PathBuf,
     allowlist: &[String],
     shell_timeout_secs: u64,
     shell_env_passthrough: &[String],
+    spill_task_id: Option<&str>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.register(ReadFileTool::new(workspace_root.clone()));
-    registry.register(GitDiffTool::new(workspace_root.clone()));
-    registry.register(ShellExecTool::new(
-        workspace_root.clone(),
-        allowlist.to_vec(),
-        shell_timeout_secs,
-        shell_env_passthrough.to_vec(),
-    ));
-    registry.register(ListFilesTool::new(workspace_root.clone()));
-    registry.register(GrepTool::new(workspace_root));
+    let spill = spill_task_id.map(|id| Arc::new(SpillStore::new(workspace_root.clone(), id)));
+    registry.register(ReadFileTool::new(workspace_root.clone()).with_spill_maybe(spill.clone()));
+    registry.register(GitDiffTool::new(workspace_root.clone()).with_spill_maybe(spill.clone()));
+    registry.register(
+        ShellExecTool::new(
+            workspace_root.clone(),
+            allowlist.to_vec(),
+            shell_timeout_secs,
+            shell_env_passthrough.to_vec(),
+        )
+        .with_spill_maybe(spill.clone()),
+    );
+    registry.register(ListFilesTool::new(workspace_root.clone()).with_spill_maybe(spill.clone()));
+    registry.register(GrepTool::new(workspace_root).with_spill_maybe(spill));
     registry
 }
 
@@ -1228,6 +1405,119 @@ mod tests {
         assert!(result.contains("[output truncated:"));
         assert!(result.contains("line 1000"));
         assert!(!result.contains("line 1001"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_tool_serves_body_by_name() {
+        let tool = SkillTool::new(vec![
+            crate::skills::Skill {
+                name: "security-review".into(),
+                description: "检查 SQL 注入".into(),
+                body: "# 安全审查\n检查 SQL 注入".into(),
+            },
+            crate::skills::Skill {
+                name: "vue-check".into(),
+                description: "Vue 实践".into(),
+                body: "Vue body".into(),
+            },
+        ]);
+        let out = tool
+            .execute(serde_json::json!({"name": "security-review"}))
+            .await
+            .unwrap();
+        assert!(out.contains("security-review"));
+        assert!(out.contains("检查 SQL 注入"));
+
+        let err = tool
+            .execute(serde_json::json!({"name": "nope"}))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unknown skill 'nope'"));
+        assert!(msg.contains("vue-check"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_tool_missing_name() {
+        let tool = SkillTool::new(vec![]);
+        let err = tool.execute(serde_json::json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("Missing 'name'"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_tool_registered_via_default_tools_pipeline() {
+        // default_tools does not register read_skill (no skills configured);
+        // executor registers it when config.task.skills is non-empty.
+        let (_tmp, root) = setup_workspace();
+        let registry = default_tools(root, &[], 120, &[], None);
+        assert!(registry.get("read_skill").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_file_output_spills_full_content_to_archives() {
+        let (_tmp, root) = setup_workspace();
+        let test_file = root.join("big.txt");
+        let mut content = String::new();
+        for i in 1..=1500 {
+            content.push_str(&format!("line {}\n", i));
+        }
+        std::fs::write(&test_file, &content).unwrap();
+
+        let tool = ReadFileTool::new(root.clone())
+            .with_spill_maybe(Some(Arc::new(SpillStore::new(root.clone(), "spill-test"))));
+        let result = tool
+            .execute(serde_json::json!({"path": "big.txt"}))
+            .await
+            .unwrap();
+
+        // The inline result is truncated and carries a locator hint...
+        assert!(result.contains("[output truncated:"));
+        assert!(result.contains("saved to"));
+        assert!(result.contains("tool-output-spill-test-1.txt"));
+        assert!(result.contains("read_file (offset/limit)"));
+        assert!(!result.contains("line 1500"));
+
+        // ...and the full *tool output* (everything the tool read before the
+        // truncation marker was applied) is recoverable from the spill file.
+        // read_file caps its read at 1001 lines when no limit is given, so
+        // the spill holds those 1001 lines — the agent can page further with
+        // offset/limit.
+        let spill = root
+            .join(".clausura")
+            .join("archives")
+            .join("tool-output-spill-test-1.txt");
+        assert!(spill.exists(), "spill file should exist");
+        let spilled = std::fs::read_to_string(&spill).unwrap();
+        let expected: String = content.lines().take(1001).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            spilled, expected,
+            "spill file must hold the full pre-truncation output"
+        );
+        assert!(spilled.contains("line 1001"));
+        assert!(
+            !spilled.contains("line 1002"),
+            "read never reached line 1002"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncated_output_without_spill_keeps_plain_marker() {
+        // No spill store attached → the classic marker, no "saved to" hint.
+        let (_tmp, root) = setup_workspace();
+        let test_file = root.join("big.txt");
+        let mut content = String::new();
+        for i in 1..=1500 {
+            content.push_str(&format!("line {}\n", i));
+        }
+        std::fs::write(&test_file, content).unwrap();
+
+        let tool = ReadFileTool::new(root);
+        let result = tool
+            .execute(serde_json::json!({"path": "big.txt"}))
+            .await
+            .unwrap();
+        assert!(result.contains("[output truncated:"));
+        assert!(!result.contains("saved to"));
     }
 
     // -----------------------------------------------------------------------
@@ -1764,7 +2054,7 @@ mod tests {
     #[test]
     fn test_default_tools_contains_all() {
         let (_tmp, root) = setup_workspace();
-        let registry = default_tools(root, &[], 120, &[]);
+        let registry = default_tools(root, &[], 120, &[], None);
         let defs = registry.list_definitions();
         assert_eq!(defs.len(), 5);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();

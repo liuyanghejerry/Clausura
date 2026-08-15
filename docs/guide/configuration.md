@@ -157,7 +157,7 @@ task:
 
 ### `task.skill_prompts`
 
-References to reusable skill files. Skills are appended to the system prompt before `prompt_template`.
+References to reusable skill files. Only a catalog (name + description) is inlined into the system prompt; full bodies are loaded on demand by the `read_skill` tool (progressive disclosure).
 
 ```yaml
 task:
@@ -165,7 +165,7 @@ task:
     - ./skills/security-review.md      # Local file (relative or absolute)
     - team/vue-best-practices          # Named reference (looked up in .clausura/skills/ and ~/.clausura/skills/)
     - community/i18n-check
-  prompt_template: |                   # Your additions go after skills
+  prompt_template: |                   # Your additions go after the skill catalog
     Also check: no console.log in production code.
 ```
 
