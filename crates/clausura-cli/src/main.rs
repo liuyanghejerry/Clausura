@@ -3,6 +3,7 @@ use colored::*;
 use commands::eval::EvalArgs;
 use commands::run::RunArgs;
 use commands::snapshot::SnapshotArgs;
+use std::io::IsTerminal;
 
 mod commands;
 
@@ -37,7 +38,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    colored::control::set_override(atty::is(atty::Stream::Stderr));
+    colored::control::set_override(std::io::stderr().is_terminal());
 
     let cli = Cli::parse();
 
