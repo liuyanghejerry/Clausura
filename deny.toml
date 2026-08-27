@@ -1,0 +1,33 @@
+# Configuration for `cargo deny check` — dependency policy gate.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+# Runs locally via `make deny`; wired into CI in .github/workflows/main.yml and pr.yml.
+
+[advisories]
+# Security advisories are also gated by `cargo audit` (see .cargo/audit.toml).
+# Keep both ignore lists in sync; leave empty by default.
+ignore = []
+
+[bans]
+# The tree retains some intentional minor-version duplicates (mostly windows-*
+# platform crates, plus transitive range overlaps such as thiserror 1.x/2.x and
+# base64 0.21/0.22). Security-relevant aspects are covered by advisory checks,
+# so duplicates are a warning rather than a hard error.
+multiple-versions = "warn"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
