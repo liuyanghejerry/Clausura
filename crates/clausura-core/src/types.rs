@@ -196,6 +196,61 @@ pub enum OnIncompletePolicy {
     Pass,
 }
 
+/// Machine-readable reason an agent run ended without a clean `Stop`.
+/// Each break path in the agent loop maps to exactly one variant, so CI can
+/// distinguish "audit infrastructure failure" (retry smaller / investigate)
+/// from genuine review results.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum IncompleteReason {
+    /// The conversation could not be truncated further under `token_budget`.
+    ContextLimit,
+    /// `max_iterations` was exhausted without a final answer.
+    IterationLimit,
+    /// The cumulative `max_total_tokens` cap was reached.
+    TokenCap,
+    /// The model stopped at its own output length limit.
+    Length,
+    /// The provider's content filter ended the run.
+    ContentFilter,
+    /// The task wall-clock timeout fired.
+    Timeout,
+    /// The final answer was not parseable findings JSON.
+    MalformedJson,
+    /// Any other abnormal finish reason.
+    Other,
+}
+
+impl IncompleteReason {
+    /// Stable machine-readable code (matches the serde snake_case form).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IncompleteReason::ContextLimit => "context_limit",
+            IncompleteReason::IterationLimit => "iteration_limit",
+            IncompleteReason::TokenCap => "token_cap",
+            IncompleteReason::Length => "length",
+            IncompleteReason::ContentFilter => "content_filter",
+            IncompleteReason::Timeout => "timeout",
+            IncompleteReason::MalformedJson => "malformed_json",
+            IncompleteReason::Other => "other",
+        }
+    }
+}
+
+/// Outcome status of a run, independent of gating results. `Incomplete` means
+/// the agent loop ended without a clean stop (see `IncompleteReason`);
+/// `Error` means execution itself failed (provider init, timeout, ...).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RunStatus {
+    Complete,
+    #[default]
+    Incomplete,
+    Error,
+}
+
 /// Supported LLM vendor API types.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -373,6 +428,84 @@ impl<'de> Deserialize<'de> for VendorConfig {
     }
 }
 
+/// What to do when a shard's agent run ends incomplete.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ShardIncompletePolicy {
+    /// Bisect the shard and retry the halves (bounded by `max_splits`).
+    #[default]
+    Bisect,
+    /// Fail the whole run immediately (strict compliance mode).
+    Fail,
+    /// Keep the shard's partial findings and continue, marking the run
+    /// incomplete in the summary/SARIF.
+    Pass,
+}
+
+/// Per-shard budget overrides applied on top of the task's own limits.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct ShardBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Sharding configuration. Presence of this section switches `clausura run`
+/// to the sharded audit path: per-file diffs are grouped into bounded
+/// shards, each reviewed by its own agent run, and the findings are
+/// aggregated through the gating rules.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ShardingConfig {
+    /// Base ref to diff against; resolved via `git merge-base`.
+    pub base: String,
+    /// Optional path filters (as passed to `git diff -- <path>...`).
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Byte budget per shard's combined diffs. Default 128 KiB.
+    #[serde(default = "default_max_diff_bytes")]
+    pub max_diff_bytes: usize,
+    /// File-count cap per shard. Default 8.
+    #[serde(default = "default_max_files_per_shard")]
+    pub max_files_per_shard: usize,
+    /// Bisect depth per shard on incomplete retries. Default 3.
+    #[serde(default = "default_max_splits")]
+    pub max_splits: u32,
+    /// Context lines per hunk in per-file diffs (`--unified`). Default 20.
+    #[serde(default = "default_shard_context_lines")]
+    pub context_lines: u32,
+    /// Budget overrides applied to each shard's agent run.
+    #[serde(default)]
+    pub per_shard: ShardBudget,
+    /// Policy when a shard ends incomplete. Default `bisect`.
+    #[serde(default)]
+    pub on_shard_incomplete: ShardIncompletePolicy,
+    /// Extra risk-scanner patterns: tag → regex (matched on added lines).
+    #[serde(default)]
+    pub risk_patterns: std::collections::BTreeMap<String, String>,
+}
+
+fn default_max_diff_bytes() -> usize {
+    128 * 1024
+}
+
+fn default_max_files_per_shard() -> usize {
+    8
+}
+
+fn default_max_splits() -> u32 {
+    3
+}
+
+fn default_shard_context_lines() -> u32 {
+    20
+}
+
 /// Task contract — defines what a task does, how it runs, and gating rules
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct TaskContract {
@@ -436,6 +569,10 @@ pub struct TaskContract {
     /// the agent's findings for gating.
     #[serde(default)]
     pub preflight: Vec<PreflightCheck>,
+    /// Sharding configuration. `Some` switches `clausura run` to the
+    /// sharded audit path (per-file diffs grouped into bounded shards).
+    #[serde(default)]
+    pub sharding: Option<ShardingConfig>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -490,6 +627,13 @@ pub struct ExecutionReport {
     pub errors: Vec<String>,
     #[serde(default)]
     pub violations: Vec<RuleViolation>,
+    /// Outcome status independent of gating: `complete`, `incomplete`
+    /// (agent loop ended without a clean stop), or `error`.
+    #[serde(default)]
+    pub status: RunStatus,
+    /// Machine-readable cause when `status` is not `complete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<IncompleteReason>,
 }
 
 /// Context about the CI environment
@@ -779,6 +923,7 @@ mod tests {
             on_incomplete: OnIncompletePolicy::Fail,
             mcp_servers: vec![],
             preflight: vec![],
+            sharding: None,
         };
         assert_eq!(contract.ambiguity_policy, AmbiguityPolicy::FailClosed);
         assert!(contract.gating_rules.is_empty());
@@ -803,10 +948,53 @@ mod tests {
             snapshot_id: None,
             errors: vec![],
             violations: vec![],
+            status: RunStatus::Complete,
+            incomplete_reason: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         let deserialized: ExecutionReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, deserialized);
+    }
+
+    #[test]
+    fn test_execution_report_status_defaults_and_serialization() {
+        // Old serialized reports (without status fields) still deserialize.
+        let legacy = r#"{
+            "task_id": "task-1", "exit_code": 2, "findings": [],
+            "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "duration_ms": 0
+        }"#;
+        let report: ExecutionReport = serde_json::from_str(legacy).unwrap();
+        assert_eq!(report.status, RunStatus::Incomplete);
+        assert_eq!(report.incomplete_reason, None);
+
+        let report = ExecutionReport {
+            task_id: "task-2".into(),
+            exit_code: 2,
+            findings: vec![],
+            token_usage: Usage::default(),
+            duration_ms: 0,
+            snapshot_id: None,
+            errors: vec![],
+            violations: vec![],
+            status: RunStatus::Incomplete,
+            incomplete_reason: Some(IncompleteReason::ContextLimit),
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"incomplete_reason\":\"context_limit\""));
+        assert!(json.contains("\"status\":\"incomplete\""));
+    }
+
+    #[test]
+    fn test_incomplete_reason_codes() {
+        assert_eq!(IncompleteReason::ContextLimit.as_str(), "context_limit");
+        assert_eq!(IncompleteReason::IterationLimit.as_str(), "iteration_limit");
+        assert_eq!(IncompleteReason::TokenCap.as_str(), "token_cap");
+        assert_eq!(IncompleteReason::Length.as_str(), "length");
+        assert_eq!(IncompleteReason::ContentFilter.as_str(), "content_filter");
+        assert_eq!(IncompleteReason::Timeout.as_str(), "timeout");
+        assert_eq!(IncompleteReason::MalformedJson.as_str(), "malformed_json");
+        assert_eq!(IncompleteReason::Other.as_str(), "other");
     }
 
     #[test]

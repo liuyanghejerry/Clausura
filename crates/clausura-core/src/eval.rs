@@ -815,6 +815,8 @@ mod tests {
             snapshot_id: None,
             errors: vec![],
             violations: vec![],
+            status: crate::types::RunStatus::Complete,
+            incomplete_reason: None,
         }
     }
 
@@ -918,6 +920,7 @@ mod tests {
             RunEvent::RunEnd {
                 truncated: false,
                 duration_ms: 5,
+                incomplete_reason: None,
             },
         ];
         let m = metrics_from_run("s", "v", 0, &empty_report(), &events, &[]);

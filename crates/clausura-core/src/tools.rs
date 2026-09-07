@@ -360,7 +360,10 @@ impl Tool for GitDiffTool {
     }
 
     fn description(&self) -> &str {
-        "Get the git diff. Use with 'base' to diff against a branch, or 'staged' for staged changes only."
+        "Get the git diff. Use 'base' to diff against a branch, or 'staged' for staged \
+         changes only. Prefer 'path' to scope the diff to a single file (much cheaper \
+         than diffing the whole repo), and 'context' to request more surrounding \
+         lines per hunk when validating a finding."
     }
 
     fn parameters(&self) -> Value {
@@ -374,6 +377,14 @@ impl Tool for GitDiffTool {
                 "staged": {
                     "type": "boolean",
                     "description": "Show staged changes only"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Restrict the diff to this file (workspace-relative path)"
+                },
+                "context": {
+                    "type": "integer",
+                    "description": "Lines of surrounding context per hunk (--unified=N, default 3)"
                 }
             }
         })
@@ -382,16 +393,25 @@ impl Tool for GitDiffTool {
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let base = args["base"].as_str();
         let staged = args["staged"].as_bool().unwrap_or(false);
+        let path = args["path"].as_str();
+        let context = args["context"].as_u64().filter(|c| *c <= 100);
 
-        let git_args: &[&str] = if let Some(base_ref) = base {
-            &["diff", base_ref]
+        let mut git_args: Vec<String> = vec!["diff".to_string()];
+        if let Some(c) = context {
+            git_args.push(format!("--unified={c}"));
+        }
+        if let Some(base_ref) = base {
+            git_args.push(base_ref.to_string());
         } else if staged {
-            &["diff", "--cached"]
-        } else {
-            &["diff"]
-        };
+            git_args.push("--cached".to_string());
+        }
+        if let Some(p) = path {
+            git_args.push("--".to_string());
+            git_args.push(p.to_string());
+        }
+        let refs: Vec<&str> = git_args.iter().map(|s| s.as_str()).collect();
 
-        let output = self.run_git(git_args).await?;
+        let output = self.run_git(&refs).await?;
         Ok(truncate_output_with_spill(output, self.spill.as_deref()))
     }
 }
@@ -1581,20 +1601,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     async fn init_git_repo(root: &Path) {
+        run_git_in(root, &["init"]).await;
+        run_git_in(root, &["config", "user.email", "test@test.com"]).await;
+        run_git_in(root, &["config", "user.name", "Test"]).await;
+    }
+
+    /// Run `git <args...>` inside `root`. Args exclude the program name.
+    async fn run_git_in(root: &Path, args: &[&str]) {
         tokio::process::Command::new("git")
-            .args(["init"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-        tokio::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(root)
-            .output()
-            .await
-            .unwrap();
-        tokio::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
+            .args(args)
             .current_dir(root)
             .output()
             .await
@@ -1661,6 +1676,80 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_empty(), "Expected non-empty diff against HEAD");
+    }
+
+    #[tokio::test]
+    async fn test_git_diff_scoped_to_single_file() {
+        let (_tmp, root) = setup_workspace();
+        init_git_repo(&root).await;
+
+        std::fs::write(root.join("a.txt"), "a1").unwrap();
+        std::fs::write(root.join("b.txt"), "b1").unwrap();
+        run_git_in(&root, &["add", "."]).await;
+        run_git_in(&root, &["commit", "-m", "initial"]).await;
+
+        std::fs::write(root.join("a.txt"), "a2").unwrap();
+        std::fs::write(root.join("b.txt"), "b2").unwrap();
+
+        let tool = GitDiffTool::new(root.clone());
+        let result = tool
+            .execute(serde_json::json!({"base": "HEAD", "path": "a.txt"}))
+            .await
+            .unwrap();
+        assert!(result.contains("a.txt"), "diff must cover a.txt: {result}");
+        assert!(
+            !result.contains("b.txt"),
+            "diff must not cover b.txt: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_git_diff_context_lines() {
+        let (_tmp, root) = setup_workspace();
+        init_git_repo(&root).await;
+
+        // 12 numbered lines committed, then line 6 is changed.
+        let original: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(root.join("file.txt"), original).unwrap();
+        run_git_in(&root, &["add", "."]).await;
+        run_git_in(&root, &["commit", "-m", "initial"]).await;
+        let modified: String = (1..=12)
+            .map(|i| {
+                if i == 6 {
+                    "line CHANGED\n".to_string()
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        std::fs::write(root.join("file.txt"), modified).unwrap();
+
+        let tool = GitDiffTool::new(root.clone());
+        let narrow = tool
+            .execute(serde_json::json!({"base": "HEAD", "context": 0}))
+            .await
+            .unwrap();
+        let wide = tool
+            .execute(serde_json::json!({"base": "HEAD", "context": 10}))
+            .await
+            .unwrap();
+
+        // --unified=0: no context lines (only the changed line + markers).
+        let narrow_context = narrow.lines().any(|l| l.starts_with(' ') && !l.is_empty());
+        assert!(
+            !narrow_context,
+            "--unified=0 must not include context lines: {narrow}"
+        );
+        // --unified=10: the change is at line 6 of 12, so both line 1 and
+        // line 12 fall inside the hunk as context.
+        assert!(
+            wide.contains("line 1\n") || wide.contains(" line 1"),
+            "wide hunk should reach line 1: {wide}"
+        );
+        assert!(
+            wide.contains("line 12"),
+            "wide hunk should reach line 12: {wide}"
+        );
     }
 
     #[tokio::test]

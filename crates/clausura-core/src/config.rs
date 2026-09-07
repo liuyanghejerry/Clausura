@@ -8,8 +8,8 @@
 /// The API key is NEVER read from the YAML file — it must come from
 /// a CLI flag or the `CLAUSURA_API_KEY` environment variable.
 use crate::types::{
-    AmbiguityPolicy, ConfigError, GateAction, GateRule, OnIncompletePolicy, Severity, TaskContract,
-    VendorConfig,
+    AmbiguityPolicy, ConfigError, GateAction, GateRule, OnIncompletePolicy, Severity, ShardBudget,
+    ShardIncompletePolicy, ShardingConfig, TaskContract, VendorConfig, VendorType,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -39,6 +39,11 @@ pub struct Config {
     pub workspace: PathBuf,
     /// Output path for SARIF results.
     pub output: PathBuf,
+    /// Optional path for the machine-readable run summary JSON
+    /// (`--summary`). Written by the executor at the end of a run; carries
+    /// `status`, `reason`, findings count, exit code, token usage, and
+    /// duration. `None` disables the summary (non-sharded default).
+    pub summary: Option<PathBuf>,
     /// Whether to resume from a previous checkpoint.
     pub resume: bool,
     /// Log output format.
@@ -98,6 +103,8 @@ struct YamlTaskConfig {
     mcp_servers: Vec<YamlMcpServerConfig>,
     #[serde(default)]
     preflight: Vec<YamlPreflightCheck>,
+    #[serde(default)]
+    sharding: Option<YamlShardingConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +124,55 @@ struct YamlMcpServerConfig {
     args: Vec<String>,
     #[serde(default)]
     env: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct YamlShardBudget {
+    #[serde(default)]
+    token_budget: Option<u64>,
+    #[serde(default)]
+    max_total_tokens: Option<u64>,
+    #[serde(default)]
+    max_iterations: Option<u32>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YamlShardingConfig {
+    base: String,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default = "yaml_default_max_diff_bytes")]
+    max_diff_bytes: usize,
+    #[serde(default = "yaml_default_max_files_per_shard")]
+    max_files_per_shard: usize,
+    #[serde(default = "yaml_default_max_splits")]
+    max_splits: u32,
+    #[serde(default = "yaml_default_shard_context_lines")]
+    context_lines: u32,
+    #[serde(default)]
+    per_shard: YamlShardBudget,
+    #[serde(default)]
+    on_shard_incomplete: String,
+    #[serde(default)]
+    risk_patterns: std::collections::BTreeMap<String, String>,
+}
+
+fn yaml_default_max_diff_bytes() -> usize {
+    128 * 1024
+}
+
+fn yaml_default_max_files_per_shard() -> usize {
+    8
+}
+
+fn yaml_default_max_splits() -> u32 {
+    3
+}
+
+fn yaml_default_shard_context_lines() -> u32 {
+    20
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +268,17 @@ fn parse_on_incomplete(s: &str) -> OnIncompletePolicy {
     }
 }
 
+fn parse_shard_policy(s: &str) -> Result<ShardIncompletePolicy, ConfigError> {
+    match s.to_lowercase().as_str() {
+        "bisect" | "" => Ok(ShardIncompletePolicy::Bisect),
+        "fail" => Ok(ShardIncompletePolicy::Fail),
+        "pass" => Ok(ShardIncompletePolicy::Pass),
+        other => Err(ConfigError::ValidationError(format!(
+            "sharding.on_shard_incomplete must be one of bisect|fail|pass, got '{other}'"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -261,6 +328,39 @@ fn validate_yaml(yaml: &YamlConfig) -> Result<(), ConfigError> {
                     s.name
                 )));
             }
+        }
+    }
+    if let Some(sh) = &yaml.task.sharding {
+        if sh.base.trim().is_empty() {
+            return Err(ConfigError::ValidationError(
+                "sharding.base must be a non-empty git ref".into(),
+            ));
+        }
+        if sh.max_diff_bytes == 0 {
+            return Err(ConfigError::ValidationError(
+                "sharding.max_diff_bytes must be > 0".into(),
+            ));
+        }
+        if sh.max_files_per_shard == 0 {
+            return Err(ConfigError::ValidationError(
+                "sharding.max_files_per_shard must be > 0".into(),
+            ));
+        }
+        if sh.context_lines > 100 {
+            return Err(ConfigError::ValidationError(
+                "sharding.context_lines must be <= 100".into(),
+            ));
+        }
+        parse_shard_policy(&sh.on_shard_incomplete)?;
+        let b = &sh.per_shard;
+        if b.token_budget == Some(0)
+            || b.max_total_tokens == Some(0)
+            || b.max_iterations == Some(0)
+            || b.timeout_secs == Some(0)
+        {
+            return Err(ConfigError::ValidationError(
+                "sharding.per_shard values must be > 0 when set".into(),
+            ));
         }
     }
     Ok(())
@@ -345,6 +445,7 @@ impl Config {
                     on_incomplete: default_on_incomplete(),
                     mcp_servers: vec![],
                     preflight: vec![],
+                    sharding: None,
                 },
                 None,
             )
@@ -360,7 +461,16 @@ impl Config {
             .ok()
             .or_else(|| cli_vendor.map(|v| v.to_string()))
             .unwrap_or_else(|| yaml_task.vendor.clone());
-        let vendor = VendorConfig::from_name(&vendor_input);
+        let mut vendor = VendorConfig::from_name(&vendor_input);
+        // Any OpenAI-compatible endpoint can be pointed at via env override,
+        // regardless of the vendor shorthand in the config (e.g. enterprise
+        // gateways and regional providers).
+        if let Ok(base_url) = std::env::var("CLAUSURA_BASE_URL") {
+            if !base_url.trim().is_empty() {
+                vendor.vendor_type = VendorType::OpenAiCompatible;
+                vendor.base_url = Some(base_url.trim().to_string());
+            }
+        }
 
         let token_budget = std::env::var("CLAUSURA_TOKEN_BUDGET")
             .ok()
@@ -506,10 +616,31 @@ impl Config {
                         }
                     })
                     .collect(),
+                sharding: yaml_task.sharding.map(|s| {
+                    let policy = parse_shard_policy(&s.on_shard_incomplete)
+                        .unwrap_or(ShardIncompletePolicy::Bisect);
+                    ShardingConfig {
+                        base: s.base,
+                        paths: s.paths,
+                        max_diff_bytes: s.max_diff_bytes,
+                        max_files_per_shard: s.max_files_per_shard,
+                        max_splits: s.max_splits,
+                        context_lines: s.context_lines,
+                        per_shard: ShardBudget {
+                            token_budget: s.per_shard.token_budget,
+                            max_total_tokens: s.per_shard.max_total_tokens,
+                            max_iterations: s.per_shard.max_iterations,
+                            timeout_secs: s.per_shard.timeout_secs,
+                        },
+                        on_shard_incomplete: policy,
+                        risk_patterns: s.risk_patterns,
+                    }
+                }),
             },
             api_key,
             workspace,
             output,
+            summary: None,
             resume,
             log_format,
         })
@@ -1532,6 +1663,7 @@ task:
 
     #[test]
     fn test_defaults_when_no_config_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let config = Config::load(
             None,
             Some("gpt-4o"),
@@ -2248,5 +2380,239 @@ task:
         assert_eq!(check.message_field, "message");
         assert_eq!(check.file_field, "file");
         assert_eq!(check.default_severity, "warning");
+    }
+
+    #[test]
+    fn test_sharding_config_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+version: "1"
+task:
+  name: sharded-audit
+  model: gpt-4o
+  vendor: openai
+  token_budget: 8000
+  sharding:
+    base: origin/main
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        let sharding = config.task.sharding.expect("sharding must be parsed");
+        assert_eq!(sharding.base, "origin/main");
+        assert_eq!(sharding.max_diff_bytes, 128 * 1024);
+        assert_eq!(sharding.max_files_per_shard, 8);
+        assert_eq!(sharding.max_splits, 3);
+        assert_eq!(sharding.context_lines, 20);
+        assert_eq!(
+            sharding.on_shard_incomplete,
+            crate::types::ShardIncompletePolicy::Bisect
+        );
+        assert_eq!(sharding.per_shard, crate::types::ShardBudget::default());
+        assert!(sharding.paths.is_empty());
+    }
+
+    #[test]
+    fn test_sharding_config_full() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+version: "1"
+task:
+  name: sharded-audit
+  model: gpt-4o
+  token_budget: 8000
+  sharding:
+    base: main
+    paths: ["packages/server/src"]
+    max_diff_bytes: 65536
+    max_files_per_shard: 4
+    max_splits: 5
+    context_lines: 10
+    on_shard_incomplete: fail
+    per_shard:
+      token_budget: 300000
+      max_total_tokens: 300000
+      max_iterations: 12
+      timeout_secs: 300
+    risk_patterns:
+      danger-zone: "danger_zone\\("
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        let sharding = config.task.sharding.unwrap();
+        assert_eq!(sharding.paths, vec!["packages/server/src"]);
+        assert_eq!(sharding.max_diff_bytes, 65536);
+        assert_eq!(sharding.max_files_per_shard, 4);
+        assert_eq!(sharding.max_splits, 5);
+        assert_eq!(sharding.context_lines, 10);
+        assert_eq!(
+            sharding.on_shard_incomplete,
+            crate::types::ShardIncompletePolicy::Fail
+        );
+        assert_eq!(sharding.per_shard.token_budget, Some(300000));
+        assert_eq!(sharding.per_shard.max_iterations, Some(12));
+        assert_eq!(
+            sharding
+                .risk_patterns
+                .get("danger-zone")
+                .map(String::as_str),
+            Some("danger_zone\\(")
+        );
+    }
+
+    #[test]
+    fn test_sharding_invalid_policy_rejected() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+version: "1"
+task:
+  name: bad-policy
+  model: gpt-4o
+  token_budget: 8000
+  sharding:
+    base: main
+    on_shard_incomplete: explode
+"#;
+        let file = write_yaml(yaml);
+        let result = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sharding_empty_base_rejected() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+version: "1"
+task:
+  name: empty-base
+  model: gpt-4o
+  token_budget: 8000
+  sharding:
+    base: ""
+"#;
+        let file = write_yaml(yaml);
+        let result = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_no_sharding_section_is_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let yaml = r#"
+version: "1"
+task:
+  name: plain
+  model: gpt-4o
+  token_budget: 8000
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        assert!(config.task.sharding.is_none());
+    }
+
+    #[test]
+    fn test_base_url_env_overrides_vendor_endpoint() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CLAUSURA_BASE_URL", "https://open.bigmodel.cn/api/paas/v4");
+        let yaml = r#"
+version: "1"
+task:
+  name: custom-endpoint
+  model: some-model
+  vendor: openai
+  token_budget: 8000
+"#;
+        let file = write_yaml(yaml);
+        let config = Config::load(
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::current_dir().unwrap(),
+            "output.sarif".into(),
+            false,
+            LogFormat::Json,
+        )
+        .unwrap();
+        std::env::remove_var("CLAUSURA_BASE_URL");
+        assert_eq!(
+            config.task.vendor.vendor_type,
+            crate::types::VendorType::OpenAiCompatible
+        );
+        assert_eq!(
+            config.task.vendor.base_url.as_deref(),
+            Some("https://open.bigmodel.cn/api/paas/v4")
+        );
     }
 }

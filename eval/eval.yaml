@@ -59,6 +59,35 @@ scenarios:
           task:
             token_budget: 60000
 
+  - name: sharded-security-audit
+    description: >
+      A multi-file "PR" (~10KB across 6 files) with three seeded security
+      findings (SQL injection, hardcoded secret, XSS) plus three large
+      low-risk filler files. The default variant audits it through the
+      sharded path (2 files / 2KB of diff per shard, 300k-token-equivalent
+      per-shard budgets scaled down for eval); the monolithic variant
+      reproduces the old failing shape — one tiny-budget agent run over the
+      whole diff — and is expected to end incomplete with lost recall.
+      Metric of interest: findings recall and run completeness per variant.
+    workspace: scenarios/sharded-security-audit/workspace
+    config: .clausura.yaml
+    ground_truth:
+      - rule_id: sql-injection
+        min_findings: 1
+      - rule_id: hardcoded-secret
+        min_findings: 1
+      - rule_id: xss
+        min_findings: 1
+    runs: 1
+    variants:
+      - name: sharded
+      - name: monolithic
+        config_overrides:
+          task:
+            sharding: null
+            token_budget: 2000
+            max_iterations: 3
+
   - name: rust-service
     description: >
       A multi-crate Rust service (core/store/api). Five rule categories with

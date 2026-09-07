@@ -8,16 +8,20 @@ pub struct SarifFormatter;
 impl SarifFormatter {
     /// Convert findings to SARIF JSON string.
     pub fn to_string(findings: &[Finding]) -> Result<String, serde_json::Error> {
-        Self::to_string_with_status(findings, false)
+        Self::to_string_with_status(findings, false, None)
     }
 
     /// Convert findings to SARIF JSON string, marking the run as incomplete
     /// (agent loop truncated or iteration limit reached) when requested.
+    /// `reason` is the machine-readable `IncompleteReason` code, written to
+    /// `invocations[0].properties.incompleteReason` so CI can tell context
+    /// limits apart from iteration caps, timeouts, and malformed answers.
     pub fn to_string_with_status(
         findings: &[Finding],
         incomplete: bool,
+        reason: Option<&str>,
     ) -> Result<String, serde_json::Error> {
-        let sarif = Self::build_sarif(findings, incomplete);
+        let sarif = Self::build_sarif(findings, incomplete, reason);
         serde_json::to_string_pretty(&sarif)
     }
 
@@ -26,7 +30,7 @@ impl SarifFormatter {
         findings: &[Finding],
         path: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        Self::write_to_file_with_status(findings, path, false)
+        Self::write_to_file_with_status(findings, path, false, None)
     }
 
     /// Write SARIF output to a file, marking the run as incomplete when
@@ -35,13 +39,18 @@ impl SarifFormatter {
         findings: &[Finding],
         path: &Path,
         incomplete: bool,
+        reason: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let content = Self::to_string_with_status(findings, incomplete)?;
+        let content = Self::to_string_with_status(findings, incomplete, reason)?;
         fs::write(path, content)?;
         Ok(())
     }
 
-    fn build_sarif(findings: &[Finding], incomplete: bool) -> serde_json::Value {
+    fn build_sarif(
+        findings: &[Finding],
+        incomplete: bool,
+        reason: Option<&str>,
+    ) -> serde_json::Value {
         let results: Vec<serde_json::Value> =
             findings.iter().map(Self::finding_to_result).collect();
 
@@ -56,11 +65,14 @@ impl SarifFormatter {
         });
 
         if incomplete {
-            run["properties"] = serde_json::json!({ "incomplete": true });
+            run["properties"] = serde_json::json!({
+                "incomplete": true,
+                "status": "incomplete"
+            });
             run["invocations"] = serde_json::json!([{
                 "executionSuccessful": false,
                 "properties": {
-                    "incompleteReason": "context truncated or iteration limit reached"
+                    "incompleteReason": reason.unwrap_or("incomplete")
                 }
             }]);
         }
@@ -215,12 +227,28 @@ mod tests {
 
     #[test]
     fn test_incomplete_run_annotated() {
-        let sarif = SarifFormatter::to_string_with_status(&[], true).unwrap();
+        let sarif = SarifFormatter::to_string_with_status(&[], true, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&sarif).unwrap();
         assert_eq!(parsed["runs"][0]["properties"]["incomplete"], true);
+        assert_eq!(parsed["runs"][0]["properties"]["status"], "incomplete");
         assert_eq!(
             parsed["runs"][0]["invocations"][0]["executionSuccessful"],
             false
+        );
+        assert_eq!(
+            parsed["runs"][0]["invocations"][0]["properties"]["incompleteReason"],
+            "incomplete"
+        );
+    }
+
+    #[test]
+    fn test_incomplete_run_reason_code_written() {
+        let sarif =
+            SarifFormatter::to_string_with_status(&[], true, Some("context_limit")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+        assert_eq!(
+            parsed["runs"][0]["invocations"][0]["properties"]["incompleteReason"],
+            "context_limit"
         );
     }
 
@@ -230,7 +258,7 @@ mod tests {
         // omit the annotation entirely (not emit "incomplete": false).
         for sarif in [
             SarifFormatter::to_string(&[]).unwrap(),
-            SarifFormatter::to_string_with_status(&[], false).unwrap(),
+            SarifFormatter::to_string_with_status(&[], false, None).unwrap(),
         ] {
             let parsed: serde_json::Value = serde_json::from_str(&sarif).unwrap();
             assert!(parsed["runs"][0].get("properties").is_none());

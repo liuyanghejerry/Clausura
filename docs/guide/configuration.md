@@ -60,6 +60,25 @@ task:
   ambiguity_policy: fail_closed      # "fail_closed" or "proceed_with_caution".
   on_incomplete: fail                # "fail" (exit 2) or "pass" (continue with partial results).
 
+  # ── Sharding (large PRs) ──────────────────────────
+  # Setting `base` enables the sharded audit path: per-file diffs grouped
+  # into bounded shards, one bounded agent run per shard, bisect-and-retry
+  # on incomplete shards, aggregated gating. See docs/guide/sharding.md.
+  sharding:
+    base: origin/main                # Required. Diff base (resolved via merge-base).
+    paths: []                        # Optional path filters.
+    max_diff_bytes: 131072           # Per-shard diff byte budget (default 128 KiB).
+    max_files_per_shard: 8           # File-count cap per shard.
+    max_splits: 3                    # Bisect depth on incomplete retries.
+    context_lines: 20                # --unified context per hunk in per-file diffs.
+    on_shard_incomplete: bisect      # bisect | fail | pass.
+    per_shard:                       # Budget overrides for each shard run.
+      token_budget: 300000
+      max_total_tokens: 300000
+      max_iterations: 12
+      timeout_secs: 300
+    risk_patterns: {}                # Optional extra pre-scan patterns (tag: regex).
+
   # ── Gating Rules ──────────────────────────────────
   gating:                            # Optional. Evaluated in declaration order.
     - rule: sql-injection            # Rule ID. Matches findings by rule_id field.
@@ -298,6 +317,40 @@ task:
 | `fail` | Exit code 2 (error). An incomplete review with zero findings must not pass gates. |
 | `pass` | Evaluate what we have. Warning is logged. SARIF output is annotated with `incomplete: true`. |
 
+The incomplete reason is always reported machine-readably: SARIF
+`invocations[0].properties.incompleteReason` (e.g. `context_limit`,
+`iteration_limit`, `token_cap`, `timeout`, `malformed_json`) and, with
+`--summary <path>`, a standalone summary JSON. A final answer that never
+becomes parseable JSON no longer discards the run: ledger-persisted findings
+are kept and the run is reported `incomplete_reason=malformed_json`.
+
+### `task.sharding`
+
+**Default: absent (single-task path).** Setting `base` enables the sharded
+audit path for large PRs. Each shard runs in its own bounded agent loop with
+the `per_shard` budget overrides; incomplete shards are bisected and retried
+(`on_shard_incomplete: bisect`), and the aggregated findings go through the
+normal gating rules.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `base` | (required) | Git ref to diff against (resolved via merge-base). |
+| `paths` | `[]` | Optional path filters passed to `git diff --`. |
+| `max_diff_bytes` | `131072` | Per-shard diff byte budget. |
+| `max_files_per_shard` | `8` | File-count cap per shard. |
+| `max_splits` | `3` | Bisect depth for incomplete shards. |
+| `context_lines` | `20` | `--unified` context per hunk (max 100). |
+| `on_shard_incomplete` | `bisect` | `bisect`, `fail`, or `pass`. |
+| `per_shard` | (all unset) | `token_budget`, `max_total_tokens`, `max_iterations`, `timeout_secs` overrides per shard. |
+| `risk_patterns` | `{}` | Extra deterministic pre-scan patterns (tag → regex on added lines). |
+
+Sharded runs always write a summary JSON (`<output>.summary.json`, or
+`--summary`) listing per-shard statuses; a shard that never completes yields
+exit 2 with `status: incomplete` / `reason: shard_incomplete`, separate from
+gate violations (exit 1).
+
+→ [Sharded audits deep dive](sharding.md)
+
 ### `task.gating`
 
 An array of gating rules, evaluated in order. Each rule:
@@ -323,6 +376,8 @@ clausura run [OPTIONS]
       --api-key <KEY>       API key
       --token-budget <N>    Token budget override
       --timeout <SECS>      Timeout override
+      --summary <PATH>      Write a machine-readable run summary JSON
+                            (status, incomplete reason, findings count, usage)
       --max-iterations <N>  Max agent loop iterations      [default: 10]
       --shell-timeout <SECS> Per-command shell_exec timeout [default: 120]
       --workspace <PATH>    Workspace root                 [default: cwd]
@@ -349,6 +404,7 @@ clausura snapshot delete --thread <ID>                   Delete all checkpoints 
 | `CLAUSURA_API_KEY` | API key (required) | `sk-...` |
 | `CLAUSURA_MODEL` | `task.model` | `gpt-4o` |
 | `CLAUSURA_VENDOR` | `task.vendor` | `openai` |
+| `CLAUSURA_BASE_URL` | Provider base URL — points any OpenAI-compatible endpoint (e.g. `https://open.bigmodel.cn/api/paas/v4`) at any vendor shorthand | `https://api.deepseek.com/v1` |
 | `CLAUSURA_AMBIGUITY_POLICY` | `task.ambiguity_policy` | `fail_closed` |
 | `CLAUSURA_ON_INCOMPLETE` | `task.on_incomplete` | `fail` |
 | `CLAUSURA_TOKEN_BUDGET` | `task.token_budget` | `32000` |

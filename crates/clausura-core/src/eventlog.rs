@@ -69,6 +69,15 @@ pub enum RunEvent {
     RepeatReminder { tool_name: String, count: u32 },
     /// A corrective findings-recovery prompt was sent (attempt is 1-based).
     FindingsRecoveryAttempt { attempt: u32, error: String },
+    /// A Stop response's findings JSON failed to parse. `error_class` is one
+    /// of `json_parse` / `schema` / `empty`; `raw_preview` is the first 2 KB
+    /// of the raw assistant output (the full response is preserved in the
+    /// preceding `llm_response` event).
+    FindingsParseFailed {
+        error_class: String,
+        parse_error: String,
+        raw_preview: String,
+    },
     /// A message-state checkpoint (written alongside SQLite snapshot saves).
     Checkpoint {
         checkpoint_id: String,
@@ -76,7 +85,13 @@ pub enum RunEvent {
         truncated: bool,
     },
     /// The agent loop ended.
-    RunEnd { truncated: bool, duration_ms: u64 },
+    RunEnd {
+        truncated: bool,
+        duration_ms: u64,
+        /// Machine-readable `IncompleteReason` code when truncated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incomplete_reason: Option<String>,
+    },
 }
 
 /// Writer for the run event log.
