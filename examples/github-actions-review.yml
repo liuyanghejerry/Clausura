@@ -1,0 +1,27 @@
+# Copy to .github/workflows/clausura.yml in the repository to review.
+# Use an Action ref and binary release containing --base (after v1.7.0).
+name: Clausura Review
+on: [pull_request]
+permissions:
+  contents: read
+jobs:
+  review:
+    # Fork PRs and Dependabot do not receive the model secret in this workflow.
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Install configured MCP servers / language servers here, before review.
+      - name: Review committed PR changes
+        id: clausura
+        uses: liuyanghejerry/Clausura@v1
+        with:
+          config: .clausura.yaml
+          api_key: ${{ secrets.LLM_API_KEY }}
+          base: ${{ github.event.pull_request.base.sha }}

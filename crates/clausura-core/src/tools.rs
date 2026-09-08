@@ -315,6 +315,7 @@ impl Tool for ReadFileTool {
 /// Runs git diff to get code changes.
 pub struct GitDiffTool {
     workspace_root: PathBuf,
+    review_range: Option<(String, String)>,
     spill: Option<Arc<SpillStore>>,
 }
 
@@ -323,7 +324,15 @@ impl GitDiffTool {
         Self {
             workspace_root,
             spill: None,
+            review_range: None,
         }
+    }
+
+    /// Pin review diffs to committed changes, independent of worktree edits and
+    /// model-supplied base/staged arguments. Path and context remain available.
+    pub fn with_review_range(mut self, range: (String, String)) -> Self {
+        self.review_range = Some(range);
+        self
     }
 
     /// Attach a spill store (if any) so oversized outputs are saved to disk
@@ -360,6 +369,11 @@ impl Tool for GitDiffTool {
     }
 
     fn description(&self) -> &str {
+        if self.review_range.is_some() {
+            return "Get committed changes in the configured PR range. The range is fixed; \
+                    base and staged arguments do not override it. Use path to select a file \
+                    and context for surrounding lines.";
+        }
         "Get the git diff. Use 'base' to diff against a branch, or 'staged' for staged \
          changes only. Prefer 'path' to scope the diff to a single file (much cheaper \
          than diffing the whole repo), and 'context' to request more surrounding \
@@ -400,7 +414,10 @@ impl Tool for GitDiffTool {
         if let Some(c) = context {
             git_args.push(format!("--unified={c}"));
         }
-        if let Some(base_ref) = base {
+        if let Some((merge_base, head)) = &self.review_range {
+            git_args.push(merge_base.clone());
+            git_args.push(head.clone());
+        } else if let Some(base_ref) = base {
             git_args.push(base_ref.to_string());
         } else if staged {
             git_args.push("--cached".to_string());
@@ -1614,6 +1631,56 @@ mod tests {
             .output()
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_review_range_in_clean_diverged_checkout() {
+        let (_tmp, root) = setup_workspace();
+        init_git_repo(&root).await;
+        std::fs::write(root.join("shared.txt"), "original\n").unwrap();
+        run_git_in(&root, &["add", "."]).await;
+        run_git_in(&root, &["commit", "-m", "initial"]).await;
+        run_git_in(&root, &["branch", "review-base"]).await;
+        run_git_in(&root, &["checkout", "-b", "feature"]).await;
+        std::fs::write(root.join("feature.txt"), "PR change\n").unwrap();
+        run_git_in(&root, &["add", "."]).await;
+        run_git_in(&root, &["commit", "-m", "feature"]).await;
+        run_git_in(&root, &["checkout", "review-base"]).await;
+        std::fs::write(root.join("base-only.txt"), "unrelated base change\n").unwrap();
+        run_git_in(&root, &["add", "."]).await;
+        run_git_in(&root, &["commit", "-m", "base advanced"]).await;
+        run_git_in(&root, &["checkout", "feature"]).await;
+
+        assert!(GitDiffTool::new(root.clone())
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap()
+            .is_empty());
+        let range = crate::executor::resolve_review_range(&root, "review-base")
+            .await
+            .unwrap();
+        let tool = GitDiffTool::new(root.clone()).with_review_range(range);
+        let diff = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(diff.contains("PR change"));
+        assert!(!diff.contains("base-only"));
+        // Dirty worktrees and model-supplied arguments cannot change the PR scope.
+        std::fs::write(root.join("shared.txt"), "local edit\n").unwrap();
+        let fixed = tool
+            .execute(serde_json::json!({"base": "HEAD", "staged": true}))
+            .await
+            .unwrap();
+        assert_eq!(diff, fixed);
+        assert!(tool
+            .execute(serde_json::json!({"path": "shared.txt"}))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(crate::executor::resolve_review_range(&root, "missing-ref")
+            .await
+            .is_err());
+        assert!(crate::executor::resolve_review_range(&root, "--help")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

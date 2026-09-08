@@ -179,6 +179,7 @@ clausura run
 ```bash
 clausura run --validate-config
 clausura run --dry-run  # show the execution plan
+clausura run --base origin/main  # committed PR changes; fetch the base/history first
 ```
 
 ### Exit codes
@@ -362,6 +363,7 @@ clausura run [OPTIONS]
       --timeout <SECS>      Timeout override
       --max-iterations <N>  Max agent loop iterations  [default: 10]
       --shell-timeout <SECS>  Per-command shell_exec timeout  [default: 120]
+      --base <REF>             Review merge-base(REF, HEAD)..HEAD (also overrides sharding.base)
       --workspace <PATH>    Workspace root            [default: cwd]
       --output <PATH>       SARIF output path          [default: clausura-output.sarif]
       --summary <PATH>      Machine-readable run summary JSON (status, reason, findings count, usage)
@@ -403,67 +405,68 @@ Clausura auto-detects your CI environment using well-known environment variables
 
 ### GitHub Actions
 
-Use the composite action directly:
+Use a full PR workflow, including checkout of the PR head and history:
 
 ```yaml
-- uses: liuyanghejerry/Clausura@v1
-  with:
-    config: .clausura.yaml
-    api_key: ${{ secrets.LLM_API_KEY }}
-    model: gpt-4o
-    vendor: openai
-    token_budget: 32000
-    timeout: 300
-    version: latest        # optional: release version to install (e.g. "1.0.8", default "latest")
+# Copy to .github/workflows/clausura.yml in the repository to review.
+# Use an Action ref and binary release containing --base (after v1.7.0).
+name: Clausura Review
+on: [pull_request]
+permissions:
+  contents: read
+jobs:
+  review:
+    # Fork PRs and Dependabot do not receive the model secret in this workflow.
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Install configured MCP servers / language servers here, before review.
+      - name: Review committed PR changes
+        id: clausura
+        uses: liuyanghejerry/Clausura@v1
+        with:
+          config: .clausura.yaml
+          api_key: ${{ secrets.LLM_API_KEY }}
+          base: ${{ github.event.pull_request.base.sha }}
 ```
 
-The action downloads the matching release binary for the runner's OS/arch (Linux and macOS, x86_64 and aarch64), verifies it against the release's SHA256 `checksums.txt`, and adds it to `PATH` before running.
+The updated Action / `--base` behavior requires a release after v1.7.0 containing
+these changes. Until then, build this branch; see the
+[CI guide](docs/guide/ci-integration.md) for the direct-binary path.
 
-Or run via the binary:
+The Action reviews `merge-base(base, HEAD)..HEAD`, uploads SARIF, summary JSON
+(when available), the execution log and exit code, then preserves the review's
+pass/fail result. Missing history fails before model calls. Install MCP and
+language servers **before** invoking the Action. Fork/Dependabot PRs are skipped
+in this secret-backed example; arrange separate trusted review for them.
 
-```yaml
-- name: Run Clausura
-  run: clausura run
-  env:
-    CLAUSURA_API_KEY: ${{ secrets.LLM_API_KEY }}
-```
+See the [complete workflow](examples/github-actions-review.yml) and
+[CI guide](docs/guide/ci-integration.md) for optional code-scanning upload, matrix
+artifact names, permissions, direct binary and Docker usage.
 
-### GitLab CI
+### GitLab CI, Jenkins and generic CI
 
-```yaml
-clausura-review:
-  image: ghcr.io/liuyanghejerry/clausura:latest
-  script:
-    - clausura run
-  variables:
-    CLAUSURA_API_KEY: $LLM_API_KEY
-    CLAUSURA_MODEL: "gpt-4o"
-```
-
-### Jenkins
-
-```groovy
-stage('Code Review') {
-    environment {
-        CLAUSURA_API_KEY = credentials('llm-api-key')
-    }
-    steps {
-        sh 'clausura run --model gpt-4o'
-    }
-}
-```
-
-### Generic CI
-
-Set `CI=true` and the relevant `CI_*` environment variables:
+CI detection supplies metadata; select the committed review range explicitly:
 
 ```bash
-export CI=true
-export CLAUSURA_API_KEY=sk-...
-clausura run
+# Ensure the base ref and full history are available in the checkout.
+clausura run --base origin/main --summary clausura-summary.json
 ```
 
-Custom context variables for Generic CI: `CI_REPO`, `CI_PR_NUMBER`, `CI_COMMIT_SHA`, `CI_BRANCH`.
+On GitLab MR pipelines use `--base "$CI_MERGE_REQUEST_DIFF_BASE_SHA"` with
+`GIT_DEPTH: "0"`; on Jenkins fetch the target branch before passing its ref.
+Upload existing SARIF/summary files even on failure. The
+[CI integration guide](docs/guide/ci-integration.md) contains platform examples.
+
+Without `--base`, non-sharded CLI runs retain working-tree diff behavior.
+For sharded runs, `--base` overrides the configured `sharding.base`.
 
 ### Supported platforms
 
@@ -550,14 +553,10 @@ RUN npm i -g typescript-language-server
 RUN pip install pyright
 ```
 
-For GitHub Actions:
+For GitHub Actions, add these dependency steps **between checkout and the
+Clausura Action** in the complete workflow above:
 
 ```yaml
-- uses: liuyanghejerry/Clausura@v1
-  with:
-    config: .clausura.yaml
-    api_key: ${{ secrets.LLM_API_KEY }}
-
 - name: Install agent-lsp
   run: curl -fsSL https://raw.githubusercontent.com/blackwell-systems/agent-lsp/main/install.sh | sh
 
@@ -568,10 +567,16 @@ For GitHub Actions:
     pip install pyright
 
 - name: Run review with LSP
-  run: clausura run
-  env:
-    CLAUSURA_API_KEY: ${{ secrets.LLM_API_KEY }}
+  id: clausura
+  uses: liuyanghejerry/Clausura@v1
+  with:
+    config: examples/mcp-lsp-review.yaml
+    api_key: ${{ secrets.LLM_API_KEY }}
+    base: ${{ github.event.pull_request.base.sha }}
 ```
+
+The Action installs Clausura and executes the review once; it is not an
+install-only step. MCP tools/preflight currently require the non-sharded path.
 
 ## Architecture
 

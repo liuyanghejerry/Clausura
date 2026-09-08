@@ -43,6 +43,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub workspace: Option<PathBuf>,
 
+    /// Review merge-base(BASE, HEAD)..HEAD; overrides sharding.base when sharding is enabled
+    #[arg(long)]
+    pub base: Option<String>,
+
     /// Output path for SARIF
     #[arg(long)]
     pub output: Option<PathBuf>,
@@ -130,6 +134,22 @@ pub async fn execute(args: RunArgs) -> i32 {
         return 0;
     }
 
+    if let Some(base) = &args.base {
+        match clausura_core::executor::resolve_review_range(&config.workspace, base).await {
+            Ok(range) => {
+                eprintln!("  Review range: {}..{}", range.0, range.1);
+                if let Some(sharding) = &mut config.task.sharding {
+                    sharding.base = range.0.clone();
+                }
+                config.review_range = Some(range);
+            }
+            Err(e) => {
+                eprintln!("Error: Cannot resolve review base {base}: {e}. Fetch the base ref and full history before running.");
+                return 2;
+            }
+        }
+    }
+
     if args.dry_run {
         step(2, total_steps, "Planning execution...");
         eprintln!();
@@ -172,7 +192,8 @@ pub async fn execute(args: RunArgs) -> i32 {
                     );
                 }
                 Err(e) => {
-                    eprintln!("    {} plan unavailable: {}", "Warning:".yellow().bold(), e);
+                    eprintln!("    {} plan unavailable: {}", "Error:".red().bold(), e);
+                    return 2;
                 }
             }
         } else {

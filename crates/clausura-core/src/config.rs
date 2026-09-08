@@ -44,6 +44,8 @@ pub struct Config {
     /// `status`, `reason`, findings count, exit code, token usage, and
     /// duration. `None` disables the summary (non-sharded default).
     pub summary: Option<PathBuf>,
+    /// Explicit committed review range (merge-base SHA, head SHA), set by `--base`.
+    pub review_range: Option<(String, String)>,
     /// Whether to resume from a previous checkpoint.
     pub resume: bool,
     /// Log output format.
@@ -641,6 +643,7 @@ impl Config {
             workspace,
             output,
             summary: None,
+            review_range: None,
             resume,
             log_format,
         })
