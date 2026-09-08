@@ -1,0 +1,36 @@
+version: "1"
+task:
+  name: sharded-security-audit
+  model: gpt-4o
+  vendor: openai
+  skill_prompts:
+    - security-review
+  token_budget: 8000
+  timeout_secs: 600
+  max_iterations: 10
+  ambiguity_policy: fail_closed
+  on_incomplete: fail
+  sharding:
+    base: HEAD~1
+    max_diff_bytes: 2048
+    max_files_per_shard: 2
+    per_shard:
+      token_budget: 16000
+      max_iterations: 12
+      timeout_secs: 300
+  gating:
+    - rule: sql-injection
+      description: Block on SQL injection
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: hardcoded-secret
+      description: Block on hardcoded secrets
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: xss
+      description: Block on XSS
+      min_severity: error
+      max_findings: 0
+      action: fail

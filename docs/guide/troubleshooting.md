@@ -53,12 +53,26 @@ Common issues, error codes, and debugging strategies for Clausura.
 
 **Symptom:** Run ends with exit code 2 and the error message includes "Agent run incomplete."
 
+The machine-readable cause is in the error (`incomplete_reason=...`), in the
+SARIF output (`invocations[0].properties.incompleteReason`), and — with
+`--summary <path>` — in a standalone summary JSON:
+
+| Reason code | Meaning | First fix to try |
+|---|---|---|
+| `context_limit` | Conversation couldn't be truncated further under `token_budget` | Shrink the input, or shard the audit |
+| `iteration_limit` | `max_iterations` exhausted without a final answer | More focused task; check for tool loops |
+| `token_cap` | Cumulative `max_total_tokens` reached | Split the work; shard the audit |
+| `length` | Model stopped at its own output length limit | Smaller task scope |
+| `timeout` | `timeout_secs` exceeded | Raise it or narrow scope |
+| `malformed_json` | Final answer never parsed as findings JSON | Check `findings_parse_failed` events in the run log; keep prompt explicit about JSON-only replies |
+| `shard_incomplete` | (Sharded runs) a shard never completed even after bisection | See the per-shard table in the summary JSON; lower `max_diff_bytes` |
+
 **Causes and fixes:**
 
 1. **Context exhausted.** The conversation grew beyond `token_budget` and couldn't be truncated further.
    - Increase `token_budget` (e.g., 32000 → 64000)
    - Reduce the size of the input (narrower diff, shorter prompt)
-   - Increase `max_iterations` if truncation keeps happening
+   - For large PRs, switch to the [sharded audit path](sharding.md) instead of raising budgets — one oversized run is exactly the failure mode sharding exists to prevent
 
 2. **Iteration limit reached.** The agent used all `max_iterations` without producing a final answer.
    - Increase `max_iterations` (e.g., 10 → 15)
@@ -69,6 +83,13 @@ Common issues, error codes, and debugging strategies for Clausura.
    - Increase `max_total_tokens` or remove it
    - Use a cheaper model
    - Reduce `token_budget` to limit per-request cost
+
+4. **Final answer never parsed (`malformed_json`).** The run's findings are
+   not lost: anything the agent reported mid-run is merged back from the
+   findings ledger, and the raw final answer is preserved in the run event
+   log (`findings_parse_failed` events carry the error class and a 2 KB
+   preview). Look there to tell "model output problem" apart from budget
+   problems.
 
 ### "Task timeout exceeded" (exit code 2)
 

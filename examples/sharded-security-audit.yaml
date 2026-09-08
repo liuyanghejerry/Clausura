@@ -1,0 +1,71 @@
+# Sharded security audit for large pull requests.
+#
+# This is the shape of workflow that used to fail: a 3000+ line server diff
+# handed to a single agent run with a 4M token budget and 80 iterations.
+# The agent spent its budget reading, never produced findings, and the
+# fail-closed policy turned that into a CI failure with no diagnostics.
+#
+# The sharded path below reviews the same PR as bounded per-file shards:
+#   - per-file diffs (with context) are grouped into shards under
+#     max_diff_bytes / max_files_per_shard
+#   - a deterministic pre-scan flags candidate hotspots in each shard's
+#     manifest (routes, SQL, request bodies, fs/auth/log/exec)
+#   - each shard runs in a small budget (300k tokens / 12 iterations /
+#     5 minutes) — if it still cannot finish, it is bisected and retried
+#   - findings are aggregated and evaluated against the gating rules
+#   - a summary JSON (next to the SARIF output) separates "security
+#     findings" from "audit incomplete" so CI can react differently:
+#       exit 1  → a gate failed (real findings)
+#       exit 2  → some shard never completed (infrastructure failure;
+#                 the summary lists exactly which shards and why)
+
+version: "1"
+task:
+  name: security-audit
+  model: gpt-4o
+  vendor: openai
+  skill_prompts:
+    - security-review
+
+  # Fallback budget for the (rare) non-shard work; each shard run uses the
+  # per_shard overrides below instead of these.
+  token_budget: 32000
+  timeout_secs: 1800
+  ambiguity_policy: fail_closed
+
+  tool_allowlist: []          # built-in tools (read_file, grep, git_diff) need no allowlist
+
+  sharding:
+    base: origin/main         # diff target; resolved via git merge-base
+    paths:
+      - packages/server/src   # optional: only audit the server package
+    max_diff_bytes: 131072    # ~128 KiB of diff per shard
+    max_files_per_shard: 8
+    max_splits: 3             # bisect depth when a shard ends incomplete
+    context_lines: 20         # --unified context around each hunk
+    on_shard_incomplete: bisect
+    per_shard:
+      token_budget: 300000
+      max_total_tokens: 300000
+      max_iterations: 12
+      timeout_secs: 300
+    # Optional extra patterns for the deterministic pre-scan (tag: regex)
+    # risk_patterns:
+    #   internal-endpoint: "/internal/[a-z]+"
+
+  gating:
+    - rule: sql-injection
+      description: Block on SQL injection
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: hardcoded-secret
+      description: Block on hardcoded secrets
+      min_severity: error
+      max_findings: 0
+      action: fail
+    - rule: xss
+      description: Block on XSS
+      min_severity: error
+      max_findings: 0
+      action: fail

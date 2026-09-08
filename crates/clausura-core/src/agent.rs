@@ -3,7 +3,9 @@ use crate::eventlog::{EventLog, RunEvent};
 use crate::provider::{is_context_overflow_err, Provider};
 use crate::snapshot::SnapshotManager;
 use crate::tools::ToolRegistry;
-use crate::types::{Finding, FinishReason, Message, ProviderError, Role, TaskContract, Usage};
+use crate::types::{
+    Finding, FinishReason, IncompleteReason, Message, ProviderError, Role, TaskContract, Usage,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -19,8 +21,14 @@ pub struct AgentResult {
     /// True when the loop ended without a clean `Stop`: context truncation,
     /// `FinishReason::Length`, an abnormal finish reason, or exhaustion of
     /// `max_iterations`. Signals to the caller that the result may be
-    /// incomplete (see `TaskContract::on_incomplete`).
+    /// incomplete (see `TaskContract::on_incomplete`). Derived from
+    /// `incomplete_reason`; kept as a bool for existing callers.
     pub truncated: bool,
+    /// Machine-readable cause when the run is incomplete; `None` on a clean
+    /// `Stop` (complete run). Distinguishes context limits, iteration caps,
+    /// token caps, model length limits, content filters, timeouts, and
+    /// unparseable final answers.
+    pub incomplete_reason: Option<IncompleteReason>,
 }
 
 /// Configuration for the agent loop
@@ -91,7 +99,16 @@ async fn recover_findings_json(
         messages.push(Message::new(Role::Assistant, retry.message.content.clone()));
         match extract_findings(&retry.message.content) {
             Ok(findings) => return Ok(findings),
-            Err(e) => last_err = e,
+            Err(e) => {
+                if let Some(log) = event_log {
+                    log.append(&RunEvent::FindingsParseFailed {
+                        error_class: classify_parse_error(&e).to_string(),
+                        parse_error: e.clone(),
+                        raw_preview: raw_preview(&retry.message.content),
+                    });
+                }
+                last_err = e;
+            }
         }
     }
     Err(last_err)
@@ -104,6 +121,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
     let mut messages = config.initial_messages;
     let mut total_usage = Usage::default();
     let mut truncated = false;
+    let mut break_reason: Option<IncompleteReason> = None;
     let mut running_tokens: u64 = 0;
 
     let tool_descriptions = config.tools.list_definitions();
@@ -150,6 +168,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         if let Some(max_total) = config.contract.max_total_tokens {
             if running_tokens >= max_total {
                 // Fall-through below marks the result truncated.
+                break_reason = Some(IncompleteReason::TokenCap);
                 break;
             }
         }
@@ -177,6 +196,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
             {
                 // Context could not be reduced further: fall-through below
                 // marks the run truncated.
+                break_reason = Some(IncompleteReason::ContextLimit);
                 break;
             }
             continue;
@@ -220,6 +240,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                             reason = %e2,
                             "context overflow persisted after compaction; marking run truncated"
                         );
+                        break_reason = Some(IncompleteReason::ContextLimit);
                         break;
                     }
                     Err(e2) => return Err(e2),
@@ -256,21 +277,42 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                 // Strict parse; on failure, ask for a JSON-only reply before
                 // giving up (bounded, billed, budget-respecting). The prompt
                 // carries the specific parse error and the expected schema.
-                let findings = match extract_findings(&response.message.content) {
+                let parsed = match extract_findings(&response.message.content) {
+                    Ok(findings) => Ok(findings),
+                    Err(err) => {
+                        if let Some(log) = config.event_log {
+                            log.append(&RunEvent::FindingsParseFailed {
+                                error_class: classify_parse_error(&err).to_string(),
+                                parse_error: err.clone(),
+                                raw_preview: raw_preview(&response.message.content),
+                            });
+                        }
+                        recover_findings_json(
+                            config.contract,
+                            config.provider,
+                            config.tools,
+                            &mut messages,
+                            &start,
+                            &mut running_tokens,
+                            &mut total_usage,
+                            config.event_log,
+                            &err,
+                        )
+                        .await
+                    }
+                };
+
+                let findings = match parsed {
                     Ok(findings) => findings,
-                    Err(err) => recover_findings_json(
-                        config.contract,
-                        config.provider,
-                        config.tools,
-                        &mut messages,
-                        &start,
-                        &mut running_tokens,
-                        &mut total_usage,
-                        config.event_log,
-                        &err,
-                    )
-                    .await
-                    .map_err(ProviderError::MalformedFindings)?,
+                    Err(_retry_err) => {
+                        // The final answer stayed unparseable after corrective
+                        // retries. Do not fail the whole run with empty
+                        // findings: fall through to the incomplete path, which
+                        // keeps the leniently extracted and ledger-persisted
+                        // findings and reports incomplete_reason=malformed_json.
+                        break_reason = Some(IncompleteReason::MalformedJson);
+                        break;
+                    }
                 };
 
                 // Merge findings persisted earlier in the run (which may have
@@ -290,6 +332,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                     log.append(&RunEvent::RunEnd {
                         truncated,
                         duration_ms: start.elapsed().as_millis() as u64,
+                        incomplete_reason: break_reason.map(|r| r.as_str().to_string()),
                     });
                 }
 
@@ -299,6 +342,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
                     usage: total_usage,
                     duration_ms: start.elapsed().as_millis() as u64,
                     truncated,
+                    incomplete_reason: break_reason,
                 });
             }
             FinishReason::ToolCalls => {
@@ -406,9 +450,15 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
             }
             FinishReason::Length => {
                 // Fall-through below marks the result truncated.
+                break_reason = Some(IncompleteReason::Length);
                 break;
             }
-            FinishReason::ContentFilter | FinishReason::Other(_) => {
+            FinishReason::ContentFilter => {
+                break_reason = Some(IncompleteReason::ContentFilter);
+                break;
+            }
+            FinishReason::Other(_) => {
+                break_reason = Some(IncompleteReason::Other);
                 break;
             }
         }
@@ -443,16 +493,24 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
     // so there is no complete final answer to hold to the strict schema below.
     // Best-effort extraction with a warning is appropriate here. Mark the
     // result as truncated (incomplete): this fall-through path is reached on
-    // Length, failed truncation, ContentFilter/Other breaks, and iteration
-    // exhaustion, none of which produced a complete final answer.
+    // Length, failed truncation, ContentFilter/Other breaks, malformed final
+    // answers, and iteration exhaustion, none of which produced a complete
+    // final answer.
     truncated = true;
+    if break_reason.is_none() {
+        // The for-loop ran to exhaustion without an explicit break.
+        break_reason = Some(IncompleteReason::IterationLimit);
+    }
     let mut findings = extract_findings_lenient(&last_content);
 
     // One more bounded attempt can rescue the run: if nothing parseable came
     // out, ask for a JSON-only findings reply. A successful recovery counts as
     // a complete final answer (truncated=false), so gating evaluates it
     // normally instead of the caller failing closed on `on_incomplete`.
-    if findings.is_empty() {
+    // Skipped when the Stop answer already burned its corrective retries
+    // (malformed_json) — repeating the recovery would only re-bill the same
+    // failure.
+    if findings.is_empty() && break_reason != Some(IncompleteReason::MalformedJson) {
         match recover_findings_json(
             config.contract,
             config.provider,
@@ -469,6 +527,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
             Ok(recovered) => {
                 findings = recovered;
                 truncated = false;
+                break_reason = None;
             }
             Err(_) => {
                 // Stay incomplete; the lenient (possibly ledger-merged)
@@ -490,6 +549,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         log.append(&RunEvent::RunEnd {
             truncated,
             duration_ms: start.elapsed().as_millis() as u64,
+            incomplete_reason: break_reason.map(|r| r.as_str().to_string()),
         });
     }
 
@@ -499,6 +559,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
         usage: total_usage,
         duration_ms: start.elapsed().as_millis() as u64,
         truncated,
+        incomplete_reason: break_reason,
     })
 }
 
@@ -1003,6 +1064,35 @@ fn finding_key(f: &Finding) -> String {
     )
 }
 
+/// Cap diagnostic text embedded in errors and events at 2 KB so CI logs stay
+/// readable. The full text always remains available in the run event log.
+fn raw_preview(content: &str) -> String {
+    const LIMIT: usize = 2048;
+    let total_chars = content.chars().count();
+    let mut preview: String = content.chars().take(LIMIT).collect();
+    if total_chars > LIMIT {
+        preview.push_str(&format!(
+            "\n... [preview truncated; {total_chars} chars total — full text in the run event log]"
+        ));
+    }
+    preview
+}
+
+/// Map an `extract_findings` error to its stable class code. Errors carry a
+/// `[class]` prefix exactly so failures can be tallied and distinguished
+/// (model output problem vs. tool/context problem vs. budget problem).
+fn classify_parse_error(err: &str) -> &'static str {
+    if err.starts_with("[json_parse]") {
+        "json_parse"
+    } else if err.starts_with("[schema]") {
+        "schema"
+    } else if err.starts_with("[empty]") {
+        "empty"
+    } else {
+        "unknown"
+    }
+}
+
 /// Extract findings from a completed agent response.
 ///
 /// The response is expected to be a JSON object `{"findings": [...]}` (a bare
@@ -1016,13 +1106,17 @@ fn finding_key(f: &Finding) -> String {
 /// Individual findings that fail schema validation are skipped with a
 /// warning (so one malformed element does not discard the entire batch).
 /// Only when *every* element fails, or no JSON can be recovered at all,
-/// does this return `Err`.
+/// does this return `Err`. Errors are prefixed with a stable class tag
+/// (`[empty]`, `[json_parse]`, `[schema]`) and embed at most a 2 KB preview.
 ///
 /// The `id` field (UUID v4) is auto-generated server-side when the agent
 /// omits it or supplies a malformed value; agents are not required to
 /// produce syntactically valid UUIDs themselves.
 fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
     let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("[empty] agent response is empty".to_string());
+    }
 
     let mut json: serde_json::Value = match serde_json::from_str(trimmed) {
         Ok(v) => v,
@@ -1033,8 +1127,10 @@ fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
 
             recovered.ok_or_else(|| {
                 format!(
-                    "agent response is not valid JSON ({first_err}) and no embedded \
-                     JSON object/array could be recovered:\n{content}"
+                    "[json_parse] agent response is not valid JSON ({first_err}) and no \
+                     embedded JSON object/array could be recovered (full response preserved \
+                     in the run event log):\n{}",
+                    raw_preview(content)
                 )
             })?
         }
@@ -1049,7 +1145,12 @@ fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
     };
     let mut elements = match findings_value {
         serde_json::Value::Array(arr) => arr,
-        other => return Err(format!("expected a `findings` array, got: {other}")),
+        other => {
+            return Err(format!(
+                "[schema] top-level JSON is not a findings array: {}",
+                raw_preview(&other.to_string())
+            ))
+        }
     };
 
     let total = elements.len();
@@ -1079,10 +1180,10 @@ fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
 
     if parsed.is_empty() && !errors.is_empty() {
         return Err(format!(
-            "{} of {} finding(s) failed to match the Finding schema:\n{}",
+            "[schema] {} of {} finding(s) failed to match the Finding schema:\n{}",
             errors.len(),
             total,
-            errors.join("\n")
+            raw_preview(&errors.join("\n"))
         ));
     }
 
@@ -1305,6 +1406,7 @@ mod tests {
             on_incomplete: OnIncompletePolicy::Fail,
             mcp_servers: vec![],
             preflight: vec![],
+            sharding: None,
         }
     }
 
@@ -1442,6 +1544,7 @@ mod tests {
             RunEvent::ToolSpill { .. } => "tool_spill",
             RunEvent::RepeatReminder { .. } => "repeat_reminder",
             RunEvent::FindingsRecoveryAttempt { .. } => "findings_recovery_attempt",
+            RunEvent::FindingsParseFailed { .. } => "findings_parse_failed",
             RunEvent::Checkpoint { .. } => "checkpoint",
             RunEvent::RunEnd { .. } => "run_end",
         }
@@ -1588,6 +1691,10 @@ mod tests {
         assert!(
             result.truncated,
             "Expected truncated=true when context cannot be reduced further"
+        );
+        assert_eq!(
+            result.incomplete_reason,
+            Some(IncompleteReason::ContextLimit)
         );
     }
 
@@ -1819,6 +1926,53 @@ mod tests {
         assert!(
             result.truncated,
             "Expected truncated=true once cumulative tokens reach max_total_tokens"
+        );
+        assert_eq!(result.incomplete_reason, Some(IncompleteReason::TokenCap));
+    }
+
+    /// Iteration exhaustion without a clean `Stop` reports
+    /// `iteration_limit` as the incomplete reason.
+    #[tokio::test]
+    async fn test_agent_loop_iteration_exhaustion_reports_iteration_limit() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+
+        let mut contract = test_contract();
+        contract.max_iterations = 2;
+        // Tool calls that never reach a Stop exhaust the iteration budget.
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            name: "git_diff".into(),
+            arguments: serde_json::json!({}),
+        };
+        let mut mock = MockProvider::new("test-model");
+        for _ in 0..5 {
+            mock.add_response(ChatResponse {
+                message: Message::new(Role::Assistant, "Running tool..."),
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                },
+                finish_reason: FinishReason::ToolCalls,
+                tool_calls: Some(vec![tool_call.clone()]),
+            });
+        }
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review")],
+            workspace_root: root,
+            snapshot_mgr: None,
+            event_log: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert!(result.truncated);
+        assert_eq!(
+            result.incomplete_reason,
+            Some(IncompleteReason::IterationLimit)
         );
     }
 
@@ -2582,11 +2736,99 @@ mod tests {
             event_log: None,
         };
 
-        let err = run_agent_loop(config).await.unwrap_err();
+        let result = run_agent_loop(config).await.unwrap();
         assert!(
-            matches!(err, ProviderError::MalformedFindings(_)),
-            "expected MalformedFindings after retries exhausted, got: {err}"
+            result.truncated,
+            "exhausted malformed retries must mark the run incomplete"
         );
+        assert_eq!(
+            result.incomplete_reason,
+            Some(IncompleteReason::MalformedJson),
+            "expected incomplete_reason=malformed_json after retries exhausted, got: {:?}",
+            result.incomplete_reason
+        );
+        assert!(
+            result.findings.is_empty(),
+            "no findings survive a fully malformed final answer"
+        );
+    }
+
+    /// Parse failures are recorded as `findings_parse_failed` events with a
+    /// stable error class, so the event log answers "was it a model-output
+    /// problem?" without re-reading raw transcripts.
+    #[tokio::test]
+    async fn test_agent_loop_records_findings_parse_failed_events() {
+        let (tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+        let event_log = EventLog::new(tmp.path(), "task-malformed-log");
+
+        let contract = test_contract();
+        let mut mock = MockProvider::new("test-model");
+        for i in 0..3 {
+            mock.add_response(ChatResponse {
+                message: Message::new(Role::Assistant, format!("still not json {i}")),
+                usage: Usage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    total_tokens: 30,
+                },
+                finish_reason: FinishReason::Stop,
+                tool_calls: None,
+            });
+        }
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root,
+            snapshot_mgr: None,
+            event_log: Some(&event_log),
+        };
+        let result = run_agent_loop(config).await.unwrap();
+        assert_eq!(
+            result.incomplete_reason,
+            Some(IncompleteReason::MalformedJson)
+        );
+
+        let content = std::fs::read_to_string(event_log.path()).unwrap();
+        let events: Vec<RunEvent> = content
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let parse_failures: Vec<&RunEvent> = events
+            .iter()
+            .filter(|e| matches!(e, RunEvent::FindingsParseFailed { .. }))
+            .collect();
+        assert!(
+            !parse_failures.is_empty(),
+            "findings_parse_failed events must be recorded: {content}"
+        );
+        // Initial Stop failure + each failed corrective retry all record.
+        assert!(parse_failures.len() >= 2);
+        for e in &parse_failures {
+            if let RunEvent::FindingsParseFailed {
+                error_class,
+                raw_preview,
+                ..
+            } = e
+            {
+                assert_eq!(error_class, "json_parse");
+                assert!(raw_preview.contains("still not json"));
+            }
+        }
+        // run_end carries the machine-readable reason code.
+        let run_end = events
+            .iter()
+            .find_map(|e| match e {
+                RunEvent::RunEnd {
+                    incomplete_reason, ..
+                } => Some(incomplete_reason.clone()),
+                _ => None,
+            })
+            .flatten();
+        assert_eq!(run_end.as_deref(), Some("malformed_json"));
     }
 
     #[test]
@@ -2932,7 +3174,8 @@ mod tests {
 
         let mut mock = MockProvider::new("gpt-4o");
         // Main answer + 2 corrective attempts, all prose. The third call
-        // (second recovery attempt) must fail closed with MalformedFindings.
+        // (second recovery attempt) leaves the run incomplete with
+        // malformed_json — fail-closed exit is the executor's job.
         for _ in 0..3 {
             mock.add_response(ChatResponse {
                 message: Message::new(Role::Assistant, "still not JSON"),
@@ -2956,10 +3199,14 @@ mod tests {
             snapshot_mgr: None,
             event_log: None,
         };
-        let result = run_agent_loop(config).await;
+        let result = run_agent_loop(config).await.unwrap();
         assert!(
-            matches!(result, Err(ProviderError::MalformedFindings(_))),
-            "exhausted recovery must fail closed, got: {result:?}"
+            result.truncated,
+            "exhausted recovery must mark the run incomplete, got: {result:?}"
+        );
+        assert_eq!(
+            result.incomplete_reason,
+            Some(IncompleteReason::MalformedJson)
         );
     }
 
@@ -3049,6 +3296,44 @@ mod tests {
     fn test_extract_findings_invalid_json_is_error() {
         let err = extract_findings("not json at all").unwrap_err();
         assert!(err.contains("not valid JSON"), "got: {err}");
+        assert!(err.starts_with("[json_parse]"), "got: {err}");
+    }
+
+    #[test]
+    fn test_extract_findings_error_classes() {
+        let not_json = extract_findings("not json").unwrap_err();
+        assert_eq!(classify_parse_error(&not_json), "json_parse");
+        let empty = extract_findings("").unwrap_err();
+        assert_eq!(classify_parse_error(&empty), "empty");
+        let no_findings_key = extract_findings(r#"{"no": "findings key"}"#).unwrap_err();
+        assert_eq!(classify_parse_error(&no_findings_key), "schema");
+        let bad_element = extract_findings(r#"{"findings": [{"bad": 1}]}"#).unwrap_err();
+        assert_eq!(classify_parse_error(&bad_element), "schema");
+        assert_eq!(classify_parse_error("no prefix"), "unknown");
+    }
+
+    #[test]
+    fn test_raw_preview_truncates_long_content() {
+        let short = "x".repeat(100);
+        assert_eq!(raw_preview(&short), short);
+
+        let long = "x".repeat(5000);
+        let preview = raw_preview(&long);
+        assert!(preview.len() < long.len(), "preview must be shorter");
+        assert!(preview.contains("preview truncated"), "got: {preview}");
+        // The whole preview stays well under the raw response size.
+        assert!(preview.len() < 3000);
+    }
+
+    #[test]
+    fn test_extract_findings_error_embeds_at_most_preview() {
+        let huge = format!("prose {} end", "y".repeat(100_000));
+        let err = extract_findings(&huge).unwrap_err();
+        assert!(
+            err.len() < 5000,
+            "error must stay bounded, got {}",
+            err.len()
+        );
     }
 
     #[test]
@@ -3337,11 +3622,21 @@ mod tests {
             event_log: None,
         };
 
-        let result = run_agent_loop(config).await;
-        let err = result.expect_err(
-            "a Stop response with findings that fail schema validation must error, \
-             not silently succeed with 0 findings",
+        let result = run_agent_loop(config).await.expect(
+            "a Stop response with findings that fail schema validation must not panic, \
+             but must not silently pass as complete either",
         );
-        assert!(matches!(err, ProviderError::MalformedFindings(_)));
+        assert!(
+            result.truncated,
+            "schema-mismatched findings must mark the run incomplete, never pass as complete"
+        );
+        assert_eq!(
+            result.incomplete_reason,
+            Some(IncompleteReason::MalformedJson)
+        );
+        assert!(
+            result.findings.is_empty(),
+            "fully schema-invalid findings must not be silently reported as findings"
+        );
     }
 }

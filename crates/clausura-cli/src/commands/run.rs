@@ -47,6 +47,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub output: Option<PathBuf>,
 
+    /// Optional path for the machine-readable run summary JSON
+    /// (status, incomplete reason, findings count, token usage)
+    #[arg(long)]
+    pub summary: Option<PathBuf>,
+
     /// Resume from last checkpoint
     #[arg(long)]
     pub resume: bool,
@@ -93,7 +98,7 @@ pub async fn execute(args: RunArgs) -> i32 {
         .clone()
         .unwrap_or_else(|| workspace.join("clausura-output.sarif"));
 
-    let config = match Config::load(
+    let mut config = match Config::load(
         Some(args.config.as_path()),
         args.model.as_deref(),
         args.vendor.as_deref(),
@@ -117,6 +122,7 @@ pub async fn execute(args: RunArgs) -> i32 {
             return 3;
         }
     };
+    config.summary = args.summary;
 
     if args.validate_config {
         step(2, total_steps, "Validating configuration...");
@@ -152,6 +158,42 @@ pub async fn execute(args: RunArgs) -> i32 {
             "Gating rules:".bold(),
             config.task.gating_rules.len()
         );
+        if let Some(sharding) = &config.task.sharding {
+            eprintln!("  {} enabled (base: {})", "Sharding:".bold(), sharding.base);
+            match clausura_core::executor::plan_sharding_preview(&config.workspace, sharding).await
+            {
+                Ok((files, bytes, shards)) => {
+                    eprintln!(
+                        "    {} {} file(s), {} diff bytes, {} shard(s)",
+                        "Plan:".bold(),
+                        files,
+                        bytes,
+                        shards
+                    );
+                }
+                Err(e) => {
+                    eprintln!("    {} plan unavailable: {}", "Warning:".yellow().bold(), e);
+                }
+            }
+        } else {
+            // Oversized single-task budgets are how audits die quietly: the
+            // agent reads everything, exhausts the budget, and produces no
+            // findings. Nudge toward sharding.
+            if config.task.token_budget >= 1_000_000 {
+                eprintln!(
+                    "  {} token_budget >= 1M without sharding — consider `sharding:` so each \
+                     shard runs in a bounded context",
+                    "Warning:".yellow().bold()
+                );
+            }
+            if config.task.max_iterations >= 40 {
+                eprintln!(
+                    "  {} max_iterations >= 40 without sharding — the agent can loop for a long \
+                     time before failing; prefer smaller shard budgets",
+                    "Warning:".yellow().bold()
+                );
+            }
+        }
         return 0;
     }
 
@@ -180,6 +222,23 @@ pub async fn execute(args: RunArgs) -> i32 {
         "Duration:".bold(),
         report.duration_ms,
     );
+
+    if report.status != clausura_core::types::RunStatus::Complete {
+        eprintln!(
+            "  {} {}{}",
+            "Status:".bold(),
+            match report.status {
+                clausura_core::types::RunStatus::Incomplete => "incomplete",
+                clausura_core::types::RunStatus::Error => "error",
+                clausura_core::types::RunStatus::Complete => "complete",
+                _ => "unknown",
+            },
+            report
+                .incomplete_reason
+                .map(|r| format!(" (incomplete_reason={})", r.as_str()))
+                .unwrap_or_default()
+        );
+    }
 
     if !report.errors.is_empty() {
         for err in &report.errors {

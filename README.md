@@ -338,6 +338,7 @@ task:
 | `CLAUSURA_API_KEY`      | API key (required)   |
 | `CLAUSURA_MODEL`        | `task.model`         |
 | `CLAUSURA_VENDOR`       | `task.vendor`        |
+| `CLAUSURA_BASE_URL`    | Provider base URL (any OpenAI-compatible endpoint; overrides the vendor's default) |
 | `CLAUSURA_AMBIGUITY_POLICY` | `task.ambiguity_policy` |
 | `CLAUSURA_ON_INCOMPLETE` | `task.on_incomplete` |
 | `CLAUSURA_TOKEN_BUDGET` | `task.token_budget`  |
@@ -363,6 +364,7 @@ clausura run [OPTIONS]
       --shell-timeout <SECS>  Per-command shell_exec timeout  [default: 120]
       --workspace <PATH>    Workspace root            [default: cwd]
       --output <PATH>       SARIF output path          [default: clausura-output.sarif]
+      --summary <PATH>      Machine-readable run summary JSON (status, reason, findings count, usage)
       --resume              Resume from last checkpoint
       --log-format <FMT>    Log format (json|pretty)   [default: json]
       --dry-run             Validate config and print the execution plan
@@ -605,13 +607,21 @@ Compaction is lossy by design, so Clausura also keeps a **lossless, deterministi
 
 On successful completion (exit code 0), archive files are automatically cleaned up. On failure (exit code 1-3), they are preserved for debugging and audit.
 
-### Incomplete runs fail closed
+### Incomplete runs fail closed, with a machine-readable reason
 
-If the agent loop ends without a clean stop — the context could not be truncated further, the model hit a length limit, the `max_total_tokens` cap was reached, or `max_iterations` was exhausted — the extracted findings may be partial. By default (`on_incomplete: fail`) Clausura fails closed: the run exits with code 2 and a clear error message, so an incomplete review can never silently pass a `max_findings: 0` gate. With `on_incomplete: pass`, the previous behavior is kept (gating rules evaluate the partial findings), but a warning is logged and the SARIF output is annotated with `"properties": {"incomplete": true}` on the run.
+If the agent loop ends without a clean stop — the context could not be truncated further, the model hit a length limit, the `max_total_tokens` cap was reached, `max_iterations` was exhausted, or the final answer never parsed as findings JSON — the extracted findings may be partial. By default (`on_incomplete: fail`) Clausura fails closed: the run exits with code 2 and a clear error message, so an incomplete review can never silently pass a `max_findings: 0` gate. With `on_incomplete: pass`, the previous behavior is kept (gating rules evaluate the partial findings), but a warning is logged and the SARIF output is annotated with `"properties": {"incomplete": true}` on the run.
+
+Every incomplete run carries a **reason code** (`context_limit`, `iteration_limit`, `token_cap`, `length`, `timeout`, `malformed_json`) in the error message, the SARIF `invocations[0].properties.incompleteReason`, and — with `--summary <path>` — a standalone machine-readable summary JSON. A final answer that stays unparseable after the schema-retry budget no longer discards the run: findings persisted to the ledger mid-run are merged back and the run is reported `incomplete_reason=malformed_json`; the raw answer is preserved in the run event log as `findings_parse_failed` events (error class + 2 KB preview).
+
+### Sharded audits for large PRs
+
+A PR with a multi-thousand-line diff cannot be reviewed by one agent run — the model spends its budget reading and produces no findings. Adding a `sharding:` section switches `clausura run` to the sharded path: per-file diffs (with context) are grouped into bounded shards, a deterministic pre-scan flags candidate hotspots (routes, SQL, string-built SQL, request bodies, `fs.*`, auth, logging, exec) in each shard's manifest, and each shard runs in its own small budget (e.g. 300k tokens / 12 iterations). A shard that still ends incomplete is bisected — by files, or by hunks for a single oversized file — and retried. Findings are deduplicated across shards and evaluated against the normal gating rules.
+
+Exit semantics keep security findings and audit infrastructure failures separate: gate violations exit 1; a shard that never completes exits 2 with `status: incomplete` / `reason: shard_incomplete` in the always-written summary JSON (`<output>.summary.json`, per-shard status table included). See [`docs/guide/sharding.md`](docs/guide/sharding.md) and [`examples/sharded-security-audit.yaml`](examples/sharded-security-audit.yaml).
 
 ### Findings schema retries
 
-A Stop response whose findings JSON fails to parse no longer fails the run immediately. Clausura sends the parse error plus the expected schema back to the model as a corrective prompt and gives it up to **2 retries**; a persistently malformed final answer still errors (`MalformedFindings`, exit 2).
+A Stop response whose findings JSON fails to parse no longer fails the run immediately. Clausura sends the parse error plus the expected schema back to the model as a corrective prompt and gives it up to **2 retries**. A persistently malformed final answer marks the run incomplete (`incomplete_reason=malformed_json`): ledger-persisted findings from earlier iterations are kept, the raw answer is recorded as `findings_parse_failed` events (error class `json_parse` / `schema` / `empty` plus a 2 KB preview) in the run event log, and the exit code follows `on_incomplete` (default: fail closed, exit 2).
 
 ### Deterministic rule engine
 
@@ -639,7 +649,7 @@ Five built-in tools plus on-demand skill loading:
 | `read_file`   | Read a file relative to workspace root, with optional `offset`/`limit` for line-range reading | Blocks absolute paths, `..` traversal, symlink escapes |
 | `list_files`  | List directory contents, with recursive depth, glob filtering, and optional file sizes | Sandboxed to workspace; skips `.clausura/` |
 | `grep`        | Search text patterns across files with literal or regex mode, extension filtering, and binary-skip | Auto-excludes `.git`, `target`, `.clausura`, `node_modules` |
-| `git_diff`    | Run `git diff` with optional base ref or staged  | Operates inside workspace only         |
+| `git_diff`    | Run `git diff` with optional base ref, staged mode, a `path` filter for a single file's diff, and a `context` line count per hunk | Operates inside workspace only  |
 | `shell_exec`  | Execute an allowed command (argv form, no shell) | Restricted to `tool_allowlist` argv prefixes; dangerous flags denied; scrubbed env |
 | `read_skill`  | Load a configured review skill's full body by name (progressive disclosure) | Only serves skills resolved from `skill_prompts` at config load; no filesystem access |
 
@@ -717,8 +727,10 @@ clausura/
         executor.rs             # Task lifecycle orchestrator
         logging.rs              # Structured logging (JSON or pretty)
         provider.rs             # LLM provider (OpenAI/Anthropic/Custom + factory)
+        risk.rs                 # Deterministic risk pre-scan for sharded audits
         rules.rs                # Deterministic rule engine for gating
         sarif.rs                # SARIF v2.1.0 output formatter
+        shard.rs                # Shard planning, bisection, and manifests
         snapshot.rs             # Snapshot manager (save/restore)
         tools.rs                # Tool sandbox (read_file, git_diff, shell_exec, list_files, grep)
         types.rs                # Core type definitions
