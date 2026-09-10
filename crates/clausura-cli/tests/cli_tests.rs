@@ -20,7 +20,8 @@ fn test_run_help() {
         .stdout(predicate::str::contains("--config"))
         .stdout(predicate::str::contains("--model"))
         .stdout(predicate::str::contains("--vendor"))
-        .stdout(predicate::str::contains("--dry-run"));
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--base"));
 }
 
 #[test]

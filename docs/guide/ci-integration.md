@@ -16,78 +16,123 @@ When detected, Clausura gathers repository, PR number, commit SHA, and branch co
 
 ## GitHub Actions
 
-### Option A: Composite Action (Simplest)
+### Complete PR workflow
+
+Copy [`examples/github-actions-review.yml`](../../examples/github-actions-review.yml)
+to `.github/workflows/clausura.yml`. The updated Action and `--base` CLI option
+require a release containing these changes (after v1.7.0); until released,
+build this branch and use the direct-binary steps below.
 
 ```yaml
-name: Code Review
+# Copy to .github/workflows/clausura.yml in the repository to review.
+# Use an Action ref and binary release containing --base (after v1.7.0).
+name: Clausura Review
 on: [pull_request]
-
+permissions:
+  contents: read
 jobs:
   review:
+    # Fork PRs and Dependabot do not receive the model secret in this workflow.
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2          # Required for git diff
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - uses: liuyanghejerry/Clausura@v1
+      # Install configured MCP servers / language servers here, before review.
+      - name: Review committed PR changes
+        id: clausura
+        uses: liuyanghejerry/Clausura@v1
         with:
           config: .clausura.yaml
           api_key: ${{ secrets.LLM_API_KEY }}
-          model: gpt-4o           # Optional overrides
-          vendor: openai
-          token_budget: 32000
-          timeout: 300
-          version: latest         # Or pin: "1.2.1"
+          base: ${{ github.event.pull_request.base.sha }}
 ```
 
-The composite action:
-1. Downloads the matching release binary for the runner's OS/arch
-2. Verifies the binary against the release's SHA256 checksums
-3. Runs `clausura run` with your config
+The checkout uses the PR head commit, with full history to resolve the common
+ancestor with the PR base. `fetch-depth: 2` is not sufficient for arbitrary
+multi-commit or diverged PRs. The Action defaults `base` to the PR's base SHA;
+an explicit `base` input overrides it. It does not fetch or change your checkout.
+An unavailable base/history fails with exit 2 before calling the model.
 
-### Option B: Direct Binary
+The Action downloads and verifies the release binary, runs the review, writes a
+job summary, uploads reports, then applies the original exit code. Artifacts
+include SARIF, summary JSON (when produced), the execution log and `exit-code.txt`.
+Setup/config errors can occur before SARIF/JSON exists. Installation failures are
+reported in the installation step's log. Gate violations remain failures even
+when report upload succeeds.
 
-```yaml
-name: Code Review
-on: [pull_request]
+Use `artifact_name` to give each invocation a unique name in matrix jobs or when
+running multiple reviews in one job. Set `upload_artifact: 'false'` to manage
+artifacts yourself (for example on GitHub Enterprise Server). Outputs `exit_code`,
+`sarif`, and `summary` are available to subsequent steps. Omitted model/vendor/
+budget inputs preserve the caller's environment and YAML settings.
 
-jobs:
-  review:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 2
+This example reviews same-repository PRs with a model secret. Fork and Dependabot
+PRs are skipped because they do not receive that secret; a skipped job is not
+proof that those changes were reviewed. Arrange a separate trusted review before
+requiring coverage of those PRs. Do not switch to `pull_request_target` to expose
+secrets to untrusted PR code.
 
-      - name: Install Clausura
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/liuyanghejerry/Clausura/main/install.sh | bash
+### Direct binary (or build from source)
 
-      - name: Run Clausura
-        run: clausura run
-        env:
-          CLAUSURA_API_KEY: ${{ secrets.LLM_API_KEY }}
-
-      - name: Upload SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: clausura-output.sarif
-```
-
-Uploading SARIF to GitHub integrates findings directly into the PR diff view and the Security tab.
-
-### Option C: Docker
+Build `cargo build --release --package clausura-cli` in a trusted Clausura source
+checkout and put the resulting binary on the runner PATH. In the target repository,
+use the same checkout and dependency ordering as above, replacing the Action with:
 
 ```yaml
 - name: Run Clausura
-  run: |
-    docker run --rm \
-      -v ${{ github.workspace }}:/workspace \
-      -e CLAUSURA_API_KEY=${{ secrets.LLM_API_KEY }} \
-      ghcr.io/liuyanghejerry/clausura:latest run
+  env:
+    CLAUSURA_API_KEY: ${{ secrets.LLM_API_KEY }}
+    REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
+  run: clausura run --base "$REVIEW_BASE" --summary clausura-summary.json
+
+- name: Upload reports
+  if: always()
+  uses: actions/upload-artifact@v7
+  with:
+    name: clausura-review
+    path: |
+      clausura-output.sarif
+      clausura-summary.json
+    if-no-files-found: warn
 ```
+
+After release, install a matching released binary instead of building from source.
+For Docker, pass `--base` too, mount the checkout with its Git history, and forward
+secrets by environment name rather than inserting their value into the command:
+
+```yaml
+- name: Review with Docker
+  env:
+    CLAUSURA_API_KEY: ${{ secrets.LLM_API_KEY }}
+    REVIEW_BASE: ${{ github.event.pull_request.base.sha }}
+  run: |
+    docker run --rm -v "$GITHUB_WORKSPACE:/workspace" \
+      -e CLAUSURA_API_KEY ghcr.io/liuyanghejerry/clausura:latest \
+      run --base "$REVIEW_BASE" --summary /workspace/clausura-summary.json
+```
+
+### Optional GitHub code scanning
+
+Artifact upload works without enabling code scanning. To additionally publish
+SARIF to code scanning, enable it for the repository, add `security-events: write`
+to job permissions, and place this step after the Action:
+
+```yaml
+- name: Publish SARIF to code scanning
+  if: ${{ always() && steps.clausura.outputs.sarif_exists == 'true' }}
+  uses: github/codeql-action/upload-sarif@v4
+  with:
+    sarif_file: ${{ steps.clausura.outputs.sarif }}
+```
+
+Availability depends on repository visibility and enabled GitHub security
+features; see [GitHub's SARIF upload requirements](https://docs.github.com/en/code-security/how-tos/find-and-fix-code-vulnerabilities/integrate-with-existing-tools/upload-sarif-file).
 
 ### Branch Protection
 
@@ -99,7 +144,8 @@ After setting up the workflow, configure branch protection rules to require the 
 4. Search for and select the `review` job
 5. Save
 
-Now PRs can't be merged unless Clausura passes.
+For jobs that execute, a gate violation or incomplete review blocks merging.
+The fork/Dependabot skip policy above still needs a separate review policy.
 
 ## GitLab CI
 
@@ -108,14 +154,16 @@ clausura-review:
   image: ghcr.io/liuyanghejerry/clausura:latest
   stage: review
   script:
-    - clausura run
+    - clausura run --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --summary clausura-summary.json
   variables:
     CLAUSURA_API_KEY: $LLM_API_KEY
+    GIT_DEPTH: "0"
     CLAUSURA_MODEL: "gpt-4o"
   artifacts:
     when: always
     paths:
       - clausura-output.sarif
+      - clausura-summary.json
     expire_in: 30 days
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -128,9 +176,10 @@ clausura-review:
   stage: review
   script:
     - curl -fsSL https://raw.githubusercontent.com/liuyanghejerry/Clausura/main/install.sh | bash
-    - clausura run
+    - clausura run --base "$CI_MERGE_REQUEST_DIFF_BASE_SHA" --summary clausura-summary.json
   variables:
     CLAUSURA_API_KEY: $LLM_API_KEY
+    GIT_DEPTH: "0"
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 ```
@@ -152,7 +201,7 @@ pipeline {
             steps {
                 sh '''
                     curl -fsSL https://raw.githubusercontent.com/liuyanghejerry/Clausura/main/install.sh | bash
-                    clausura run --model gpt-4o
+                    clausura run --model gpt-4o --base "origin/$CHANGE_TARGET" --summary clausura-summary.json
                 '''
             }
         }
@@ -160,7 +209,7 @@ pipeline {
 
     post {
         always {
-            archiveArtifacts artifacts: 'clausura-output.sarif', fingerprint: true
+            archiveArtifacts artifacts: 'clausura-output.sarif,clausura-summary.json', allowEmptyArchive: true, fingerprint: true
         }
     }
 }
@@ -168,7 +217,7 @@ pipeline {
 
 ### GitHub Branch Source / Multibranch Pipeline
 
-Clausura auto-detects the PR context from Jenkins environment variables when using the GitHub Branch Source plugin.
+Clausura auto-detects PR metadata from Jenkins environment variables. Fetch the target branch and enough history for merge-base before review; this example assumes `origin/$CHANGE_TARGET` exists locally.
 
 ## Generic CI
 
@@ -182,7 +231,7 @@ export CI_COMMIT_SHA="abc123def456"
 export CI_BRANCH="feature/new-login"
 
 export CLAUSURA_API_KEY=sk-...
-clausura run
+clausura run --base origin/main --summary clausura-summary.json
 ```
 
 | Variable | Purpose | Required |
@@ -218,20 +267,20 @@ prompt_template: |
 
 ## SARIF Upload
 
-Clausura always writes `clausura-output.sarif`. In CI, upload it to your platform's security dashboard:
+Completed agent executions write SARIF; setup/config errors may not. Upload existing reports even when review fails:
 
 ### GitHub Advanced Security
 
 ```yaml
-- uses: github/codeql-action/upload-sarif@v3
-  if: always()
+- uses: github/codeql-action/upload-sarif@v4
+  if: ${{ always() && hashFiles('clausura-output.sarif') != '' }}
   with:
     sarif_file: clausura-output.sarif
 ```
 
 ### GitLab
 
-SARIF files can be uploaded as pipeline artifacts and viewed with GitLab's SARIF support (GitLab Ultimate).
+Upload SARIF and summary JSON as pipeline artifacts. This does not automatically populate the GitLab security dashboard.
 
 ### Generic
 
@@ -248,7 +297,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with: { fetch-depth: 2 }
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - uses: liuyanghejerry/Clausura@v1
         with:
           config: .clausura/security.yaml
@@ -258,14 +310,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with: { fetch-depth: 2 }
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - uses: liuyanghejerry/Clausura@v1
         with:
           config: .clausura/i18n.yaml
           api_key: ${{ secrets.LLM_API_KEY }}
 ```
 
-Each job independently passes or fails. Use branch protection rules to require all review jobs.
+Use the same pull_request trigger, permissions and fork/Dependabot condition as
+the complete workflow. Each job independently passes or fails; require the
+appropriate jobs in branch protection.
 
 ## Checkpoint Persistence
 
@@ -275,15 +332,15 @@ For persistent checkpointing in CI, mount a volume at `$HOME/.clausura/`.
 
 ## Best Practices
 
-1. **`fetch-depth: 2`** — Clausura's `git_diff` tool needs the previous commit for comparison. Always set `fetch-depth: 2` (or higher) in your checkout step.
+1. **Use a committed review range** — Fetch full history and the target ref, then pass `--base <ref-or-sha>`. The normal CLI without `--base` retains local working-tree diff behavior; CI metadata detection alone does not select a PR range.
 
 2. **Use secrets for API keys** — Never commit API keys. Use your CI's secrets manager (`${{ secrets.LLM_API_KEY }}`, GitLab CI/CD variables, Jenkins credentials).
 
 3. **Upload SARIF on failure** — Use `if: always()` so SARIF is available for debugging even when the pipeline fails.
 
-4. **Set realistic timeouts** — The CI job timeout should exceed `task.timeout_secs` by a comfortable margin (add 60s for installation and SARIF writing).
+4. **Set a job timeout** — Allow time for installation and uploads. Sharded runs currently apply budgets per shard/attempt, so the overall CI timeout must bound the aggregate run.
 
-5. **Run on PRs, not pushes to main** — Clausura compares against the base branch; running on pushes to `main` without a PR context may not produce meaningful diffs.
+5. **Choose the intended range** — On push/manual runs, supply an explicit base appropriate to the changes being reviewed.
 
 ## Next
 

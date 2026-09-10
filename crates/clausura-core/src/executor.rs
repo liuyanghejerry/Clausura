@@ -80,6 +80,28 @@ async fn run_git_output(workspace: &Path, args: &[&str]) -> Result<String, Strin
     }
 }
 
+/// Resolve the PR's committed range before making any model requests.
+/// Missing refs/history are errors, never an empty successful review.
+pub async fn resolve_review_range(
+    workspace: &Path,
+    base: &str,
+) -> Result<(String, String), String> {
+    let base_sha = run_git_output(
+        workspace,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{base}^{{commit}}"),
+        ],
+    )
+    .await?;
+    let head = run_git_output(workspace, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+    let merge_base =
+        run_git_output(workspace, &["merge-base", base_sha.trim(), head.trim()]).await?;
+    Ok((merge_base.trim().to_string(), head.trim().to_string()))
+}
+
 /// Collect per-file diffs between `sharding.base` (via merge-base) and HEAD,
 /// run the deterministic risk scan, and plan shards.
 async fn collect_shard_plan(
@@ -610,8 +632,16 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
         &config.task.tool_allowlist,
         config.task.shell_timeout_secs,
         &config.task.shell_env_passthrough,
-        Some(spill_store),
+        Some(spill_store.clone()),
     );
+
+    if let Some(range) = &config.review_range {
+        tools.register(
+            crate::tools::GitDiffTool::new(config.workspace.clone())
+                .with_review_range(range.clone())
+                .with_spill_maybe(Some(spill_store)),
+        );
+    }
 
     // Progressive skill disclosure: bodies served by read_skill on demand.
     if !config.task.skills.is_empty() {
@@ -721,6 +751,17 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
             config.task.prompt_template.clone(),
         )]
     };
+
+    if let Some((base, head)) = &config.review_range {
+        initial_messages.push(Message::new(
+            Role::User,
+            format!(
+                "Review committed changes from {base} to {head}. Start with git_diff; \
+                     it is pinned to this range even in a clean checkout. Read surrounding \
+                     files only as needed to validate findings."
+            ),
+        ));
+    }
 
     // Inject preflight summary into agent context (if any findings).
     if let Some(summary) = preflight_summary {

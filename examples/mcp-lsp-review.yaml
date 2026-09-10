@@ -59,12 +59,14 @@ task:
     # LSP 诊断产生的 finding 自动带 rule_id 前缀 "lsp-"
     # 只要有任何 error 级别的 LSP 诊断，就 fail
     - rule: lsp-error
+      description: Block on LSP errors
       min_severity: error
       max_findings: 0
       action: fail
 
     # warning 级别的 LSP 诊断最多允许 5 个
     - rule: lsp-warning
+      description: Warn on excessive LSP warnings
       min_severity: warning
       max_findings: 5
       action: warn

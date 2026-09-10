@@ -11,6 +11,18 @@ inputs:
     description: 'Path to .clausura.yaml config file'
     required: false
     default: '.clausura.yaml'
+  base:
+    description: 'Review merge-base(base, HEAD)..HEAD; defaults to the pull request base SHA'
+    required: false
+    default: ${{ github.event.pull_request.base.sha }}
+  artifact_name:
+    description: 'Unique report artifact name (set per invocation when running multiple reviews)'
+    required: false
+    default: clausura-review-${{ github.job }}-${{ github.run_attempt }}
+  upload_artifact:
+    description: 'Upload SARIF, summary JSON and execution log even when review fails'
+    required: false
+    default: 'true'
   model:
     description: 'Override the LLM model'
     required: false
@@ -26,6 +38,20 @@ inputs:
   timeout:
     description: 'Override timeout in seconds'
     required: false
+
+outputs:
+  exit_code:
+    description: 'Clausura exit code: 0 pass, 1 violation, 2 runtime error/incomplete, 3 config error'
+    value: ${{ steps.review.outputs.exit-code }}
+  sarif:
+    description: 'SARIF path (file may be absent on setup/config errors)'
+    value: ${{ steps.review.outputs.report-dir }}/output.sarif
+  sarif_exists:
+    description: 'Whether this invocation produced a SARIF file'
+    value: ${{ steps.review.outputs.sarif-exists }}
+  summary:
+    description: 'Run summary JSON path (file may be absent on setup/config errors)'
+    value: ${{ steps.review.outputs.report-dir }}/summary.json
 
 runs:
   using: 'composite'
@@ -85,14 +111,33 @@ runs:
       shell: bash
       run: clausura --version
 
-    - run: clausura run --config ${{ inputs.config }}
+    - name: Run review and record verdict
+      id: review
       shell: bash
       env:
-        CLAUSURA_API_KEY: ${{ inputs.api_key }}
-        CLAUSURA_MODEL: ${{ inputs.model }}
-        CLAUSURA_VENDOR: ${{ inputs.vendor }}
-        CLAUSURA_TOKEN_BUDGET: ${{ inputs.token_budget }}
-        CLAUSURA_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_API_KEY: ${{ inputs.api_key }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_VENDOR: ${{ inputs.vendor }}
+        INPUT_TOKEN_BUDGET: ${{ inputs.token_budget }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/run-action.sh"
+
+    - name: Upload review reports
+      if: ${{ always() && inputs.upload_artifact == 'true' && steps.review.outputs.report-dir != '' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: ${{ steps.review.outputs.report-dir }}
+        if-no-files-found: warn
+
+    - name: Apply review verdict
+      if: ${{ always() && steps.review.outputs.exit-code != '' }}
+      shell: bash
+      env:
+        REVIEW_EXIT_CODE: ${{ steps.review.outputs.exit-code }}
+      run: exit "$REVIEW_EXIT_CODE"
 
 branding:
   icon: 'check-circle'

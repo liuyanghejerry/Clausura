@@ -34,8 +34,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Test Action orchestration
+        if: runner.os == 'Linux'
+        run: python3 scripts/test_action.py
+
       - name: Test
         run: cargo test --workspace
+
+      - name: Test PR review with mock provider
+        if: runner.os == 'Linux'
+        run: python3 scripts/test_ci_review.py
 
   audit:
     name: Security Audit
