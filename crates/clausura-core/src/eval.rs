@@ -817,6 +817,7 @@ mod tests {
             violations: vec![],
             status: crate::types::RunStatus::Complete,
             incomplete_reason: None,
+            verification: None,
         }
     }
 

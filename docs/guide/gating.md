@@ -202,5 +202,6 @@ prompt_template: |
 
 ## Next
 
+→ [Filter false positives with findings verification](findings-verification.md)
 → [Reuse community skills](skills.md)
 → [See complete scenario configs](scenarios.md)

@@ -232,6 +232,7 @@ async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> Exe
                 violations: vec![],
                 status: RunStatus::Error,
                 incomplete_reason: None,
+                verification: None,
             };
         }
     };
@@ -259,6 +260,7 @@ async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> Exe
                 violations: vec![],
                 status: RunStatus::Error,
                 incomplete_reason: None,
+                verification: None,
             };
         }
     };
@@ -466,6 +468,7 @@ async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> Exe
                         violations: vec![],
                         status: RunStatus::Incomplete,
                         incomplete_reason: Some(IncompleteReason::Other),
+                        verification: None,
                     };
                 }
 
@@ -490,6 +493,8 @@ async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> Exe
     }
 
     let all_findings = dedup_findings(all_findings);
+    let (all_findings, verification) =
+        crate::jev::verify_findings(&config.task.verify, all_findings).await;
     let gate_result = RuleEngine::evaluate(&all_findings, &config.task.gating_rules);
 
     // Security findings outrank infrastructure failures in the exit code
@@ -533,6 +538,7 @@ async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> Exe
         &total_usage,
         start.elapsed().as_millis() as u64,
         &shard_records,
+        verification.as_ref(),
     );
 
     for v in &gate_result.violations {
@@ -555,6 +561,7 @@ async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> Exe
         violations: gate_result.violations,
         status,
         incomplete_reason: None,
+        verification,
     }
 }
 
@@ -570,6 +577,7 @@ fn write_sharded_summary(
     usage: &Usage,
     duration_ms: u64,
     shard_records: &[ShardRecord],
+    verification: Option<&crate::types::VerificationSummary>,
 ) {
     let summary = serde_json::json!({
         "task_id": task_id,
@@ -580,6 +588,7 @@ fn write_sharded_summary(
         "token_usage": usage,
         "duration_ms": duration_ms,
         "shards": shard_records,
+        "verification": verification,
     });
     match serde_json::to_string_pretty(&summary)
         .map_err(|e| e.to_string())
@@ -613,6 +622,7 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
                 violations: vec![],
                 status: RunStatus::Error,
                 incomplete_reason: None,
+                verification: None,
             };
         }
     };
@@ -719,6 +729,7 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
                 violations: vec![],
                 status: RunStatus::Error,
                 incomplete_reason: None,
+                verification: None,
             };
         }
     };
@@ -797,6 +808,7 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
                 violations: vec![],
                 status: RunStatus::Error,
                 incomplete_reason: Some(IncompleteReason::Timeout),
+                verification: None,
             };
         }
         Err(e) => {
@@ -811,6 +823,7 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
                 violations: vec![],
                 status: RunStatus::Error,
                 incomplete_reason: None,
+                verification: None,
             };
         }
     };
@@ -831,6 +844,8 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
 
     // Merge preflight findings (deterministic) with agent findings.
     let all_findings = [preflight_findings, agent_result.findings].concat();
+    let (all_findings, verification) =
+        crate::jev::verify_findings(&config.task.verify, all_findings).await;
 
     let gate_result = RuleEngine::evaluate(&all_findings, &config.task.gating_rules);
 
@@ -884,6 +899,7 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
             exit_code,
             &agent_result.usage,
             agent_result.duration_ms,
+            verification.as_ref(),
         );
     }
 
@@ -911,6 +927,7 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
         violations: gate_result.violations,
         status,
         incomplete_reason: agent_result.incomplete_reason,
+        verification,
     }
 }
 
@@ -926,6 +943,7 @@ fn write_run_summary(
     exit_code: u32,
     usage: &Usage,
     duration_ms: u64,
+    verification: Option<&crate::types::VerificationSummary>,
 ) {
     let summary = serde_json::json!({
         "task_id": task_id,
@@ -935,6 +953,7 @@ fn write_run_summary(
         "exit_code": exit_code,
         "token_usage": usage,
         "duration_ms": duration_ms,
+        "verification": verification,
     });
     match serde_json::to_string_pretty(&summary)
         .map_err(|e| e.to_string())
@@ -1364,6 +1383,7 @@ mod tests {
                 total_tokens: 15,
             },
             1234,
+            None,
         );
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -1384,6 +1404,7 @@ mod tests {
             0,
             &Usage::default(),
             0,
+            None,
         );
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -1645,6 +1666,7 @@ mod tests {
             &Usage::default(),
             42,
             &records,
+            None,
         );
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

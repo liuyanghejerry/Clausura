@@ -320,6 +320,18 @@ task:
       min_severity: error
       max_findings: 0
       action: fail
+
+  # Findings verification (optional, System One decision model)
+  verify:
+    enabled: false                   # Default. Score every finding with a yes/no
+                                     # decision-model call before gating.
+    threshold: 0.5                   # Default. Findings with P(genuine) below this are
+                                     # excluded from gating. Fail-open on API errors.
+    model: jev-latest                # Default. Decision model id.
+    base_url: "https://api.typesafe.ai"  # Default. `/v1/systemone` is appended.
+    api_key_env: TYPESAFE_API_KEY    # Default. Env var holding the decision API key.
+    timeout_secs: 30                 # Default. Per-request timeout.
+    max_findings: 100                # Default. Cost guard; excess findings pass unverified.
 ```
 
 **Gating rule fields:**
@@ -331,6 +343,26 @@ task:
 | `min_severity`| string | Minimum severity: `hint`, `info`, `warning`, `error`. |
 | `max_findings`| number | Maximum allowed findings at or above this severity. |
 | `action`      | string | `fail` (exit 1), `warn` (log only), `ignore` (skip). |
+
+### Findings verification (System One decision model)
+
+When `task.verify.enabled` is true (or `CLAUSURA_VERIFY=1`), every finding is
+scored before gating by a System One decision model (e.g. TypeSafe Jev — a
+non-generative model that returns calibrated probabilities, not text). The
+decision model answers one yes/no question per finding: *"is this finding
+genuine and supported by its own evidence?"* Findings whose probability falls
+below `verify.threshold` are excluded from gating, SARIF, and the report's
+finding list; they are recorded under `verification.filtered_findings` in the
+run summary and report JSON for audit.
+
+Verification is fail-open: request errors, timeouts, and unparseable
+responses keep the finding (counted as `verification.failed`), and a missing
+`$TYPESAFE_API_KEY` skips verification entirely with a warning — a
+decision-API outage can never block CI. The review LLM still does all
+open-ended analysis; verification only audits its output. Set the key via
+`TYPESAFE_API_KEY` (get one at console.typesafe.ai).
+
+→ Full guide: [`docs/guide/findings-verification.md`](docs/guide/findings-verification.md)
 
 ### Environment variables
 
@@ -347,6 +379,8 @@ task:
 | `CLAUSURA_TIMEOUT`      | `task.timeout_secs`  |
 | `CLAUSURA_SHELL_TIMEOUT` | `task.shell_timeout_secs` |
 | `CLAUSURA_MAX_ITERATIONS` | `task.max_iterations` |
+| `CLAUSURA_VERIFY`   | `task.verify.enabled` |
+| `TYPESAFE_API_KEY`  | Decision-model key for findings verification (not a Clausura override) |
 
 Config loading priority: YAML file < CLI flags < environment variables.
 

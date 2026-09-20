@@ -506,6 +506,104 @@ fn default_shard_context_lines() -> u32 {
     20
 }
 
+/// Findings verification via a System One decision model (e.g. TypeSafe Jev).
+///
+/// When enabled, every finding is scored with a yes/no question ("is this
+/// finding genuine and supported by its own evidence?") and findings whose
+/// calibrated probability falls below `threshold` are excluded from gating.
+/// Verification is fail-open: call failures keep the finding, and a missing
+/// API key disables verification with a warning instead of failing the run.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct VerifyConfig {
+    /// Master switch. Default false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Keep-threshold on P(finding is genuine), in [0, 1]. Default 0.5.
+    #[serde(default = "default_verify_threshold")]
+    pub threshold: f64,
+    /// Decision model id. Default `jev-latest`.
+    #[serde(default = "default_verify_model")]
+    pub model: String,
+    /// API base URL; the `/v1/systemone` endpoint path is appended to it.
+    #[serde(default = "default_verify_base_url")]
+    pub base_url: String,
+    /// Env var holding the decision-model API key. Default `TYPESAFE_API_KEY`.
+    #[serde(default = "default_verify_api_key_env")]
+    pub api_key_env: String,
+    /// Per-request timeout in seconds. Default 30.
+    #[serde(default = "default_verify_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Max findings verified per run (cost guard); the rest pass through
+    /// unverified. Default 100.
+    #[serde(default = "default_verify_max_findings")]
+    pub max_findings: usize,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: default_verify_threshold(),
+            model: default_verify_model(),
+            base_url: default_verify_base_url(),
+            api_key_env: default_verify_api_key_env(),
+            timeout_secs: default_verify_timeout_secs(),
+            max_findings: default_verify_max_findings(),
+        }
+    }
+}
+
+fn default_verify_threshold() -> f64 {
+    0.5
+}
+
+fn default_verify_model() -> String {
+    "jev-latest".into()
+}
+
+fn default_verify_base_url() -> String {
+    "https://api.typesafe.ai".into()
+}
+
+fn default_verify_api_key_env() -> String {
+    "TYPESAFE_API_KEY".into()
+}
+
+fn default_verify_timeout_secs() -> u64 {
+    30
+}
+
+fn default_verify_max_findings() -> usize {
+    100
+}
+
+/// A finding excluded from gating by verification (audit trail).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct FilteredFinding {
+    pub finding_id: uuid::Uuid,
+    pub rule_id: String,
+    pub probability: f64,
+    pub message: String,
+}
+
+/// Outcome of findings verification. `None` on the report when verification
+/// was disabled or skipped (e.g. missing decision-model API key).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct VerificationSummary {
+    pub model: String,
+    pub threshold: f64,
+    /// Findings that scored >= threshold and were gated.
+    pub verified: usize,
+    /// Findings below threshold — excluded from gating.
+    pub filtered: usize,
+    /// Findings kept because their verification call failed (fail-open).
+    pub failed: usize,
+    /// Findings kept unverified (over the `max_findings` cap).
+    pub skipped: usize,
+    /// Audit trail for the filtered findings.
+    pub filtered_findings: Vec<FilteredFinding>,
+}
+
 /// Task contract — defines what a task does, how it runs, and gating rules
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct TaskContract {
@@ -573,6 +671,10 @@ pub struct TaskContract {
     /// sharded audit path (per-file diffs grouped into bounded shards).
     #[serde(default)]
     pub sharding: Option<ShardingConfig>,
+    /// Findings verification via a System One decision model. Default
+    /// disabled.
+    #[serde(default)]
+    pub verify: VerifyConfig,
 }
 
 fn default_max_iterations() -> u32 {
@@ -634,6 +736,10 @@ pub struct ExecutionReport {
     /// Machine-readable cause when `status` is not `complete`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete_reason: Option<IncompleteReason>,
+    /// Findings-verification summary; `None` when verification was disabled
+    /// or skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationSummary>,
 }
 
 /// Context about the CI environment
@@ -924,6 +1030,7 @@ mod tests {
             mcp_servers: vec![],
             preflight: vec![],
             sharding: None,
+            verify: VerifyConfig::default(),
         };
         assert_eq!(contract.ambiguity_policy, AmbiguityPolicy::FailClosed);
         assert!(contract.gating_rules.is_empty());
@@ -931,6 +1038,7 @@ mod tests {
         assert!(!contract.auto_compact);
         assert_eq!(contract.max_compactions, 3);
         assert!(contract.findings_ledger);
+        assert!(!contract.verify.enabled);
     }
 
     #[test]
@@ -950,6 +1058,7 @@ mod tests {
             violations: vec![],
             status: RunStatus::Complete,
             incomplete_reason: None,
+            verification: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         let deserialized: ExecutionReport = serde_json::from_str(&json).unwrap();
@@ -979,6 +1088,7 @@ mod tests {
             violations: vec![],
             status: RunStatus::Incomplete,
             incomplete_reason: Some(IncompleteReason::ContextLimit),
+            verification: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"incomplete_reason\":\"context_limit\""));

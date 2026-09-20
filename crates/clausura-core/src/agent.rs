@@ -1407,6 +1407,7 @@ mod tests {
             mcp_servers: vec![],
             preflight: vec![],
             sharding: None,
+            verify: crate::types::VerifyConfig::default(),
         }
     }
 

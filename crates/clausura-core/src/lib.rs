@@ -7,6 +7,7 @@ pub mod context;
 pub mod eval;
 pub mod eventlog;
 pub mod executor;
+pub mod jev;
 pub mod logging;
 pub mod mcp;
 pub mod provider;
