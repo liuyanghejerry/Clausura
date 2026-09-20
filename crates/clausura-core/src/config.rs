@@ -107,6 +107,8 @@ struct YamlTaskConfig {
     preflight: Vec<YamlPreflightCheck>,
     #[serde(default)]
     sharding: Option<YamlShardingConfig>,
+    #[serde(default)]
+    verify: crate::types::VerifyConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -448,6 +450,7 @@ impl Config {
                     mcp_servers: vec![],
                     preflight: vec![],
                     sharding: None,
+                    verify: crate::types::VerifyConfig::default(),
                 },
                 None,
             )
@@ -498,6 +501,13 @@ impl Config {
             Ok(v) => matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
             Err(_) => yaml_task.findings_ledger,
         };
+
+        // Findings verification (System One decision model): YAML
+        // `task.verify.*` with a boolean env override for the master switch.
+        let mut verify = yaml_task.verify;
+        if let Ok(v) = std::env::var("CLAUSURA_VERIFY") {
+            verify.enabled = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
 
         let timeout = std::env::var("CLAUSURA_TIMEOUT")
             .ok()
@@ -638,6 +648,7 @@ impl Config {
                         risk_patterns: s.risk_patterns,
                     }
                 }),
+                verify,
             },
             api_key,
             workspace,
