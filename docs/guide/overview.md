@@ -168,4 +168,5 @@ Clausura is not an assistant. It's a pipeline gate. Every interactive prompt is 
 - [Set up your LLM provider →](llm-providers.md)
 - [Understand the configuration →](configuration.md)
 - [Design your gating rules →](gating.md)
+- [Filter false positives with findings verification →](findings-verification.md)
 - [See real-world scenarios →](scenarios.md)

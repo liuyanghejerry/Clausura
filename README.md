@@ -362,6 +362,8 @@ decision-API outage can never block CI. The review LLM still does all
 open-ended analysis; verification only audits its output. Set the key via
 `TYPESAFE_API_KEY` (get one at console.typesafe.ai).
 
+→ Full guide: [`docs/guide/findings-verification.md`](docs/guide/findings-verification.md)
+
 ### Environment variables
 
 | Variable                | Overrides            |

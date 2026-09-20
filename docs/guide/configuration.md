@@ -96,6 +96,19 @@ task:
       min_severity: warning
       max_findings: 5
       action: warn
+
+  # ── Findings Verification (optional) ──────────────
+  # Fail-open pre-gating filter: a System One decision model (TypeSafe Jev)
+  # scores each finding and drops the ones below `threshold` from gating.
+  # See docs/guide/findings-verification.md.
+  verify:
+    enabled: false                   # Master switch (or CLAUSURA_VERIFY=1).
+    threshold: 0.5                   # Keep-threshold on P(finding is genuine).
+    model: jev-latest                # Decision model id.
+    base_url: "https://api.typesafe.ai"  # `/v1/systemone` is appended.
+    api_key_env: TYPESAFE_API_KEY    # Env var holding the decision API key.
+    timeout_secs: 30                 # Per-request timeout.
+    max_findings: 100                # Cost guard; excess findings pass unverified.
 ```
 
 ## Field Reference
@@ -365,6 +378,28 @@ An array of gating rules, evaluated in order. Each rule:
 
 → [Gating rules deep dive](gating.md)
 
+### `task.verify`
+
+**Default: disabled.** Optional fail-open filter that runs before gating:
+each finding is scored by a System One decision model (TypeSafe Jev) with a
+yes/no question — *is this finding genuine and supported by its evidence?* —
+and findings below `threshold` are excluded from gating, SARIF, and the
+report (audited under `verification.filtered_findings` in the run summary).
+Request errors keep the finding; a missing API key skips verification with a
+warning.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Master switch. `CLAUSURA_VERIFY=1` overrides. |
+| `threshold` | `0.5` | Keep-threshold on P(genuine), clamped to [0, 1]. |
+| `model` | `jev-latest` | Decision model id. |
+| `base_url` | `https://api.typesafe.ai` | API base URL; `/v1/systemone` is appended. |
+| `api_key_env` | `TYPESAFE_API_KEY` | Env var holding the decision API key. |
+| `timeout_secs` | `30` | Per-request timeout. |
+| `max_findings` | `100` | Cost guard; excess findings pass through unverified. |
+
+→ [Findings verification deep dive](findings-verification.md)
+
 ## CLI Flags
 
 ```
@@ -412,8 +447,11 @@ clausura snapshot delete --thread <ID>                   Delete all checkpoints 
 | `CLAUSURA_TIMEOUT` | `task.timeout_secs` | `300` |
 | `CLAUSURA_SHELL_TIMEOUT` | `task.shell_timeout_secs` | `120` |
 | `CLAUSURA_MAX_ITERATIONS` | `task.max_iterations` | `10` |
+| `CLAUSURA_VERIFY` | `task.verify.enabled` | `1` |
+| `TYPESAFE_API_KEY` | Decision-model key for findings verification (see `task.verify`) | `apikey_...` |
 
 ## Next
 
 → [Design your gating rules](gating.md)
+→ [Filter false positives with findings verification](findings-verification.md)
 → [See common scenarios](scenarios.md)
