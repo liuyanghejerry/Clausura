@@ -43,7 +43,9 @@ jobs:
 
       - name: Test PR review with mock provider
         if: runner.os == 'Linux'
-        run: python3 scripts/test_ci_review.py
+        run: |
+          python3 scripts/test_ci_review.py
+          python3 scripts/test_gating.py
 
   audit:
     name: Security Audit

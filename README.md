@@ -382,7 +382,7 @@ open-ended analysis; verification only audits its output. Set the key via
 | `CLAUSURA_VERIFY`   | `task.verify.enabled` |
 | `TYPESAFE_API_KEY`  | Decision-model key for findings verification (not a Clausura override) |
 
-Config loading priority: YAML file < CLI flags < environment variables.
+Config loading priority: YAML file < CLI flags < environment variables. Empty model, vendor, and API-key overrides are ignored. When `vendor.api_key_env` is configured, its nonempty value takes precedence over `CLAUSURA_API_KEY`, then `--api-key`.
 
 ### CLI flags
 
@@ -555,6 +555,8 @@ task:
 
 Preflight findings are also summarized in the agent's context so the LLM-aware review can build on them.
 
+Preflight rule IDs are the configured prefix plus normalized severity (`lsp-error`, `lsp-warning`, `lsp-info`, or `lsp-hint`). Numeric LSP severities 1–4 are accepted. An unavailable server, failed tool call, or malformed diagnostic output fails the task with exit code 2 before the agent runs; only a valid empty array means no diagnostics. Preflight checks must run in a separate non-sharded task when using sharded audits.
+
 ### LSP code intelligence
 
 For semantic code analysis beyond diagnostics, pair MCP with a skill guide:
@@ -643,6 +645,8 @@ Proactive truncation relies on a token-count heuristic, which underestimates cod
 ### Findings ledger (disk-backed memory)
 
 Compaction is lossy by design, so Clausura also keeps a **lossless, deterministic memory** on disk: whenever the agent emits findings in a response, they are appended to `{workspace}/.clausura/archives/findings-ledger-{task_id}.jsonl` (one JSON object per line). When the run finishes, the final findings are **merged with the ledger** — the final response wins on conflicts, and findings from iterations that were truncated out of context are appended back. No extra LLM calls are involved; the merge is plain deduplication keyed on `rule_id` + location + message. Disable with `findings_ledger: false` (env `CLAUSURA_FINDINGS_LEDGER=false`).
+
+A fresh run first moves any preceding ledger to `previous-findings-{task_id}-{uuid}.jsonl`, preserving it for audit without merging stale findings. `--resume` keeps the active ledger. Shard attempts also start with a fresh ledger. Archived ledgers from preceding runs are retained when the new run succeeds.
 
 On successful completion (exit code 0), archive files are automatically cleaned up. On failure (exit code 1-3), they are preserved for debugging and audit.
 

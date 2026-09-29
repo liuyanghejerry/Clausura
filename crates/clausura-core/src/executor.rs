@@ -21,7 +21,88 @@ use std::time::Instant;
 /// Orchestrates: config → provider → agent → rule engine → SARIF → checkpoint.
 /// Exit codes: 0 = pass, 1 = rule violation, 2 = error, 3 = config error.
 pub async fn execute_task(config: &Config) -> ExecutionReport {
+    let start = Instant::now();
+    let report = match tokio::time::timeout(
+        std::time::Duration::from_secs(config.task.timeout_secs),
+        execute_task_inner(config),
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(_) => execution_error(
+            config,
+            start,
+            "Task timeout exceeded".into(),
+            Some(IncompleteReason::Timeout),
+        ),
+    };
+    if report.status == RunStatus::Error {
+        write_error_outputs(config, &report);
+    }
+    report
+}
+
+fn write_error_outputs(config: &Config, report: &ExecutionReport) {
+    // Replace preceding successful reports even when an inner deadline wins
+    // the race with the overall timeout, or setup fails before the agent runs.
+    let reason = report.incomplete_reason;
+    if let Err(e) = SarifFormatter::write_to_file_with_status(
+        &report.findings,
+        &config.output,
+        true,
+        Some(reason.map_or("execution_error", |r| r.as_str())),
+    ) {
+        eprintln!("Warning: Failed to write SARIF: {e}");
+    }
+    if let Some(path) = &config.summary {
+        write_run_summary(
+            path,
+            &report.task_id,
+            report.status,
+            reason,
+            &report.findings,
+            report.exit_code,
+            &report.token_usage,
+            report.duration_ms,
+            report.verification.as_ref(),
+        );
+    }
+}
+
+fn execution_error(
+    config: &Config,
+    start: Instant,
+    error: String,
+    reason: Option<IncompleteReason>,
+) -> ExecutionReport {
+    ExecutionReport {
+        task_id: config.task.id.clone(),
+        exit_code: 2,
+        findings: vec![],
+        token_usage: Usage::default(),
+        duration_ms: start.elapsed().as_millis() as u64,
+        snapshot_id: None,
+        errors: vec![error],
+        violations: vec![],
+        status: RunStatus::Error,
+        incomplete_reason: reason,
+        verification: None,
+    }
+}
+
+async fn execute_task_inner(config: &Config) -> ExecutionReport {
     if let Some(sharding) = &config.task.sharding {
+        // Shard runs do not support MCP preflight. Never silently skip a
+        // configured required check when selecting this execution path.
+        if !config.task.preflight.is_empty() {
+            return execution_error(
+                config,
+                Instant::now(),
+                "Preflight checks are not supported in sharded runs; run them as a separate task"
+                    .into(),
+                None,
+            );
+        }
         return execute_sharded_task(config, sharding).await;
     }
     execute_single_task(config).await
@@ -294,6 +375,15 @@ async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> Exe
             contract.timeout_secs = ts;
         }
         contract.prompt_template = shard_prompt(&config.task.prompt_template);
+
+        if let Err(e) = crate::agent::archive_previous_ledger(&workspace, &shard_task_id) {
+            return execution_error(
+                config,
+                start,
+                format!("Ledger initialization failed: {e}"),
+                None,
+            );
+        }
 
         let manifest = crate::shard::build_manifest(&shard, &risk_hits);
         let diffs = shard
@@ -603,6 +693,17 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
     let start = Instant::now();
     let task_id = config.task.id.clone();
 
+    if !config.resume {
+        if let Err(e) = crate::agent::archive_previous_ledger(&config.workspace, &task_id) {
+            return execution_error(
+                config,
+                start,
+                format!("Ledger initialization failed: {e}"),
+                None,
+            );
+        }
+    }
+
     let provider = match create_provider(
         &config.task.vendor,
         &config.task.model,
@@ -678,42 +779,13 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
     // ── Preflight checks ──────────────────────────────────────────────────
     // Run configured MCP tool calls *before* the agent loop. Their output is
     // parsed into deterministic Findings and merged with agent findings.
-    let mut preflight_findings: Vec<Finding> = Vec::new();
-    let mut preflight_summary: Option<String> = None;
-    if let Some(ref mgr) = _mcp_manager {
-        if !config.task.preflight.is_empty() {
-            let mut all_items: Vec<Finding> = Vec::new();
-            for check in &config.task.preflight {
-                tracing::info!(
-                    server = %check.mcp_server,
-                    tool = %check.tool,
-                    "Running preflight check"
-                );
-                match mgr
-                    .call_tool(&check.mcp_server, &check.tool, check.args.clone())
-                    .await
-                {
-                    Ok(output) => {
-                        let findings = parse_preflight_result(&output, check);
-                        all_items.extend(findings);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            server = %check.mcp_server,
-                            tool = %check.tool,
-                            error = %e,
-                            "Preflight check failed — skipping"
-                        );
-                    }
-                }
-            }
-            if !all_items.is_empty() {
-                let summary = format_preflight_summary(&all_items);
-                preflight_summary = Some(summary);
-                preflight_findings = all_items;
-            }
-        }
-    }
+    let preflight_findings =
+        match run_preflight(_mcp_manager.as_ref(), &config.task.preflight).await {
+            Ok(findings) => findings,
+            Err(e) => return execution_error(config, start, e, None),
+        };
+    let preflight_summary =
+        (!preflight_findings.is_empty()).then(|| format_preflight_summary(&preflight_findings));
 
     let checkpoint_store = match CheckpointStore::new() {
         Ok(cs) => cs,
@@ -1004,7 +1076,7 @@ pub fn cleanup_archives(workspace: &Path, task_id: &str) {
         return;
     }
     let dump_prefix = format!("context-dump-{}-{}", task_id, "");
-    let ledger_prefix = format!("findings-ledger-{}", task_id);
+    let ledger_name = format!("findings-ledger-{}.jsonl", task_id);
     let spill_prefix = format!("tool-output-{}", task_id);
     let event_prefix = format!("run-{}", task_id);
     if let Ok(entries) = std::fs::read_dir(&archives_dir) {
@@ -1012,7 +1084,7 @@ pub fn cleanup_archives(workspace: &Path, task_id: &str) {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             let is_dump = name_str.starts_with(&dump_prefix) && name_str.ends_with(".log");
-            let is_ledger = name_str.starts_with(&ledger_prefix) && name_str.ends_with(".jsonl");
+            let is_ledger = name_str == ledger_name;
             let is_spill = name_str.starts_with(&spill_prefix) && name_str.ends_with(".txt");
             let is_event =
                 name_str.starts_with(&event_prefix) && name_str.ends_with(".events.jsonl");
@@ -1025,76 +1097,96 @@ pub fn cleanup_archives(workspace: &Path, task_id: &str) {
 
 // ── Preflight helpers ─────────────────────────────────────────────────────
 
-/// Parse an MCP tool's JSON output into `Finding` objects.
-///
-/// The output is expected to be a JSON array of objects. Each object's fields
-/// are mapped to `Finding` fields using the `PreflightCheck` configuration.
-/// Items that cannot be parsed are silently skipped.
-fn parse_preflight_result(output: &str, check: &PreflightCheck) -> Vec<Finding> {
-    let value: serde_json::Value = match serde_json::from_str(output) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    let items = match value.as_array() {
-        Some(arr) => arr,
-        None => return Vec::new(),
-    };
-
+/// Execute every configured check before the agent. An unavailable server,
+/// failed tool call or malformed diagnostic is an execution error.
+async fn run_preflight(
+    manager: Option<&crate::mcp::McpClientManager>,
+    checks: &[PreflightCheck],
+) -> Result<Vec<Finding>, String> {
     let mut findings = Vec::new();
-    for item in items {
-        if let Some(msg) = item
+    for check in checks {
+        let label = format!("Preflight '{}' on '{}'", check.tool, check.mcp_server);
+        let manager = manager.ok_or_else(|| format!("{label}: MCP server unavailable"))?;
+        let output = manager
+            .call_tool(&check.mcp_server, &check.tool, check.args.clone())
+            .await
+            .map_err(|e| format!("{label} failed: {e}"))?;
+        findings.extend(
+            parse_preflight_result(&output, check)
+                .map_err(|e| format!("{label}: invalid diagnostics: {e}"))?,
+        );
+    }
+    Ok(findings)
+}
+
+/// Empty diagnostics are valid; failed or malformed diagnostics are errors.
+fn parse_preflight_result(output: &str, check: &PreflightCheck) -> Result<Vec<Finding>, String> {
+    let value: serde_json::Value = serde_json::from_str(output).map_err(|e| e.to_string())?;
+    let items = value
+        .as_array()
+        .ok_or("expected a JSON diagnostics array")?;
+    let mut findings = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let msg = item
             .get(&check.message_field)
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            let severity_str = item
-                .get(&check.severity_field)
-                .and_then(|v| v.as_str())
-                .unwrap_or(&check.default_severity);
-            let severity = parse_severity_str(severity_str);
-
-            let file = item
-                .get(&check.file_field)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let line_start = item
-                .get(&check.line_field)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let col_start = item
-                .get(&check.column_field)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-
-            let location = if !file.is_empty() {
-                Some(crate::types::Location {
-                    file,
-                    line_start,
-                    line_end: line_start,
-                    column_start: col_start,
-                    column_end: col_start,
-                })
-            } else {
-                None
-            };
-
-            let rule_id = format!("{}{}", check.rule_id_prefix, msg);
-
-            findings.push(Finding {
-                id: uuid::Uuid::new_v4(),
-                rule_id,
-                severity,
-                message: msg.to_string(),
-                location,
-                evidence: output.len().min(200).to_string(), // first 200 chars as evidence
-            });
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "diagnostic {index}: missing nonempty '{}'",
+                    check.message_field
+                )
+            })?;
+        let severity_text = match item.get(&check.severity_field) {
+            None => check.default_severity.clone(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            Some(_) => return Err(format!("diagnostic {index}: invalid severity")),
+        };
+        if !matches!(
+            severity_text.to_lowercase().as_str(),
+            "error" | "1" | "warning" | "2" | "warn" | "info" | "3" | "information" | "hint" | "4"
+        ) {
+            return Err(format!(
+                "diagnostic {index}: unknown severity '{severity_text}'"
+            ));
         }
+        let severity = parse_severity_str(&severity_text);
+        let severity_name = match severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+            Severity::Hint => "hint",
+        };
+        let file = item
+            .get(&check.file_field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let line = item
+            .get(&check.line_field)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+        let column = item
+            .get(&check.column_field)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+        let location = (!file.is_empty()).then(|| crate::types::Location {
+            file: file.to_string(),
+            line_start: line,
+            line_end: line,
+            column_start: column,
+            column_end: column,
+        });
+        findings.push(Finding {
+            id: uuid::Uuid::new_v4(),
+            rule_id: format!("{}{}", check.rule_id_prefix, severity_name),
+            severity,
+            message: msg.to_string(),
+            location,
+            evidence: item.to_string().chars().take(200).collect(),
+        });
     }
-
-    findings
+    Ok(findings)
 }
 
 /// Convert a string like "error", "warning", "info" into `Severity`.
@@ -1421,7 +1513,7 @@ mod tests {
             {"severity": "error", "message": "type mismatch", "file": "src/main.rs", "line": 42},
             {"severity": "warning", "message": "unused variable", "file": "src/lib.rs", "line": 10}
         ]"#;
-        let findings = parse_preflight_result(output, &check);
+        let findings = parse_preflight_result(output, &check).unwrap();
         assert_eq!(findings.len(), 2);
 
         assert_eq!(findings[0].severity, Severity::Error);
@@ -1437,15 +1529,14 @@ mod tests {
     #[test]
     fn test_parse_preflight_result_empty() {
         let check = PreflightCheck::default();
-        let findings = parse_preflight_result(r#"[]"#, &check);
+        let findings = parse_preflight_result(r#"[]"#, &check).unwrap();
         assert!(findings.is_empty());
     }
 
     #[test]
     fn test_parse_preflight_result_non_json() {
         let check = PreflightCheck::default();
-        let findings = parse_preflight_result("not json at all", &check);
-        assert!(findings.is_empty());
+        assert!(parse_preflight_result("not json at all", &check).is_err());
     }
 
     #[test]
@@ -1461,7 +1552,7 @@ mod tests {
         let output = r#"[
             {"s": "error", "m": "E001: something wrong", "path": "a.rs", "ln": 1}
         ]"#;
-        let findings = parse_preflight_result(output, &check);
+        let findings = parse_preflight_result(output, &check).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Error);
         assert!(findings[0].rule_id.starts_with("diag-"));

@@ -137,9 +137,10 @@ Typical CI policy:
 
 - Shards run serially (determinism, rate limits). A `concurrency` knob may
   follow.
-- The pre-scan is regex-based by design; for semantic scanning, pair
-  sharding with MCP preflight checks (Semgrep, CodeQL, LSP).
-- MCP tools/preflight are not available *inside* shard runs; configure
-  them at the task level for the non-sharded path.
-- The findings ledger, checkpoints and `--resume` apply per shard run; the
-  summary JSON is the aggregate record.
+- The pre-scan is regex-based by design. Run MCP preflight checks
+  (Semgrep, CodeQL, LSP) in a separate non-sharded task for semantic scanning.
+- MCP tools/preflight are not available inside shard runs. A sharded task
+  with configured preflight checks returns an error rather than skipping them.
+- Each shard attempt starts with a fresh findings ledger; previous ledgers
+  are retained for audit. Checkpoint restoration and `--resume` are supported
+  by non-sharded tasks; the sharded summary JSON is the aggregate record.

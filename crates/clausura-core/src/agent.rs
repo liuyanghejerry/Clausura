@@ -97,6 +97,19 @@ async fn recover_findings_json(
         total_usage.total_tokens += retry.usage.total_tokens;
         *running_tokens += retry.usage.total_tokens;
         messages.push(Message::new(Role::Assistant, retry.message.content.clone()));
+        // Valid JSON alone does not mean the review completed. Do not accept
+        // a length-limited, filtered or tool-calling corrective response.
+        if retry.finish_reason != FinishReason::Stop
+            || retry
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty())
+        {
+            return Err(format!(
+                "corrective response did not finish cleanly: {:?}",
+                retry.finish_reason
+            ));
+        }
         match extract_findings(&retry.message.content) {
             Ok(findings) => return Ok(findings),
             Err(e) => {
@@ -116,6 +129,13 @@ async fn recover_findings_json(
 
 /// Run the bounded agent loop.
 pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, ProviderError> {
+    let timeout = Duration::from_secs(config.contract.timeout_secs);
+    tokio::time::timeout(timeout, run_agent_loop_inner(config))
+        .await
+        .map_err(|_| ProviderError::Timeout("Task timeout exceeded".into()))?
+}
+
+async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, ProviderError> {
     let start = Instant::now();
     let max_iterations: u32 = config.contract.max_iterations;
     let mut messages = config.initial_messages;
@@ -996,6 +1016,22 @@ fn ledger_path(workspace_root: &Path, task_id: &str) -> PathBuf {
         .join(".clausura")
         .join("archives")
         .join(format!("findings-ledger-{}.jsonl", task_id))
+}
+
+/// A fresh run must not merge the preceding run's findings. Preserve that
+/// ledger for audit, under a name neither merging nor cleanup will consume.
+pub(crate) fn archive_previous_ledger(workspace_root: &Path, task_id: &str) -> std::io::Result<()> {
+    let path = ledger_path(workspace_root, task_id);
+    let previous = path.with_file_name(format!(
+        "previous-findings-{}-{}.jsonl",
+        task_id,
+        uuid::Uuid::new_v4()
+    ));
+    match std::fs::rename(path, previous) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Append findings to the ledger, creating file/dirs as needed.
