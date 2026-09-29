@@ -12,6 +12,8 @@ YAML file  <  CLI flags  <  Environment variables
 
 For example, `task.model` from the YAML file is overridden by `--model` on the CLI, which is in turn overridden by `CLAUSURA_MODEL` in the environment.
 
+Empty `CLAUSURA_MODEL`, `CLAUSURA_VENDOR`, and `CLAUSURA_API_KEY` values do not overwrite lower-priority configuration. For API keys, a nonempty `vendor.api_key_env` value takes precedence over `CLAUSURA_API_KEY`, then `--api-key`.
+
 ## Complete Schema
 
 ```yaml
@@ -258,9 +260,11 @@ task:
 
 Env override: `CLAUSURA_FINDINGS_LEDGER=false`.
 
+Fresh runs archive an existing ledger as `previous-findings-{task_id}-{uuid}.jsonl` and start empty. `--resume` retains the active ledger; old archived ledgers remain available for audit but are never merged into a new run. Shard attempts likewise start with a fresh ledger.
+
 ### `task.timeout_secs`
 
-**Default: 300.** Maximum wall-clock time for the entire run. If exceeded, the run terminates with exit code 2 (error).
+**Default: 300.** Maximum wall-clock time for the entire run, including MCP startup/preflight, model retries and backoff, compaction, tool calls, shard retries, and findings verification. Per-shard timeouts may be shorter, but cannot extend the overall deadline. If exceeded, the run terminates with exit code 2 and incomplete reports.
 
 ```yaml
 task:

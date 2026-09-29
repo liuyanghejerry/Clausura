@@ -292,6 +292,24 @@ impl McpClient {
         tool_name: &str,
         args: Value,
     ) -> Result<String, McpError> {
+        tokio::time::timeout(
+            Duration::from_secs(channel.timeout_secs),
+            Self::call_tool_inner(channel, tool_name, args),
+        )
+        .await
+        .map_err(|_| {
+            McpError::Timeout(format!(
+                "MCP tool '{}' timed out after {}s",
+                tool_name, channel.timeout_secs
+            ))
+        })?
+    }
+
+    async fn call_tool_inner(
+        channel: &McpClientChannel,
+        tool_name: &str,
+        args: Value,
+    ) -> Result<String, McpError> {
         let mut child = spawn_server(&channel.command, &channel.args, &channel.env)?;
 
         // Run handshake on the new connection.
@@ -310,17 +328,14 @@ impl McpClient {
 
         child.send(&req).await?;
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(channel.timeout_secs),
-            child.recv_response(id),
-        )
-        .await
-        .map_err(|_| {
-            McpError::Timeout(format!(
-                "MCP tool '{}' timed out after {}s",
-                tool_name, channel.timeout_secs
-            ))
-        })??;
+        let result = child.recv_response(id).await?;
+
+        if result["result"]["isError"].as_bool() == Some(true) {
+            return Err(McpError::Protocol(format!(
+                "Tool '{tool_name}' reported an error: {}",
+                extract_text_content(&result["result"]["content"]).unwrap_or_default()
+            )));
+        }
 
         // Extract the tool result content.
         // MCP spec: result is { content: [{ type: "text", text: "..." }] }

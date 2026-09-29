@@ -72,7 +72,7 @@ struct YamlTaskConfig {
     #[serde(default)]
     model: String,
     #[serde(default)]
-    vendor: String,
+    vendor: VendorConfig,
     #[serde(default = "default_prompt")]
     prompt_template: String,
     #[serde(default)]
@@ -114,6 +114,7 @@ struct YamlTaskConfig {
 #[derive(Debug, Deserialize)]
 struct YamlGateRule {
     rule: String,
+    #[serde(default)]
     description: String,
     min_severity: String,
     max_findings: u32,
@@ -209,6 +210,11 @@ fn default_prompt() -> String {
     "{{task_description}}".to_string()
 }
 
+/// Empty optional CI inputs should not hide lower-priority configuration.
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
 fn default_token_budget() -> u64 {
     32000
 }
@@ -296,11 +302,6 @@ fn validate_yaml(yaml: &YamlConfig) -> Result<(), ConfigError> {
             "Unsupported schema version '{}'. Expected '1'",
             yaml.version
         )));
-    }
-    if yaml.task.model.is_empty() && std::env::var("CLAUSURA_MODEL").is_err() {
-        return Err(ConfigError::ValidationError(
-            "task.model is required (or set CLAUSURA_MODEL)".into(),
-        ));
     }
     if yaml.task.token_budget == 0 {
         return Err(ConfigError::ValidationError(
@@ -432,7 +433,7 @@ impl Config {
                     description: String::new(),
                     skill_prompts: vec![],
                     model: String::new(),
-                    vendor: String::new(),
+                    vendor: VendorConfig::default(),
                     prompt_template: default_prompt(),
                     tool_allowlist: vec![],
                     token_budget: default_token_budget(),
@@ -457,16 +458,27 @@ impl Config {
         };
 
         // ---- Layer 2: Environment variable + CLI overrides ----
-        let model = std::env::var("CLAUSURA_MODEL")
-            .ok()
-            .or_else(|| cli_model.map(|m| m.to_string()))
+        let model = nonempty_env("CLAUSURA_MODEL")
+            .or_else(|| {
+                cli_model
+                    .filter(|m| !m.trim().is_empty())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| yaml_task.model.clone());
+        if config_path.is_some() && model.trim().is_empty() {
+            return Err(ConfigError::ValidationError(
+                "task.model is required (or set --model / CLAUSURA_MODEL)".into(),
+            ));
+        }
 
-        let vendor_input = std::env::var("CLAUSURA_VENDOR")
-            .ok()
-            .or_else(|| cli_vendor.map(|v| v.to_string()))
+        let mut vendor = nonempty_env("CLAUSURA_VENDOR")
+            .or_else(|| {
+                cli_vendor
+                    .filter(|v| !v.trim().is_empty())
+                    .map(str::to_string)
+            })
+            .map(|v| VendorConfig::from_name(&v))
             .unwrap_or_else(|| yaml_task.vendor.clone());
-        let mut vendor = VendorConfig::from_name(&vendor_input);
         // Any OpenAI-compatible endpoint can be pointed at via env override,
         // regardless of the vendor shorthand in the config (e.g. enterprise
         // gateways and regional providers).
@@ -528,9 +540,16 @@ impl Config {
             .unwrap_or(yaml_task.shell_timeout_secs);
 
         // ---- Layer 3: Environment variable overrides ----
-        let api_key = std::env::var("CLAUSURA_API_KEY")
-            .ok()
-            .or_else(|| cli_api_key.map(|s| s.to_string()));
+        let api_key = vendor
+            .api_key_env
+            .as_deref()
+            .and_then(nonempty_env)
+            .or_else(|| nonempty_env("CLAUSURA_API_KEY"))
+            .or_else(|| {
+                cli_api_key
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+            });
 
         let ambiguity_str =
             std::env::var("CLAUSURA_AMBIGUITY_POLICY").unwrap_or(yaml_task.ambiguity_policy);
