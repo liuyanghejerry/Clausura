@@ -33,7 +33,7 @@ enum Commands {
     /// Manage checkpoints
     Snapshot(SnapshotArgs),
     /// Effect-oriented evaluation across scenarios and config variants
-    Eval(EvalArgs),
+    Eval(Box<EvalArgs>),
 }
 
 #[tokio::main]
@@ -54,6 +54,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             Ok(())
         }
-        Commands::Eval(args) => commands::eval::execute(args).await,
+        Commands::Eval(args) => commands::eval::execute(*args).await,
     }
 }
