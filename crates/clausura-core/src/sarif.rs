@@ -77,6 +77,15 @@ impl SarifFormatter {
             }]);
         }
 
+        let ci = crate::ci::context();
+        if ci.repo.is_some()
+            || ci.pr_number.is_some()
+            || ci.commit_sha.is_some()
+            || ci.branch.is_some()
+        {
+            run["properties"]["ci"] = serde_json::to_value(ci).unwrap_or_default();
+        }
+
         serde_json::json!({
             "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
             "version": "2.1.0",
@@ -254,14 +263,15 @@ mod tests {
 
     #[test]
     fn test_complete_run_not_annotated() {
-        // Both the default to_string and an explicit incomplete=false must
-        // omit the annotation entirely (not emit "incomplete": false).
+        // CI metadata may exist under properties, but incomplete annotations
+        // must be absent (not emit "incomplete": false).
         for sarif in [
             SarifFormatter::to_string(&[]).unwrap(),
             SarifFormatter::to_string_with_status(&[], false, None).unwrap(),
         ] {
             let parsed: serde_json::Value = serde_json::from_str(&sarif).unwrap();
-            assert!(parsed["runs"][0].get("properties").is_none());
+            assert!(parsed["runs"][0]["properties"]["incomplete"].is_null());
+            assert!(parsed["runs"][0]["properties"]["status"].is_null());
             assert!(parsed["runs"][0].get("invocations").is_none());
         }
     }

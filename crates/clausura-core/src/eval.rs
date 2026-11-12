@@ -21,7 +21,7 @@
 
 use crate::config::{Config, LogFormat};
 use crate::eventlog::{EventLog, RunEvent};
-use crate::executor::execute_task;
+use crate::executor::{execute_task_with_options, ExecutionOptions};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -137,6 +137,12 @@ pub struct RunMetrics {
     pub truth_overreported: u32,
     /// Findings whose rule_id has no ground-truth entry.
     pub unexpected_rule_ids: Vec<String>,
+    /// Execution outcome from the executor, independent of event-log health.
+    #[serde(default)]
+    pub status: crate::types::RunStatus,
+    /// Runtime or incomplete diagnostics returned by the executor.
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 impl RunMetrics {
@@ -172,6 +178,10 @@ pub fn metrics_from_run(
         variant: variant.into(),
         run_index,
         exit_code: report.exit_code,
+        truncated: report.status != crate::types::RunStatus::Complete
+            || report.incomplete_reason.is_some(),
+        status: report.status,
+        errors: report.errors.clone(),
         duration_ms: report.duration_ms,
         input_tokens: report.token_usage.input_tokens,
         output_tokens: report.token_usage.output_tokens,
@@ -196,7 +206,7 @@ pub fn metrics_from_run(
             RunEvent::ContextTruncated { .. } => m.context_truncations += 1,
             RunEvent::RepeatReminder { .. } => m.repeat_reminders += 1,
             RunEvent::FindingsRecoveryAttempt { .. } => m.recovery_attempts += 1,
-            RunEvent::RunEnd { truncated, .. } => m.truncated = *truncated,
+            RunEvent::RunEnd { truncated, .. } => m.truncated |= *truncated,
             _ => {}
         }
     }
@@ -282,6 +292,9 @@ pub struct VariantSummary {
     pub truth_overreported: u32,
     /// Unexpected rule_ids seen across runs.
     pub unexpected_rule_ids: Vec<String>,
+    /// Unaggregated outcomes used to build this summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_metrics: Vec<RunMetrics>,
 }
 
 fn mean(values: &[f64]) -> f64 {
@@ -301,6 +314,7 @@ pub fn summarize_variant(runs: &[RunMetrics]) -> VariantSummary {
         scenario: runs[0].scenario.clone(),
         variant: runs[0].variant.clone(),
         runs: runs.len() as u32,
+        run_metrics: runs.to_vec(),
         ..Default::default()
     };
     s.success_rate = runs.iter().filter(|m| m.success()).count() as f64 / runs.len() as f64;
@@ -340,12 +354,12 @@ pub fn summarize_variant(runs: &[RunMetrics]) -> VariantSummary {
             .map(|m| m.repeat_reminders as f64)
             .collect::<Vec<_>>(),
     );
-    let attempts: u32 = runs.iter().map(|m| m.recovery_attempts).sum();
-    let recovered: u32 = runs.iter().filter(|m| m.recovered).map(|_| 1).sum();
-    s.recovery_success_rate = if attempts == 0 {
+    let attempted_runs = runs.iter().filter(|m| m.recovery_attempts > 0).count();
+    let recovered_runs = runs.iter().filter(|m| m.recovered).count();
+    s.recovery_success_rate = if attempted_runs == 0 {
         0.0
     } else {
-        recovered as f64 / attempts as f64
+        recovered_runs as f64 / attempted_runs as f64
     };
     let matched: u32 = runs.iter().map(|m| m.truth_matched).sum();
     let total: u32 = runs.iter().map(|m| m.truth_total).sum();
@@ -374,6 +388,9 @@ pub struct EvalReport {
     /// Git commit the binary/repo was built from (best-effort).
     pub commit: String,
     pub branch: String,
+    /// Whether the source tree contained uncommitted changes at eval start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tree_dirty: Option<bool>,
     pub model: String,
     pub scenarios: Vec<ScenarioSummary>,
 }
@@ -573,6 +590,8 @@ pub struct MatrixReport {
     pub generated_at: String,
     pub commit: String,
     pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tree_dirty: Option<bool>,
     /// Variant the matrix was restricted to, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
@@ -656,16 +675,20 @@ impl MatrixReport {
             "# Model matrix — {} ({} @ {})\n\n",
             self.generated_at, self.branch, self.commit
         ));
+        if let Some(dirty) = self.source_tree_dirty {
+            out.push_str(&format!("source tree dirty: `{dirty}` · "));
+        }
         if let Some(variant) = &self.variant {
             out.push_str(&format!("variant: `{variant}` · "));
         }
         out.push_str(
-            "recall = fraction of ground-truth rules reported (micro-averaged over runs); \
+            "rule recall = fraction of ground-truth rule categories meeting their finding-count \
+             threshold (micro-averaged over runs), not per-instance or location recall; \
              success = clean finish (gate exit codes are scenario properties).\n\n",
         );
 
         out.push_str(
-            "| model | recall | success | tokens/run | LLM calls/run | time/run (s) | total tokens |\n\
+            "| model | rule recall | success | tokens/run | LLM calls/run | time/run (s) | total tokens |\n\
              |-------|--------|---------|------------|---------------|--------------|--------------|\n",
         );
         for m in &self.models {
@@ -734,10 +757,12 @@ impl MatrixReport {
             out.push('\n');
             for m in &self.models {
                 out.push_str(&format!("| `{}` |", m.model));
+                let unavailable =
+                    m.error.is_some() || (m.total_runs() > 0 && m.total_tokens() == 0.0);
                 for name in &scenario_names {
-                    match m.scenario_recall(name) {
-                        Some(r) => out.push_str(&format!(" {:.0}% |", r * 100.0)),
-                        None => out.push_str(" — |"),
+                    match (unavailable, m.scenario_recall(name)) {
+                        (false, Some(r)) => out.push_str(&format!(" {:.0}% |", r * 100.0)),
+                        _ => out.push_str(" — |"),
                     }
                 }
                 out.push('\n');
@@ -878,7 +903,7 @@ fn init_git_repo(ws: &Path) {
 }
 
 /// Best-effort git context for report provenance.
-fn git_context() -> (String, String) {
+fn git_context() -> (String, String, Option<bool>) {
     let short = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
@@ -894,7 +919,15 @@ fn git_context() -> (String, String) {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "detached".into());
-    (short, branch)
+    static DIRTY: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let dirty = *DIRTY.get_or_init(|| {
+        let output = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()?;
+        output.status.success().then_some(!output.stdout.is_empty())
+    });
+    (short, branch, dirty)
 }
 
 /// Run the full eval: every scenario × variant × run. Returns the report.
@@ -906,11 +939,12 @@ pub async fn run_eval(eval_path: &Path, opts: &EvalOptions) -> Result<EvalReport
         .ok_or(EvalError::MissingApiKey)?;
 
     let (eval_config, base_dir) = load_eval_config(eval_path)?;
-    let (commit, branch) = git_context();
+    let (commit, branch, source_tree_dirty) = git_context();
     let mut report = EvalReport {
         generated_at: chrono::Utc::now().to_rfc3339(),
         commit,
         branch,
+        source_tree_dirty,
         model: opts
             .model
             .clone()
@@ -1044,9 +1078,15 @@ async fn run_once(
     )?;
 
     let task_id = config.task.id.clone();
-    let result = execute_task(&config).await;
+    let result = execute_task_with_options(
+        &config,
+        ExecutionOptions {
+            preserve_archives: true,
+        },
+    )
+    .await;
 
-    // Preserve the run event log for debugging regardless of cleanup.
+    // Preserve the run event log for debugging and mechanism metrics.
     let log_path = EventLog::new(&ws_copy, &task_id).path().to_path_buf();
     let events = read_run_events(&log_path);
     if log_path.exists() {
@@ -1216,6 +1256,35 @@ mod tests {
     }
 
     #[test]
+    fn test_metrics_error_without_run_end_is_not_success() {
+        let mut report = empty_report();
+        report.exit_code = 2;
+        report.status = crate::types::RunStatus::Error;
+        report.incomplete_reason = Some(crate::types::IncompleteReason::Timeout);
+        report.errors = vec!["Task timeout exceeded".into()];
+
+        let metrics = metrics_from_run("s", "v", 0, &report, &[], &[]);
+        assert!(metrics.truncated);
+        assert!(!metrics.success());
+        assert_eq!(metrics.status, crate::types::RunStatus::Error);
+        assert_eq!(metrics.errors, vec!["Task timeout exceeded"]);
+    }
+
+    #[test]
+    fn test_recovery_rate_counts_attempted_runs_not_calls() {
+        let summary = summarize_variant(&[RunMetrics {
+            scenario: "s".into(),
+            variant: "v".into(),
+            recovery_attempts: 2,
+            recovered: true,
+            ..Default::default()
+        }]);
+        assert_eq!(summary.recovery_success_rate, 1.0);
+        assert_eq!(summary.run_metrics.len(), 1);
+        assert_eq!(summary.run_metrics[0].recovery_attempts, 2);
+    }
+
+    #[test]
     fn test_summarize_variant() {
         let runs = vec![
             RunMetrics {
@@ -1284,6 +1353,7 @@ scenarios:
             generated_at: "x".into(),
             commit: "old".into(),
             branch: "main".into(),
+            source_tree_dirty: None,
             model: "m".into(),
             scenarios: vec![ScenarioSummary {
                 name: "sec".into(),
@@ -1423,6 +1493,7 @@ scenarios:
                 generated_at: "x".into(),
                 commit: "c".into(),
                 branch: "main".into(),
+                source_tree_dirty: None,
                 model: model.into(),
                 scenarios: vec![ScenarioSummary {
                     name: scenario.into(),
@@ -1504,6 +1575,8 @@ models:
         assert!(md.contains("no tokens billed"), "got:\n{md}");
         assert!(md.contains("## Recall by scenario"));
         assert!(md.contains("security-basics"));
+        let zero_token_scenario = md.lines().rfind(|line| line.starts_with("| `d/d`"));
+        assert_eq!(zero_token_scenario, Some("| `d/d` | — |"));
         // JSON round-trip keeps the pooled counts for offline rendering.
         let json = serde_json::to_string(&report).unwrap();
         let back: MatrixReport = serde_json::from_str(&json).unwrap();

@@ -8,7 +8,7 @@
 # Usage (OpenRouter serves all entries with one key):
 #   export CLAUSURA_API_KEY="$OPENROUTER_API_KEY"
 #   clausura eval --config eval/eval.yaml --models eval/models.yaml \
-#     --variant default --runs 2 --out-dir eval-results/matrix
+#     --variant default --runs 3 --out-dir eval-results/matrix
 #
 # Keys: by default every entry uses CLAUSURA_API_KEY (or --api-key). Set
 # api_key_env on an entry to read a different env var, e.g. when mixing

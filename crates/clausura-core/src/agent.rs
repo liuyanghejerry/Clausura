@@ -4,7 +4,8 @@ use crate::provider::{is_context_overflow_err, Provider};
 use crate::snapshot::SnapshotManager;
 use crate::tools::ToolRegistry;
 use crate::types::{
-    Finding, FinishReason, IncompleteReason, Message, ProviderError, Role, TaskContract, Usage,
+    AmbiguityPolicy, Finding, FinishReason, IncompleteReason, Message, ProviderError, Role,
+    TaskContract, Usage,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -294,9 +295,9 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
                     response.message.content.clone(),
                 ));
 
-                // Strict parse; on failure, ask for a JSON-only reply before
-                // giving up (bounded, billed, budget-respecting). The prompt
-                // carries the specific parse error and the expected schema.
+                // Strict parse by default; proceed_with_caution uses lenient
+                // extraction. Otherwise ask for a JSON-only reply with the
+                // specific parse error and expected schema.
                 let parsed = match extract_findings(&response.message.content) {
                     Ok(findings) => Ok(findings),
                     Err(err) => {
@@ -307,18 +308,26 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
                                 raw_preview: raw_preview(&response.message.content),
                             });
                         }
-                        recover_findings_json(
-                            config.contract,
-                            config.provider,
-                            config.tools,
-                            &mut messages,
-                            &start,
-                            &mut running_tokens,
-                            &mut total_usage,
-                            config.event_log,
-                            &err,
-                        )
-                        .await
+                        if config.contract.ambiguity_policy == AmbiguityPolicy::ProceedWithCaution {
+                            eprintln!(
+                                "Warning: {err}; continuing with best-effort findings \
+                                 (ambiguity_policy=proceed_with_caution)"
+                            );
+                            Ok(extract_findings_lenient(&response.message.content))
+                        } else {
+                            recover_findings_json(
+                                config.contract,
+                                config.provider,
+                                config.tools,
+                                &mut messages,
+                                &start,
+                                &mut running_tokens,
+                                &mut total_usage,
+                                config.event_log,
+                                &err,
+                            )
+                            .await
+                        }
                     }
                 };
 
@@ -523,10 +532,10 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
     }
     let mut findings = extract_findings_lenient(&last_content);
 
-    // One more bounded attempt can rescue the run: if nothing parseable came
-    // out, ask for a JSON-only findings reply. A successful recovery counts as
-    // a complete final answer (truncated=false), so gating evaluates it
-    // normally instead of the caller failing closed on `on_incomplete`.
+    // One more bounded attempt can recover findings from the context gathered
+    // before an abnormal ending. It does not prove that the requested sweep
+    // completed, so the original incomplete reason must remain intact for
+    // `on_incomplete` and CI status reporting.
     // Skipped when the Stop answer already burned its corrective retries
     // (malformed_json) — repeating the recovery would only re-bill the same
     // failure.
@@ -546,8 +555,6 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
         {
             Ok(recovered) => {
                 findings = recovered;
-                truncated = false;
-                break_reason = None;
             }
             Err(_) => {
                 // Stay incomplete; the lenient (possibly ledger-merged)
@@ -3204,6 +3211,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_agent_loop_proceed_with_caution_uses_lenient_extraction() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+        let mut mock = MockProvider::new("gpt-4o");
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, "not findings JSON"),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let mut contract = test_contract();
+        contract.ambiguity_policy = AmbiguityPolicy::ProceedWithCaution;
+        let result = run_agent_loop(AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review the diff")],
+            workspace_root: root,
+            snapshot_mgr: None,
+            event_log: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(!result.truncated);
+        assert_eq!(result.incomplete_reason, None);
+        assert!(result.findings.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_agent_loop_malformed_json_retries_exhausted() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
@@ -3297,8 +3340,12 @@ mod tests {
         };
         let result = run_agent_loop(config).await.unwrap();
         assert!(
-            !result.truncated,
-            "a successful corrective recovery counts as a complete final answer"
+            result.truncated,
+            "recovering findings must not hide the earlier iteration limit"
+        );
+        assert_eq!(
+            result.incomplete_reason,
+            Some(IncompleteReason::IterationLimit)
         );
         assert_eq!(result.findings.len(), 1);
         assert!(result.findings[0].message.contains("recovered"));

@@ -193,8 +193,11 @@ If a run was interrupted, inspect what the agent had done:
 
 ```bash
 clausura snapshot list
-clausura snapshot show
+clausura snapshot show --thread 'task-code-review@/absolute/path/to/workspace'
 ```
+
+Checkpoint thread IDs are workspace-scoped. A legacy unscoped checkpoint or a
+checkpoint from another workspace is not restored automatically.
 
 ### 5. Test with a small config first
 
