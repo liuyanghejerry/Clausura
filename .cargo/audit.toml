@@ -9,4 +9,7 @@
 #
 # See https://rustsec.org/advisories/ for the advisory database.
 [advisories]
-ignore = []
+# Unmaintained-crate notice (not a vulnerability) from serde_yaml's
+# unsafe-libyaml dependency; no fixed upgrade is available. Keep in sync
+# with deny.toml until the YAML dependency is replaced.
+ignore = ["RUSTSEC-2024-0449"]

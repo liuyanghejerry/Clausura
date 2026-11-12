@@ -138,12 +138,13 @@ async fn execute_matrix(
     let mut matrix_report = MatrixReport::new(args.variant.clone());
 
     for entry in &matrix.models {
-        let vendor = entry.effective_vendor(&matrix).unwrap_or("openai");
+        let vendor = entry.effective_vendor(&matrix);
+        let vendor_display = vendor.unwrap_or("from config");
         println!(
             "{} `{}` (vendor: {})",
             "Evaluating model".cyan().bold(),
             entry.model,
-            vendor
+            vendor_display
         );
 
         let api_key = match &entry.api_key_env {
@@ -158,7 +159,7 @@ async fn execute_matrix(
                     );
                     matrix_report.models.push(MatrixModelReport {
                         model: entry.model.clone(),
-                        vendor: vendor.into(),
+                        vendor: vendor_display.into(),
                         error: Some(format!("missing API key in ${env_name}")),
                         ..Default::default()
                     });
@@ -173,7 +174,7 @@ async fn execute_matrix(
         let options = EvalOptions {
             api_key,
             model: Some(entry.model.clone()),
-            vendor: Some(vendor.into()),
+            vendor: vendor.map(str::to_string),
             runs: args.runs,
             scenario_filter: args.scenario.clone(),
             variant_filter: args.variant.clone(),
@@ -189,7 +190,7 @@ async fn execute_matrix(
                 write_report(&model_dir, &report)?;
                 matrix_report.models.push(MatrixModelReport {
                     model: entry.model.clone(),
-                    vendor: vendor.into(),
+                    vendor: vendor_display.into(),
                     error: None,
                     report,
                 });
@@ -202,7 +203,7 @@ async fn execute_matrix(
                 );
                 matrix_report.models.push(MatrixModelReport {
                     model: entry.model.clone(),
-                    vendor: vendor.into(),
+                    vendor: vendor_display.into(),
                     error: Some(e.to_string()),
                     ..Default::default()
                 });

@@ -790,6 +790,8 @@ pub enum EvalError {
     ClausuraConfig(#[from] crate::types::ConfigError),
     #[error("Scenario not found: {0}")]
     ScenarioNotFound(String),
+    #[error("Variant not found in any scenario: {0}")]
+    VariantNotFound(String),
 }
 
 /// Load and parse an eval config file.
@@ -974,6 +976,9 @@ pub async fn run_eval(eval_path: &Path, opts: &EvalOptions) -> Result<EvalReport
     if report.scenarios.is_empty() {
         if let Some(filter) = &opts.scenario_filter {
             return Err(EvalError::ScenarioNotFound(filter.clone()));
+        }
+        if let Some(filter) = &opts.variant_filter {
+            return Err(EvalError::VariantNotFound(filter.clone()));
         }
     }
 
@@ -1503,5 +1508,31 @@ models:
         let json = serde_json::to_string(&report).unwrap();
         let back: MatrixReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back.models[0].pooled_recall(), (6, 6));
+    }
+
+    #[tokio::test]
+    async fn test_variant_filter_with_no_matches_is_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("ws")).unwrap();
+        let eval_path = tmp.path().join("eval.yaml");
+        std::fs::write(
+            &eval_path,
+            "scenarios:\n  - name: sec\n    workspace: ws\n    config: .clausura.yaml\n    variants:\n      - name: default\n",
+        )
+        .unwrap();
+        let opts = EvalOptions {
+            api_key: Some("not-used".into()),
+            model: None,
+            vendor: None,
+            runs: Some(1),
+            scenario_filter: None,
+            variant_filter: Some("defualt".into()),
+            out_dir: tmp.path().join("out"),
+        };
+        let err = run_eval(&eval_path, &opts).await.unwrap_err();
+        assert!(
+            matches!(err, EvalError::VariantNotFound(ref name) if name == "defualt"),
+            "expected VariantNotFound, got {err}"
+        );
     }
 }

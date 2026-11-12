@@ -11,6 +11,7 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// All LLM providers implement this trait.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Send a chat completion request (non-streaming).
