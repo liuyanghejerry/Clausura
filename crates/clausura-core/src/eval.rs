@@ -272,6 +272,12 @@ pub struct VariantSummary {
     pub recovery_success_rate: f64,
     /// Recall over ground-truth rules (all runs pooled).
     pub recall: f64,
+    /// Ground-truth rules matched across runs (recall numerator).
+    #[serde(default)]
+    pub truth_matched: u32,
+    /// Ground-truth rules expected across runs (recall denominator).
+    #[serde(default)]
+    pub truth_total: u32,
     /// Ground-truth rules over-reported across runs (findings > max_findings).
     pub truth_overreported: u32,
     /// Unexpected rule_ids seen across runs.
@@ -348,6 +354,8 @@ pub fn summarize_variant(runs: &[RunMetrics]) -> VariantSummary {
     } else {
         matched as f64 / total as f64
     };
+    s.truth_matched = matched;
+    s.truth_total = total;
     s.truth_overreported = runs.iter().map(|m| m.truth_overreported).sum();
     let mut unexpected: Vec<String> = runs
         .iter()
@@ -495,6 +503,257 @@ pub fn compare_reports(baseline: &EvalReport, current: &EvalReport) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Model matrix (multi-model evals)
+// ---------------------------------------------------------------------------
+
+/// A model matrix for `clausura eval --models models.yaml`: run the same
+/// scenarios against several models and publish a comparable recall report.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelMatrix {
+    /// Default vendor shorthand for entries that don't set one
+    /// (e.g. `openrouter`).
+    #[serde(default)]
+    pub vendor: Option<String>,
+    pub models: Vec<ModelEntry>,
+}
+
+/// One model in a matrix.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelEntry {
+    /// Provider-native model id (e.g. `deepseek/deepseek-v4.1-flash`).
+    pub model: String,
+    /// Vendor shorthand override; falls back to the matrix-level `vendor`.
+    #[serde(default)]
+    pub vendor: Option<String>,
+    /// Env var holding this entry's API key. Defaults to `CLAUSURA_API_KEY`
+    /// (or `--api-key`), so a single gateway key can serve the whole matrix.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+impl ModelEntry {
+    pub fn effective_vendor<'a>(&'a self, matrix: &'a ModelMatrix) -> Option<&'a str> {
+        self.vendor.as_deref().or(matrix.vendor.as_deref())
+    }
+
+    /// Filesystem-safe directory name for per-model artifacts.
+    pub fn slug(&self) -> String {
+        self.model
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    }
+}
+
+/// Load and parse a model matrix file.
+pub fn load_model_matrix(path: &Path) -> Result<ModelMatrix, EvalError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| EvalError::Config(format!("{}: {e}", path.display())))?;
+    let matrix: ModelMatrix = serde_yaml::from_str(&content)
+        .map_err(|e| EvalError::Config(format!("{}: {e}", path.display())))?;
+    if matrix.models.is_empty() {
+        return Err(EvalError::Config(format!(
+            "{}: model matrix must list at least one model",
+            path.display()
+        )));
+    }
+    Ok(matrix)
+}
+
+/// Aggregated multi-model report: per-model eval reports plus a rendered
+/// cross-model comparison suitable for publishing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MatrixReport {
+    pub generated_at: String,
+    pub commit: String,
+    pub branch: String,
+    /// Variant the matrix was restricted to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    pub models: Vec<MatrixModelReport>,
+}
+
+/// One model's outcome in a matrix. A model that failed to evaluate keeps
+/// `error` and an empty report instead of aborting the whole matrix.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MatrixModelReport {
+    pub model: String,
+    pub vendor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub report: EvalReport,
+}
+
+impl MatrixModelReport {
+    fn variants(&self) -> impl Iterator<Item = &VariantSummary> {
+        self.report.scenarios.iter().flat_map(|s| s.variants.iter())
+    }
+
+    /// Micro recall across every scenario × variant (pooled ground truth).
+    pub fn pooled_recall(&self) -> (u32, u32) {
+        self.variants()
+            .fold((0, 0), |(m, t), v| (m + v.truth_matched, t + v.truth_total))
+    }
+
+    fn total_runs(&self) -> u32 {
+        self.variants().map(|v| v.runs).sum()
+    }
+
+    fn total_tokens(&self) -> f64 {
+        self.variants()
+            .map(|v| v.mean_total_tokens * v.runs as f64)
+            .sum()
+    }
+
+    fn mean_success(&self) -> f64 {
+        let runs = self.total_runs();
+        if runs == 0 {
+            0.0
+        } else {
+            self.variants()
+                .map(|v| v.success_rate * v.runs as f64)
+                .sum::<f64>()
+                / runs as f64
+        }
+    }
+
+    /// Recall for one scenario across its variants (micro, pooled).
+    fn scenario_recall(&self, scenario: &str) -> Option<f64> {
+        let s = self.report.scenarios.iter().find(|s| s.name == scenario)?;
+        let (matched, total) = s
+            .variants
+            .iter()
+            .fold((0, 0), |(m, t), v| (m + v.truth_matched, t + v.truth_total));
+        if total == 0 {
+            None
+        } else {
+            Some(matched as f64 / total as f64)
+        }
+    }
+}
+
+impl MatrixReport {
+    /// Start a matrix report stamped with the current UTC time.
+    pub fn new(variant: Option<String>) -> Self {
+        MatrixReport {
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            variant,
+            ..Default::default()
+        }
+    }
+
+    /// Render the matrix as publishable Markdown: a summary table plus a
+    /// per-scenario recall table.
+    pub fn to_markdown(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "# Model matrix — {} ({} @ {})\n\n",
+            self.generated_at, self.branch, self.commit
+        ));
+        if let Some(variant) = &self.variant {
+            out.push_str(&format!("variant: `{variant}` · "));
+        }
+        out.push_str(
+            "recall = fraction of ground-truth rules reported (micro-averaged over runs); \
+             success = clean finish (gate exit codes are scenario properties).\n\n",
+        );
+
+        out.push_str(
+            "| model | recall | success | tokens/run | LLM calls/run | time/run (s) | total tokens |\n\
+             |-------|--------|---------|------------|---------------|--------------|--------------|\n",
+        );
+        for m in &self.models {
+            if let Some(error) = &m.error {
+                out.push_str(&format!(
+                    "| `{}` | eval failed: {} | | | | | |\n",
+                    m.model, error
+                ));
+                continue;
+            }
+            if m.total_runs() > 0 && m.total_tokens() == 0.0 {
+                out.push_str(&format!(
+                    "| `{}` | no tokens billed — provider/auth failure, not a recall result | | | | | |\n",
+                    m.model
+                ));
+                continue;
+            }
+            let (matched, total) = m.pooled_recall();
+            let recall = if total == 0 {
+                0.0
+            } else {
+                matched as f64 / total as f64
+            };
+            let runs = m.total_runs().max(1) as f64;
+            let llm_calls: f64 = m
+                .variants()
+                .map(|v| v.mean_llm_requests * v.runs as f64)
+                .sum();
+            let duration: f64 = m
+                .variants()
+                .map(|v| v.mean_duration_ms * v.runs as f64)
+                .sum();
+            out.push_str(&format!(
+                "| `{}` | {:.0}% ({}/{}) | {:.0}% | {:.0} | {:.1} | {:.1} | {:.0} |\n",
+                m.model,
+                recall * 100.0,
+                matched,
+                total,
+                m.mean_success() * 100.0,
+                m.total_tokens() / runs,
+                llm_calls / runs,
+                duration / runs / 1000.0,
+                m.total_tokens(),
+            ));
+        }
+
+        let scenario_names: Vec<String> = self
+            .models
+            .iter()
+            .flat_map(|m| m.report.scenarios.iter().map(|s| s.name.clone()))
+            .fold(Vec::new(), |mut acc, name| {
+                if !acc.contains(&name) {
+                    acc.push(name);
+                }
+                acc
+            });
+        if !scenario_names.is_empty() {
+            out.push_str("\n## Recall by scenario\n\n| model |");
+            for name in &scenario_names {
+                out.push_str(&format!(" {name} |"));
+            }
+            out.push_str("\n|-------|");
+            for _ in &scenario_names {
+                out.push_str("--------|");
+            }
+            out.push('\n');
+            for m in &self.models {
+                out.push_str(&format!("| `{}` |", m.model));
+                for name in &scenario_names {
+                    match m.scenario_recall(name) {
+                        Some(r) => out.push_str(&format!(" {:.0}% |", r * 100.0)),
+                        None => out.push_str(" — |"),
+                    }
+                }
+                out.push('\n');
+            }
+        }
+
+        out.push_str(
+            "\nLLM output is nondeterministic: treat small-run results as indicative, not as \
+             stable rankings. Reproduce with `clausura eval --models <matrix.yaml>`; per-model \
+             reports and event logs live alongside this file.\n",
+        );
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 
@@ -511,6 +770,10 @@ pub struct EvalOptions {
     pub runs: Option<u32>,
     /// Only run scenarios matching this name.
     pub scenario_filter: Option<String>,
+    /// Only run variants with this name; scenarios without it are skipped.
+    /// Useful for model matrices, where only the `default` variant of each
+    /// scenario is compared across models.
+    pub variant_filter: Option<String>,
     /// Directory for SARIF artifacts, per-run event logs, and the report.
     pub out_dir: PathBuf,
 }
@@ -669,7 +932,17 @@ pub async fn run_eval(eval_path: &Path, opts: &EvalOptions) -> Result<EvalReport
             )));
         }
 
-        let variants = scenario.effective_variants();
+        let mut variants = scenario.effective_variants();
+        if let Some(filter) = &opts.variant_filter {
+            variants.retain(|v| &v.name == filter);
+            if variants.is_empty() {
+                eprintln!(
+                    "  skipping scenario '{}': no variant named '{}'",
+                    scenario.name, filter
+                );
+                continue;
+            }
+        }
         let runs = opts.runs.unwrap_or(scenario.runs).max(1);
         let mut scenario_summary = ScenarioSummary {
             name: scenario.name.clone(),
@@ -1134,5 +1407,101 @@ scenarios:
             ..Default::default()
         };
         assert!(m3.success());
+    }
+
+    fn matrix_model(model: &str, scenario: &str, matched: u32, total: u32) -> MatrixModelReport {
+        MatrixModelReport {
+            model: model.into(),
+            vendor: "openrouter".into(),
+            error: None,
+            report: EvalReport {
+                generated_at: "x".into(),
+                commit: "c".into(),
+                branch: "main".into(),
+                model: model.into(),
+                scenarios: vec![ScenarioSummary {
+                    name: scenario.into(),
+                    variants: vec![VariantSummary {
+                        scenario: scenario.into(),
+                        variant: "default".into(),
+                        runs: 2,
+                        success_rate: 1.0,
+                        mean_total_tokens: 1000.0,
+                        mean_llm_requests: 4.0,
+                        mean_duration_ms: 5000.0,
+                        recall: if total == 0 {
+                            1.0
+                        } else {
+                            matched as f64 / total as f64
+                        },
+                        truth_matched: matched,
+                        truth_total: total,
+                        ..Default::default()
+                    }],
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn test_model_matrix_parse_and_slug() {
+        let yaml = r#"
+vendor: openrouter
+models:
+  - model: deepseek/deepseek-v4.1-flash
+  - model: anthropic/claude-haiku-5.5
+    api_key_env: ANTHROPIC_KEY
+"#;
+        let matrix: ModelMatrix = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(matrix.models.len(), 2);
+        assert_eq!(
+            matrix.models[0].effective_vendor(&matrix),
+            Some("openrouter")
+        );
+        assert_eq!(matrix.models[0].slug(), "deepseek-deepseek-v4-1-flash");
+        assert_eq!(
+            matrix.models[1].api_key_env.as_deref(),
+            Some("ANTHROPIC_KEY")
+        );
+    }
+
+    #[test]
+    fn test_load_model_matrix_rejects_empty() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "vendor: openrouter\nmodels: []\n").unwrap();
+        let err = load_model_matrix(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("at least one model"));
+    }
+
+    #[test]
+    fn test_matrix_report_markdown_pools_recall() {
+        let mut report = MatrixReport::new(Some("default".into()));
+        report
+            .models
+            .push(matrix_model("a/a", "security-basics", 6, 6));
+        report
+            .models
+            .push(matrix_model("b/b", "security-basics", 3, 6));
+        report.models.push(MatrixModelReport {
+            model: "c/c".into(),
+            vendor: "openrouter".into(),
+            error: Some("missing API key".into()),
+            ..Default::default()
+        });
+        let mut zero_tokens = matrix_model("d/d", "security-basics", 0, 6);
+        zero_tokens.report.scenarios[0].variants[0].mean_total_tokens = 0.0;
+        report.models.push(zero_tokens);
+
+        let md = report.to_markdown();
+        assert!(md.contains("| `a/a` | 100% (6/6) |"), "got:\n{md}");
+        assert!(md.contains("| `b/b` | 50% (3/6) |"), "got:\n{md}");
+        assert!(md.contains("eval failed: missing API key"));
+        assert!(md.contains("no tokens billed"), "got:\n{md}");
+        assert!(md.contains("## Recall by scenario"));
+        assert!(md.contains("security-basics"));
+        // JSON round-trip keeps the pooled counts for offline rendering.
+        let json = serde_json::to_string(&report).unwrap();
+        let back: MatrixReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.models[0].pooled_recall(), (6, 6));
     }
 }

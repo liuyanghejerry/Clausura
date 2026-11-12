@@ -90,6 +90,7 @@ Any LLM that exposes an OpenAI-compatible `/chat/completions` endpoint:
 | `openai` | `https://api.openai.com/v1` | `Authorization: Bearer` |
 | `deepseek` | `https://api.deepseek.com/v1` | `Authorization: Bearer` |
 | `groq` | `https://api.groq.com/openai/v1` | `Authorization: Bearer` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `Authorization: Bearer` |
 | `ollama` | `http://localhost:11434/v1` | `Authorization: Bearer` |
 | (custom) | User-defined | `Authorization: Bearer` |
 
@@ -112,7 +113,7 @@ Claude models via Anthropic's native Messages API:
 
 ```yaml
 vendor: anthropic
-model: claude-sonnet-4-20250514
+model: claude-sonnet-5-5
 ```
 
 Uses Anthropic's native Messages API (`/v1/messages`) with `x-api-key` auth and `anthropic-version: 2023-06-01`.
@@ -141,7 +142,7 @@ Create `.clausura.yaml` (or `.clausura.yml`) in your project root:
 version: "1"
 task:
   name: code-review
-  model: gpt-4o
+  model: gpt-5.4-mini
   vendor: openai
   prompt_template: "Review the git diff and return findings as JSON."
   token_budget: 16000
@@ -266,7 +267,7 @@ task:
   name: my-task                      # Required. Task name.
 
   # LLM provider
-  model: gpt-4o                      # Required (or set CLAUSURA_MODEL).
+  model: gpt-5.4-mini                      # Required (or set CLAUSURA_MODEL).
   vendor: openai                     # Shorthand (backward compatible).
   # Or with full config:
   vendor:
@@ -421,7 +422,13 @@ Effect-oriented evaluation:
 ```
 clausura eval --config eval.yaml                          Run all scenarios (needs CLAUSURA_API_KEY)
 clausura eval --baseline eval-results/eval-report.json    Diff against a previous run
+clausura eval --models eval/models.yaml --variant default Compare models; write eval-matrix.{json,md}
 ```
+
+Multi-model matrices run the same scenarios against every entry in
+[`eval/models.yaml`](eval/models.yaml) and publish a cross-model recall
+report. See [`eval/`](eval/) for the matrix format and published results.
+Latest published matrix: [2026-11-11, eight models via OpenRouter, three repeats](eval/results/2026-11-11-openrouter-runs3/eval-matrix.md).
 
 See [`eval/`](eval/) and [`docs/guide/eval.md`](docs/guide/eval.md).
 

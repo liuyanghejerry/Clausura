@@ -17,7 +17,7 @@
 version: "1"
 task:
   name: mcp-lsp-review
-  model: gpt-4o
+  model: gpt-5.4-mini
   vendor: openai
 
   # ── MCP 服务器 ─────────────────────────────────────────────

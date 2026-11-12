@@ -17,8 +17,19 @@ mechanism (compaction, spill, repeat-call reminders, findings recovery).
 
 ```bash
 export CLAUSURA_API_KEY=sk-...
-clausura eval --config eval.yaml --model gpt-4o
+clausura eval --config eval.yaml --model gpt-5.4-mini
 ```
+
+To compare several models on the same corpus, use a model matrix:
+
+```bash
+clausura eval --config eval/eval.yaml --models eval/models.yaml \
+  --variant default --runs 2 --out-dir eval-results/matrix
+```
+
+This writes `eval-matrix.{json,md}` (cross-model recall summary and
+per-scenario table) plus one full report per model. See `eval/README.md`
+for the matrix format and `eval/results/` for published data.
 
 See `eval/README.md` for the scenario format, metric definitions, and the
 before/after comparison workflow (`--baseline`).

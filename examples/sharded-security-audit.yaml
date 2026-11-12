@@ -22,7 +22,7 @@
 version: "1"
 task:
   name: security-audit
-  model: gpt-4o
+  model: gpt-5.4-mini
   vendor: openai
   skill_prompts:
     - security-review

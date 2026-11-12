@@ -37,7 +37,7 @@ Clausura 的核心价值是 "LLM 审查 + 确定性门禁"。引擎（agent loop
 version: "1"
 task:
   name: security-review
-  model: gpt-4o
+  model: gpt-5.4-mini
   vendor: openai
   skill_prompts:
     - community/security-review    # 复用社区的审查知识

@@ -203,7 +203,7 @@ Before running a full review pipeline, test with minimal settings:
 ```yaml
 task:
   name: test
-  model: gpt-4o-mini
+  model: gpt-5.4-mini
   vendor: openai
   prompt_template: "Look at the diff and tell me if you see any issues. Output {'findings': []}."
   token_budget: 4000

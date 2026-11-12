@@ -1,0 +1,33 @@
+# Model matrix for `clausura eval --models`.
+#
+# Every entry runs the same scenarios × variants × repeats; reports are
+# aggregated into eval-matrix.json / eval-matrix.md. Model ids below were
+# verified against the OpenRouter model list (https://openrouter.ai/models)
+# on 2026-11-10 — refresh them as providers deprecate versions.
+#
+# Usage (OpenRouter serves all entries with one key):
+#   export CLAUSURA_API_KEY="$OPENROUTER_API_KEY"
+#   clausura eval --config eval/eval.yaml --models eval/models.yaml \
+#     --variant default --runs 2 --out-dir eval-results/matrix
+#
+# Keys: by default every entry uses CLAUSURA_API_KEY (or --api-key). Set
+# api_key_env on an entry to read a different env var, e.g. when mixing
+# direct providers instead of going through one gateway.
+
+vendor: openrouter
+models:
+  # Budget / high-throughput tier
+  - model: qwen/qwen3.8-flash
+  - model: anthropic/claude-haiku-5.5
+  - model: deepseek/deepseek-v4.1-flash
+  - model: google/gemini-3.8-flash
+  # Mid tier
+  - model: openai/gpt-5.4-mini
+  - model: deepseek/deepseek-v4-pro
+  - model: moonshotai/kimi-k3
+  # Flagship reference point
+  - model: anthropic/claude-sonnet-5.5
+
+  # Other verified ids worth adding as budget allows:
+  # - model: openai/gpt-5.5
+  # - model: z-ai/glm-5.3
