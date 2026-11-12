@@ -1,7 +1,7 @@
 version: "1"
 task:
   name: sharded-security-audit
-  model: gpt-4o
+  model: gpt-5.4-mini
   vendor: openai
   skill_prompts:
     - security-review

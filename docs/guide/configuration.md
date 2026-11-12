@@ -24,7 +24,7 @@ task:
   name: my-task                      # Required. Task name, used in logs and SARIF.
 
   # ── LLM Provider ──────────────────────────────────
-  model: gpt-4o                      # Required (or set CLAUSURA_MODEL).
+  model: gpt-5.4-mini                      # Required (or set CLAUSURA_MODEL).
   vendor: openai                     # Shorthand: openai, anthropic, deepseek, groq, ollama.
   # Or full config:
   vendor:
@@ -130,7 +130,7 @@ task:
 
 ```yaml
 task:
-  model: gpt-4o
+  model: gpt-5.4-mini
 ```
 
 ### `task.vendor`
@@ -441,7 +441,7 @@ clausura snapshot delete --thread <ID>                   Delete all checkpoints 
 | Variable | Overrides | Example |
 |----------|-----------|---------|
 | `CLAUSURA_API_KEY` | API key (required) | `sk-...` |
-| `CLAUSURA_MODEL` | `task.model` | `gpt-4o` |
+| `CLAUSURA_MODEL` | `task.model` | `gpt-5.4-mini` |
 | `CLAUSURA_VENDOR` | `task.vendor` | `openai` |
 | `CLAUSURA_BASE_URL` | Provider base URL — points any OpenAI-compatible endpoint (e.g. `https://open.bigmodel.cn/api/paas/v4`) at any vendor shorthand | `https://api.deepseek.com/v1` |
 | `CLAUSURA_AMBIGUITY_POLICY` | `task.ambiguity_policy` | `fail_closed` |

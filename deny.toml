@@ -5,7 +5,11 @@
 [advisories]
 # Security advisories are also gated by `cargo audit` (see .cargo/audit.toml).
 # Keep both ignore lists in sync; leave empty by default.
-ignore = []
+#
+# RUSTSEC-2024-0449 is an unmaintained-crate notice for unsafe-libyaml,
+# reached through serde_yaml. It is not a vulnerability and has no fixed
+# upgrade; exempt it until the YAML dependency is replaced.
+ignore = ["RUSTSEC-2024-0449"]
 
 [bans]
 # The tree retains some intentional minor-version duplicates (mostly windows-*
@@ -25,6 +29,7 @@ allow = [
     "Unlicense",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    "Zlib",
     "Apache-2.0 WITH LLVM-exception",
 ]
 

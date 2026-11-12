@@ -30,7 +30,7 @@ The shorthand maps to built-in presets. The object form gives you full control.
 
 ```yaml
 task:
-  model: gpt-4o
+  model: gpt-5.5
   vendor: openai
 ```
 
@@ -38,9 +38,13 @@ Uses `https://api.openai.com/v1` with `Authorization: Bearer` header.
 
 | Model | Recommended for |
 |-------|-----------------|
-| `gpt-4o` | General-purpose code review |
-| `gpt-4o-mini` | Faster, cheaper, good for lint-like checks |
-| `o3-mini` | Reasoning-heavy analysis |
+| `gpt-5.5` | General-purpose code review |
+| `gpt-5.4-mini` | Faster, cheaper, good for lint-like checks |
+| `gpt-5.3-codex` | Reasoning-heavy, code-specialized analysis |
+
+Model ids below were refreshed for November 2026; confirm against your
+provider's model list, and prefix with `openai/` when routing through
+OpenRouter.
 
 Set the API key:
 
@@ -52,7 +56,7 @@ export CLAUSURA_API_KEY=sk-proj-...
 
 ```yaml
 task:
-  model: claude-sonnet-4-20250514
+  model: claude-sonnet-5-5
   vendor: anthropic
 ```
 
@@ -60,9 +64,12 @@ Uses Anthropic's native [Messages API](https://docs.anthropic.com/en/api/message
 
 | Model | Recommended for |
 |-------|-----------------|
-| `claude-sonnet-4-20250514` | Balanced speed and quality |
-| `claude-opus-4-20250514` | Complex analysis, large diffs |
-| `claude-haiku-3-5-20241022` | Fast, cheap, simple checks |
+| `claude-sonnet-5-5` | Balanced speed and quality |
+| `claude-opus-5-5` | Complex analysis, large diffs |
+| `claude-haiku-5-5` | Fast, cheap, simple checks |
+
+Native API ids use hyphens (`claude-sonnet-5-5`); the same models are
+routed through OpenRouter as `anthropic/claude-sonnet-5.5`.
 
 The shorthand `claude` is an alias for `anthropic`:
 
@@ -88,8 +95,11 @@ Uses DeepSeek's OpenAI-compatible endpoint at `https://api.deepseek.com/v1`.
 
 | Model | Notes |
 |-------|-------|
-| `deepseek-chat` | General purpose (V3) |
-| `deepseek-reasoner` | Reasoning model (R1) |
+| `deepseek-chat` | General purpose; alias tracks the current V-series release |
+| `deepseek-reasoner` | Reasoning model; alias tracks the current R-series release |
+
+For pinned versions (e.g. `deepseek/deepseek-v4-pro` or
+`deepseek/deepseek-v4.1-flash`), route through OpenRouter.
 
 Set the API key:
 
@@ -133,6 +143,33 @@ Ollama must be running locally:
 ollama serve
 ollama pull llama3.2
 ```
+
+### 6. OpenRouter (multi-model gateway)
+
+```yaml
+task:
+  model: deepseek/deepseek-v4.1-flash
+  vendor: openrouter
+```
+
+Uses `https://openrouter.ai/api/v1` with `Authorization: Bearer`. One API key
+reaches hundreds of models, addressed as `<provider>/<model>` — convenient
+for comparing models without provisioning each vendor separately. Verified
+ids (November 2026) include:
+
+| Model id | Tier |
+|----------|------|
+| `anthropic/claude-sonnet-5.5` | Flagship reference |
+| `openai/gpt-5.5` | Flagship |
+| `openai/gpt-5.4-mini` | Mid |
+| `deepseek/deepseek-v4-pro` | Mid |
+| `deepseek/deepseek-v4.1-flash` | Budget |
+| `anthropic/claude-haiku-5.5` | Budget |
+| `qwen/qwen3.8-flash` | Budget |
+
+To benchmark several of these on the same seeded scenarios, use the model
+matrix: `clausura eval --models eval/models.yaml --variant default` (see
+[`eval/`](../../eval/)).
 
 ## Custom Providers
 
@@ -193,13 +230,13 @@ Code review is the primary use case. Key considerations:
 
 | Priority | Concern | Recommendation |
 |----------|---------|----------------|
-| Quality | False negatives (missed issues) | Use a strong model: `gpt-4o`, `claude-sonnet-4` |
-| Speed | CI pipeline latency | `gpt-4o-mini` or `claude-haiku` for lint-like checks |
+| Quality | False negatives (missed issues) | Use a strong model: `gpt-5.5`, `claude-sonnet-5-5` |
+| Speed | CI pipeline latency | `gpt-5.4-mini` or `claude-haiku-5-5` for lint-like checks |
 | Cost | API spend per PR | Smaller models + low `token_budget`; skip large diffs |
 
 ### For Classification Tasks
 
-If your task is classification rather than reasoning (e.g., "does this file use Options API or Composition API?"), cheaper models like `gpt-4o-mini` or `claude-haiku-3-5` work well.
+If your task is classification rather than reasoning (e.g., "does this file use Options API or Composition API?"), cheaper models like `gpt-5.4-mini` or `claude-haiku-5-5` work well. To choose with data instead of defaults, run the [model matrix](../../eval/) and compare recall and tokens per scenario.
 
 ### Conditional Model Selection
 

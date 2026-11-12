@@ -1,0 +1,146 @@
+{
+  "generated_at": "2026-11-11T15:15:54.112946010+00:00",
+  "commit": "7653c87",
+  "branch": "main",
+  "model": "deepseek/deepseek-v4.1-flash",
+  "scenarios": [
+    {
+      "name": "security-basics",
+      "variants": [
+        {
+          "scenario": "security-basics",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 11096.333333333334,
+          "mean_llm_requests": 3.0,
+          "mean_duration_ms": 12235.0,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 1.0,
+          "truth_matched": 9,
+          "truth_total": 9,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "context-stress",
+      "variants": [
+        {
+          "scenario": "context-stress",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 0.0,
+          "mean_total_tokens": 22360.0,
+          "mean_llm_requests": 8.0,
+          "mean_duration_ms": 17646.666666666668,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 4.333333333333333,
+          "mean_repeat_reminders": 1.0,
+          "recovery_success_rate": 0.0,
+          "recall": 0.0,
+          "truth_matched": 0,
+          "truth_total": 3,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "rust-service",
+      "variants": [
+        {
+          "scenario": "rust-service",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 0.6666666666666666,
+          "mean_total_tokens": 84958.33333333333,
+          "mean_llm_requests": 9.0,
+          "mean_duration_ms": 78347.66666666667,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.6666666666666666,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.5,
+          "recall": 0.6666666666666666,
+          "truth_matched": 10,
+          "truth_total": 15,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "web-monorepo",
+      "variants": [
+        {
+          "scenario": "web-monorepo",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 38049.666666666664,
+          "mean_llm_requests": 4.666666666666667,
+          "mean_duration_ms": 52229.333333333336,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 1.0,
+          "recall": 1.0,
+          "truth_matched": 15,
+          "truth_total": 15,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "legacy-refactor",
+      "variants": [
+        {
+          "scenario": "legacy-refactor",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 1.0,
+          "mean_total_tokens": 41832.666666666664,
+          "mean_llm_requests": 5.666666666666667,
+          "mean_duration_ms": 42636.0,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 1.0,
+          "recall": 0.9333333333333333,
+          "truth_matched": 14,
+          "truth_total": 15,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "secret-sweep",
+      "variants": [
+        {
+          "scenario": "secret-sweep",
+          "variant": "default",
+          "runs": 3,
+          "success_rate": 0.6666666666666666,
+          "mean_total_tokens": 68094.66666666667,
+          "mean_llm_requests": 8.0,
+          "mean_duration_ms": 45681.333333333336,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 2.3333333333333335,
+          "mean_repeat_reminders": 0.6666666666666666,
+          "recovery_success_rate": 0.3333333333333333,
+          "recall": 0.6666666666666666,
+          "truth_matched": 2,
+          "truth_total": 3,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    }
+  ]
+}

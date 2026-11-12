@@ -15,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 // ---------------------------------------------------------------------------
 
 /// A tool that the agent can invoke.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Tool name (used by LLM to invoke)

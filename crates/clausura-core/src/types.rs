@@ -314,6 +314,11 @@ impl VendorConfig {
                 base_url: Some("https://api.groq.com/openai/v1".into()),
                 ..Default::default()
             },
+            "openrouter" => VendorConfig {
+                vendor_type: VendorType::OpenAiCompatible,
+                base_url: Some("https://openrouter.ai/api/v1".into()),
+                ..Default::default()
+            },
             other => VendorConfig {
                 vendor_type: VendorType::OpenAiCompatible,
                 base_url: Some(format!("https://api.{}.com/v1", other)),
@@ -1143,6 +1148,14 @@ mod tests {
         let cfg = VendorConfig::ollama();
         assert_eq!(cfg.vendor_type, VendorType::OpenAiCompatible);
         assert_eq!(cfg.effective_base_url(), "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn test_vendor_config_openrouter() {
+        let cfg = VendorConfig::from_name("openrouter");
+        assert_eq!(cfg.vendor_type, VendorType::OpenAiCompatible);
+        assert_eq!(cfg.effective_base_url(), "https://openrouter.ai/api/v1");
+        assert_eq!(cfg.auth_header_name(), "Authorization");
     }
 
     #[test]

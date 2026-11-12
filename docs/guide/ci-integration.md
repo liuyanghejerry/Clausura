@@ -158,7 +158,7 @@ clausura-review:
   variables:
     CLAUSURA_API_KEY: $LLM_API_KEY
     GIT_DEPTH: "0"
-    CLAUSURA_MODEL: "gpt-4o"
+    CLAUSURA_MODEL: "gpt-5.4-mini"
   artifacts:
     when: always
     paths:
@@ -201,7 +201,7 @@ pipeline {
             steps {
                 sh '''
                     curl -fsSL https://raw.githubusercontent.com/liuyanghejerry/Clausura/main/install.sh | bash
-                    clausura run --model gpt-4o --base "origin/$CHANGE_TARGET" --summary clausura-summary.json
+                    clausura run --model gpt-5.4-mini --base "origin/$CHANGE_TARGET" --summary clausura-summary.json
                 '''
             }
         }

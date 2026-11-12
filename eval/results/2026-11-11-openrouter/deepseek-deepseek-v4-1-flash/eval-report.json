@@ -1,0 +1,146 @@
+{
+  "generated_at": "2026-11-11T06:11:29.536669614+00:00",
+  "commit": "7653c87",
+  "branch": "main",
+  "model": "deepseek/deepseek-v4.1-flash",
+  "scenarios": [
+    {
+      "name": "security-basics",
+      "variants": [
+        {
+          "scenario": "security-basics",
+          "variant": "default",
+          "runs": 2,
+          "success_rate": 1.0,
+          "mean_total_tokens": 15975.0,
+          "mean_llm_requests": 4.5,
+          "mean_duration_ms": 10321.0,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 1.0,
+          "truth_matched": 6,
+          "truth_total": 6,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "context-stress",
+      "variants": [
+        {
+          "scenario": "context-stress",
+          "variant": "default",
+          "runs": 2,
+          "success_rate": 0.0,
+          "mean_total_tokens": 25977.5,
+          "mean_llm_requests": 8.5,
+          "mean_duration_ms": 17143.5,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 4.0,
+          "mean_repeat_reminders": 1.5,
+          "recovery_success_rate": 0.0,
+          "recall": 0.0,
+          "truth_matched": 0,
+          "truth_total": 2,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "rust-service",
+      "variants": [
+        {
+          "scenario": "rust-service",
+          "variant": "default",
+          "runs": 2,
+          "success_rate": 0.5,
+          "mean_total_tokens": 62321.0,
+          "mean_llm_requests": 8.0,
+          "mean_duration_ms": 50966.5,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 1.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 0.5,
+          "truth_matched": 5,
+          "truth_total": 10,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "web-monorepo",
+      "variants": [
+        {
+          "scenario": "web-monorepo",
+          "variant": "default",
+          "runs": 2,
+          "success_rate": 1.0,
+          "mean_total_tokens": 38069.5,
+          "mean_llm_requests": 5.0,
+          "mean_duration_ms": 44929.5,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 1.0,
+          "recall": 1.0,
+          "truth_matched": 10,
+          "truth_total": 10,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "legacy-refactor",
+      "variants": [
+        {
+          "scenario": "legacy-refactor",
+          "variant": "default",
+          "runs": 2,
+          "success_rate": 1.0,
+          "mean_total_tokens": 49418.0,
+          "mean_llm_requests": 6.5,
+          "mean_duration_ms": 33206.5,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 0.0,
+          "mean_repeat_reminders": 0.0,
+          "recovery_success_rate": 0.0,
+          "recall": 1.0,
+          "truth_matched": 10,
+          "truth_total": 10,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    },
+    {
+      "name": "secret-sweep",
+      "variants": [
+        {
+          "scenario": "secret-sweep",
+          "variant": "default",
+          "runs": 2,
+          "success_rate": 1.0,
+          "mean_total_tokens": 96220.0,
+          "mean_llm_requests": 10.5,
+          "mean_duration_ms": 39815.0,
+          "mean_compactions": 0.0,
+          "mean_tool_spills": 2.0,
+          "mean_repeat_reminders": 0.5,
+          "recovery_success_rate": 1.0,
+          "recall": 1.0,
+          "truth_matched": 2,
+          "truth_total": 2,
+          "truth_overreported": 0,
+          "unexpected_rule_ids": []
+        }
+      ]
+    }
+  ]
+}

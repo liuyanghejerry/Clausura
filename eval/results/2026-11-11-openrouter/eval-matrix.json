@@ -1,0 +1,758 @@
+{
+  "generated_at": "2026-11-11T05:43:04.937374897+00:00",
+  "commit": "7653c87",
+  "branch": "main",
+  "variant": "default",
+  "models": [
+    {
+      "model": "qwen/qwen3.8-flash",
+      "vendor": "openrouter",
+      "report": {
+        "generated_at": "2026-11-11T05:43:04.940223513+00:00",
+        "commit": "7653c87",
+        "branch": "main",
+        "model": "qwen/qwen3.8-flash",
+        "scenarios": [
+          {
+            "name": "security-basics",
+            "variants": [
+              {
+                "scenario": "security-basics",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 21158.0,
+                "mean_llm_requests": 5.0,
+                "mean_duration_ms": 35921.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 1.0,
+                "truth_matched": 6,
+                "truth_total": 6,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "context-stress",
+            "variants": [
+              {
+                "scenario": "context-stress",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 0.0,
+                "mean_total_tokens": 28026.0,
+                "mean_llm_requests": 8.5,
+                "mean_duration_ms": 56105.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 4.5,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 0.0,
+                "truth_matched": 0,
+                "truth_total": 2,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "rust-service",
+            "variants": [
+              {
+                "scenario": "rust-service",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 110675.5,
+                "mean_llm_requests": 9.5,
+                "mean_duration_ms": 259429.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 1.0,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "web-monorepo",
+            "variants": [
+              {
+                "scenario": "web-monorepo",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 82707.5,
+                "mean_llm_requests": 8.0,
+                "mean_duration_ms": 153667.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.6666666666666666,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "legacy-refactor",
+            "variants": [
+              {
+                "scenario": "legacy-refactor",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 42523.5,
+                "mean_llm_requests": 6.0,
+                "mean_duration_ms": 99246.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "secret-sweep",
+            "variants": [
+              {
+                "scenario": "secret-sweep",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 0.5,
+                "mean_total_tokens": 64699.0,
+                "mean_llm_requests": 9.0,
+                "mean_duration_ms": 92282.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 2.0,
+                "mean_repeat_reminders": 1.0,
+                "recovery_success_rate": 0.5,
+                "recall": 0.5,
+                "truth_matched": 1,
+                "truth_total": 2,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "model": "anthropic/claude-haiku-5.5",
+      "vendor": "openrouter",
+      "report": {
+        "generated_at": "2026-11-11T06:06:18.762937143+00:00",
+        "commit": "7653c87",
+        "branch": "main",
+        "model": "anthropic/claude-haiku-5.5",
+        "scenarios": [
+          {
+            "name": "security-basics",
+            "variants": [
+              {
+                "scenario": "security-basics",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 13032.5,
+                "mean_llm_requests": 3.0,
+                "mean_duration_ms": 9317.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 1.0,
+                "truth_matched": 6,
+                "truth_total": 6,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "context-stress",
+            "variants": [
+              {
+                "scenario": "context-stress",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 0.0,
+                "mean_total_tokens": 29715.5,
+                "mean_llm_requests": 7.5,
+                "mean_duration_ms": 16740.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 5.5,
+                "mean_repeat_reminders": 1.5,
+                "recovery_success_rate": 0.0,
+                "recall": 0.0,
+                "truth_matched": 0,
+                "truth_total": 2,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "rust-service",
+            "variants": [
+              {
+                "scenario": "rust-service",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 22986.0,
+                "mean_llm_requests": 3.0,
+                "mean_duration_ms": 25995.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "web-monorepo",
+            "variants": [
+              {
+                "scenario": "web-monorepo",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 39195.0,
+                "mean_llm_requests": 4.0,
+                "mean_duration_ms": 32388.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.5,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "legacy-refactor",
+            "variants": [
+              {
+                "scenario": "legacy-refactor",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 52993.0,
+                "mean_llm_requests": 5.0,
+                "mean_duration_ms": 49605.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.5,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "secret-sweep",
+            "variants": [
+              {
+                "scenario": "secret-sweep",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 64552.0,
+                "mean_llm_requests": 5.0,
+                "mean_duration_ms": 21146.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 1.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 0.0,
+                "truth_matched": 0,
+                "truth_total": 2,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "vendor": "openrouter",
+      "report": {
+        "generated_at": "2026-11-11T06:11:29.536669614+00:00",
+        "commit": "7653c87",
+        "branch": "main",
+        "model": "deepseek/deepseek-v4.1-flash",
+        "scenarios": [
+          {
+            "name": "security-basics",
+            "variants": [
+              {
+                "scenario": "security-basics",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 15975.0,
+                "mean_llm_requests": 4.5,
+                "mean_duration_ms": 10321.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 1.0,
+                "truth_matched": 6,
+                "truth_total": 6,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "context-stress",
+            "variants": [
+              {
+                "scenario": "context-stress",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 0.0,
+                "mean_total_tokens": 25977.5,
+                "mean_llm_requests": 8.5,
+                "mean_duration_ms": 17143.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 4.0,
+                "mean_repeat_reminders": 1.5,
+                "recovery_success_rate": 0.0,
+                "recall": 0.0,
+                "truth_matched": 0,
+                "truth_total": 2,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "rust-service",
+            "variants": [
+              {
+                "scenario": "rust-service",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 0.5,
+                "mean_total_tokens": 62321.0,
+                "mean_llm_requests": 8.0,
+                "mean_duration_ms": 50966.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 1.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 0.5,
+                "truth_matched": 5,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "web-monorepo",
+            "variants": [
+              {
+                "scenario": "web-monorepo",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 38069.5,
+                "mean_llm_requests": 5.0,
+                "mean_duration_ms": 44929.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 1.0,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "legacy-refactor",
+            "variants": [
+              {
+                "scenario": "legacy-refactor",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 49418.0,
+                "mean_llm_requests": 6.5,
+                "mean_duration_ms": 33206.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "secret-sweep",
+            "variants": [
+              {
+                "scenario": "secret-sweep",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 96220.0,
+                "mean_llm_requests": 10.5,
+                "mean_duration_ms": 39815.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 2.0,
+                "mean_repeat_reminders": 0.5,
+                "recovery_success_rate": 1.0,
+                "recall": 1.0,
+                "truth_matched": 2,
+                "truth_total": 2,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "model": "openai/gpt-5.4-mini",
+      "vendor": "openrouter",
+      "report": {
+        "generated_at": "2026-11-11T06:18:02.717491259+00:00",
+        "commit": "7653c87",
+        "branch": "main",
+        "model": "openai/gpt-5.4-mini",
+        "scenarios": [
+          {
+            "name": "security-basics",
+            "variants": [
+              {
+                "scenario": "security-basics",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 7026.0,
+                "mean_llm_requests": 3.0,
+                "mean_duration_ms": 7260.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 1.0,
+                "truth_matched": 6,
+                "truth_total": 6,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "context-stress",
+            "variants": [
+              {
+                "scenario": "context-stress",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 0.0,
+                "mean_total_tokens": 16536.0,
+                "mean_llm_requests": 8.0,
+                "mean_duration_ms": 13260.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 3.0,
+                "mean_repeat_reminders": 2.0,
+                "recovery_success_rate": 0.0,
+                "recall": 0.0,
+                "truth_matched": 0,
+                "truth_total": 2,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "rust-service",
+            "variants": [
+              {
+                "scenario": "rust-service",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 0.5,
+                "mean_total_tokens": 44734.0,
+                "mean_llm_requests": 7.5,
+                "mean_duration_ms": 21417.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.5,
+                "recall": 0.5,
+                "truth_matched": 5,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "web-monorepo",
+            "variants": [
+              {
+                "scenario": "web-monorepo",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 0.5,
+                "mean_total_tokens": 37879.5,
+                "mean_llm_requests": 6.5,
+                "mean_duration_ms": 16243.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.5,
+                "recall": 0.5,
+                "truth_matched": 5,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "legacy-refactor",
+            "variants": [
+              {
+                "scenario": "legacy-refactor",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 16836.5,
+                "mean_llm_requests": 4.0,
+                "mean_duration_ms": 15141.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 1.0,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "secret-sweep",
+            "variants": [
+              {
+                "scenario": "secret-sweep",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 59418.0,
+                "mean_llm_requests": 7.0,
+                "mean_duration_ms": 17180.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 1.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 1.0,
+                "recall": 1.0,
+                "truth_matched": 2,
+                "truth_total": 2,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "model": "anthropic/claude-sonnet-5.5",
+      "vendor": "openrouter",
+      "report": {
+        "generated_at": "2026-11-11T06:21:04.108481675+00:00",
+        "commit": "7653c87",
+        "branch": "main",
+        "model": "anthropic/claude-sonnet-5.5",
+        "scenarios": [
+          {
+            "name": "security-basics",
+            "variants": [
+              {
+                "scenario": "security-basics",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 15425.5,
+                "mean_llm_requests": 3.5,
+                "mean_duration_ms": 11282.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 1.0,
+                "truth_matched": 6,
+                "truth_total": 6,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "context-stress",
+            "variants": [
+              {
+                "scenario": "context-stress",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 0.5,
+                "mean_total_tokens": 37821.5,
+                "mean_llm_requests": 8.5,
+                "mean_duration_ms": 20533.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 5.5,
+                "mean_repeat_reminders": 1.0,
+                "recovery_success_rate": 0.3333333333333333,
+                "recall": 0.5,
+                "truth_matched": 1,
+                "truth_total": 2,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "rust-service",
+            "variants": [
+              {
+                "scenario": "rust-service",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 20967.0,
+                "mean_llm_requests": 3.0,
+                "mean_duration_ms": 25874.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "web-monorepo",
+            "variants": [
+              {
+                "scenario": "web-monorepo",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 20138.5,
+                "mean_llm_requests": 3.0,
+                "mean_duration_ms": 23066.0,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "legacy-refactor",
+            "variants": [
+              {
+                "scenario": "legacy-refactor",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 23000.0,
+                "mean_llm_requests": 3.0,
+                "mean_duration_ms": 24315.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 0.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 0.0,
+                "recall": 1.0,
+                "truth_matched": 10,
+                "truth_total": 10,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          },
+          {
+            "name": "secret-sweep",
+            "variants": [
+              {
+                "scenario": "secret-sweep",
+                "variant": "default",
+                "runs": 2,
+                "success_rate": 1.0,
+                "mean_total_tokens": 86558.0,
+                "mean_llm_requests": 7.0,
+                "mean_duration_ms": 34293.5,
+                "mean_compactions": 0.0,
+                "mean_tool_spills": 1.0,
+                "mean_repeat_reminders": 0.0,
+                "recovery_success_rate": 1.0,
+                "recall": 1.0,
+                "truth_matched": 2,
+                "truth_total": 2,
+                "truth_overreported": 0,
+                "unexpected_rule_ids": []
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

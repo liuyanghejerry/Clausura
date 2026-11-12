@@ -12,7 +12,7 @@
 version: "1"
 task:
   name: full-review
-  model: gpt-4o
+  model: gpt-5.4-mini
   vendor: openai
 
   # 引用 Skill：可以是本地路径、命名引用或混合

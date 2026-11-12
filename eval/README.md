@@ -9,7 +9,7 @@ append-only event log into comparable metrics.
 
 ```bash
 export CLAUSURA_API_KEY=sk-...
-clausura eval --config eval.yaml --model gpt-4o --runs 3
+clausura eval --config eval.yaml --model gpt-5.4-mini --runs 3
 ```
 
 Outputs (under `eval-results/` by default):
@@ -86,3 +86,43 @@ clausura eval --config eval.yaml --model <model> \
 
 Commit a new baseline when the corpus or the implementation changes
 materially, so comparisons stay anchored.
+
+## Model matrices (multi-model recall)
+
+`eval/models.yaml` lists the models to compare — one gateway (`openrouter`)
+or mixed vendors. Each entry may set `vendor` and `api_key_env`; without
+`api_key_env`, entries share `CLAUSURA_API_KEY` / `--api-key`.
+
+```bash
+export CLAUSURA_API_KEY="$OPENROUTER_API_KEY"
+clausura eval --config eval/eval.yaml --models eval/models.yaml \
+  --variant default --runs 2 --out-dir eval-results/matrix
+```
+
+Outputs under `eval-results/matrix/`:
+
+- `eval-matrix.json` / `eval-matrix.md` — cross-model summary (pooled
+  recall, success, tokens/run) plus a per-scenario recall table.
+- `<model-slug>/eval-report.{json,md}` — the full per-model report, usable
+  as a `--baseline` for later diffs.
+- `<model-slug>/<scenario>/<variant>/run-*/` — SARIF + event logs (audit).
+
+`--variant default` compares the baseline variant of each scenario;
+scenarios without that variant (e.g. `sharded-security-audit`, whose
+variants are `sharded`/`monolithic`) are skipped with a note. Run those
+separately with `--scenario <name> --variant <name>`.
+
+A model whose runs bill zero tokens is rendered as a provider/auth failure
+in the matrix, not as 0% recall — do not publish such a report as a model
+result. A model that errors out entirely is recorded in the matrix and does
+not abort the others.
+
+## Published results
+
+`eval/results/` holds committed, publicly comparable matrix reports
+(<date>-<provider>/eval-matrix.{json,md} plus per-model reports). See
+[`results/`](results/) for the reproduction recipe and publication rules.
+Only real, unedited harness output belongs there — never hand-written
+numbers.
+
+Latest published matrix: [2026-11-11, eight models via OpenRouter, three repeats](results/2026-11-11-openrouter-runs3/eval-matrix.md).

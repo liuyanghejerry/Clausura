@@ -10,7 +10,7 @@ The most common use case — catch SQL injection, XSS, hardcoded secrets, and in
 version: "1"
 task:
   name: security-review
-  model: gpt-4o
+  model: gpt-5.5
   vendor: openai
   prompt_template: |
     Review the git diff for security issues. For each finding use the specified rule_id.
@@ -81,7 +81,7 @@ Ensure translation coverage stays consistent across locales.
 version: "1"
 task:
   name: i18n-check
-  model: gpt-4o-mini
+  model: gpt-5.4-mini
   vendor: openai
   prompt_template: |
     Review the git diff for internationalization issues. Locale files are in locales/ or i18n/ directories.
@@ -113,7 +113,7 @@ task:
       action: warn
 ```
 
-Note the use of `gpt-4o-mini` — classification tasks like "is this string hardcoded?" don't need a frontier model.
+Note the use of `gpt-5.4-mini` — classification tasks like "is this string hardcoded?" don't need a frontier model.
 
 ## Scenario 3: Architecture Compliance
 
@@ -123,7 +123,7 @@ Enforce layer boundaries and import rules in a layered architecture.
 version: "1"
 task:
   name: architecture-check
-  model: gpt-4o
+  model: gpt-5.5
   vendor: openai
   prompt_template: |
     Review the git diff for architecture violations in our layered architecture:
@@ -174,7 +174,7 @@ Enforce Vue-specific conventions in a frontend project.
 version: "1"
 task:
   name: vue-review
-  model: gpt-4o-mini
+  model: gpt-5.4-mini
   vendor: openai
   skill_prompts:
     - vue-best-practices
@@ -263,7 +263,7 @@ For reviews that need to run project-specific tools (linters, test suites) befor
 version: "1"
 task:
   name: smart-gate
-  model: gpt-4o
+  model: gpt-5.5
   vendor: openai
   prompt_template: |
     Run `cargo clippy --message-format=json` first using shell_exec to gather lint results.
@@ -299,10 +299,10 @@ This lets the agent gather data from project tooling before making its analysis,
 
 | Task Type | Recommended Model | Why |
 |-----------|------------------|-----|
-| Security review | `gpt-4o` / `claude-sonnet-4` | Needs deep reasoning to spot subtle vulnerabilities |
-| Style/lint checks | `gpt-4o-mini` / `claude-haiku` | Pattern matching, not reasoning |
-| Architecture analysis | `gpt-4o` / `claude-sonnet-4` | Requires understanding project structure |
-| i18n coverage | `gpt-4o-mini` / `claude-haiku` | Classification task, fast and cheap |
+| Security review | `gpt-5.5` / `claude-sonnet-5-5` | Needs deep reasoning to spot subtle vulnerabilities |
+| Style/lint checks | `gpt-5.4-mini` / `claude-haiku-5-5` | Pattern matching, not reasoning |
+| Architecture analysis | `gpt-5.5` / `claude-sonnet-5-5` | Requires understanding project structure |
+| i18n coverage | `gpt-5.4-mini` / `claude-haiku-5-5` | Classification task, fast and cheap |
 | Local dev / offline | Ollama + `llama3.2` or `qwen2.5-coder` | No API cost, suitable for pre-commit hooks |
 
 → [LLM provider setup](llm-providers.md)
