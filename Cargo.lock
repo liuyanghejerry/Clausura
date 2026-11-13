@@ -275,7 +275,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "clausura-cli"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "clausura-core"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "async-trait",
  "chrono",
