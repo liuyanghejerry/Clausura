@@ -472,13 +472,11 @@ impl AnthropicProvider {
 
     fn convert_messages_to_anthropic(messages: &[Message]) -> Vec<serde_json::Value> {
         let mut result = Vec::new();
-        for msg in messages {
+        let mut index = 0;
+        while index < messages.len() {
+            let msg = &messages[index];
             match msg.role {
-                Role::System => {
-                    // Anthropic handles system as top-level field, not in messages
-                    // We'll handle this in send_chat_request
-                    continue;
-                }
+                Role::System => {}
                 Role::User => {
                     result.push(serde_json::json!({
                         "role": "user",
@@ -486,43 +484,47 @@ impl AnthropicProvider {
                     }));
                 }
                 Role::Assistant => {
-                    // Check if content looks like a tool call JSON
-                    if let Ok(tool_calls) = serde_json::from_str::<Vec<ToolCall>>(&msg.content) {
-                        let content_blocks: Vec<serde_json::Value> = tool_calls
-                            .iter()
-                            .map(|tc| {
-                                serde_json::json!({
-                                    "type": "tool_use",
-                                    "id": tc.id,
-                                    "name": tc.name,
-                                    "input": tc.arguments,
-                                })
-                            })
-                            .collect();
-                        result.push(serde_json::json!({
-                            "role": "assistant",
-                            "content": content_blocks,
-                        }));
-                    } else {
-                        result.push(serde_json::json!({
-                            "role": "assistant",
-                            "content": msg.content,
+                    let mut content_blocks = Vec::new();
+                    if !msg.content.is_empty() {
+                        content_blocks.push(serde_json::json!({
+                            "type": "text",
+                            "text": msg.content,
                         }));
                     }
-                }
-                Role::Tool => {
-                    // Tool results: need to pair with the tool_use id
-                    // Parse the tool result content to get the tool_use_id if present
+                    if let Some(tool_calls) = &msg.tool_calls {
+                        content_blocks.extend(tool_calls.iter().map(|tc| {
+                            serde_json::json!({
+                                "type": "tool_use",
+                                "id": tc.id,
+                                "name": tc.name,
+                                "input": tc.arguments,
+                            })
+                        }));
+                    }
                     result.push(serde_json::json!({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": "unknown",
-                            "content": msg.content,
-                        }],
+                        "role": "assistant",
+                        "content": content_blocks,
                     }));
                 }
+                Role::Tool => {
+                    let mut content_blocks = Vec::new();
+                    while index < messages.len() && messages[index].role == Role::Tool {
+                        let tool_msg = &messages[index];
+                        content_blocks.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_msg.tool_call_id,
+                            "content": tool_msg.content,
+                        }));
+                        index += 1;
+                    }
+                    result.push(serde_json::json!({
+                        "role": "user",
+                        "content": content_blocks,
+                    }));
+                    continue;
+                }
             }
+            index += 1;
         }
         result
     }
@@ -1465,6 +1467,106 @@ pub mod tests {
         let calls = response.tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
+    }
+
+    #[test]
+    fn test_anthropic_tool_round_trip_uses_structured_calls_and_result_ids() {
+        let messages = vec![
+            Message::new(Role::System, "Review the code"),
+            Message::new(Role::User, "Inspect two files"),
+            Message {
+                role: Role::Assistant,
+                content: "Checking both files".into(),
+                tool_call_id: None,
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "toolu_a".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "a.rs"}),
+                    },
+                    ToolCall {
+                        id: "toolu_b".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "b.rs"}),
+                    },
+                ]),
+            },
+            Message::with_tool_call(Role::Tool, "contents of a", "toolu_a".into()),
+            Message::with_tool_call(Role::Tool, "contents of b", "toolu_b".into()),
+        ];
+
+        let converted = AnthropicProvider::convert_messages_to_anthropic(&messages);
+        assert_eq!(converted.len(), 3);
+        assert_eq!(converted[1]["content"][0]["text"], "Checking both files");
+        assert_eq!(converted[1]["content"][1]["id"], "toolu_a");
+        assert_eq!(converted[1]["content"][1]["type"], "tool_use");
+        assert_eq!(converted[1]["content"][2]["id"], "toolu_b");
+
+        let results = converted[2]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["tool_use_id"], "toolu_a");
+        assert_eq!(results[1]["tool_use_id"], "toolu_b");
+        assert_eq!(results[0]["content"], "contents of a");
+        assert_eq!(results[1]["content"], "contents of b");
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_tool_follow_up_request_matches_api_contract() {
+        let mock_server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/v1/messages"))
+            .and(matchers::body_json(serde_json::json!({
+                "model": "claude-sonnet-5-5",
+                "max_tokens": 4096,
+                "system": "Review the code",
+                "messages": [
+                    {"role": "user", "content": "Inspect a.rs"},
+                    {"role": "assistant", "content": [
+                        {"type": "text", "text": "Checking the file"},
+                        {"type": "tool_use", "id": "toolu_a", "name": "read_file",
+                         "input": {"path": "a.rs"}}
+                    ]},
+                    {"role": "user", "content": [{
+                        "type": "tool_result", "tool_use_id": "toolu_a",
+                        "content": "contents of a"
+                    }]}
+                ],
+                "tools": []
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "{\"findings\":[]}"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 20, "output_tokens": 4}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: mock_server.uri(),
+            api_key: "sk-ant-test".into(),
+            model: "claude-sonnet-5-5".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let messages = vec![
+            Message::new(Role::System, "Review the code"),
+            Message::new(Role::User, "Inspect a.rs"),
+            Message {
+                role: Role::Assistant,
+                content: "Checking the file".into(),
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "toolu_a".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "a.rs"}),
+                }]),
+            },
+            Message::with_tool_call(Role::Tool, "contents of a", "toolu_a".into()),
+        ];
+
+        let response = provider.chat_with_tools(&messages, &[]).await.unwrap();
+        assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert_eq!(response.message.content, "{\"findings\":[]}");
     }
 
     #[test]

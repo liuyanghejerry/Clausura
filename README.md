@@ -428,7 +428,7 @@ clausura eval --models eval/models.yaml --variant default Compare models; write 
 Multi-model matrices run the same scenarios against every entry in
 [`eval/models.yaml`](eval/models.yaml) and publish a cross-model recall
 report. See [`eval/`](eval/) for the matrix format and published results.
-Latest published matrix: [2026-11-11, eight models via OpenRouter, three repeats](eval/results/2026-11-11-openrouter-runs3/eval-matrix.md).
+Most recent historical matrix (pre-hardening; see its errata): [2026-11-11, eight models via OpenRouter, three repeats](eval/results/2026-11-11-openrouter-runs3/eval-matrix.md).
 
 See [`eval/`](eval/) and [`docs/guide/eval.md`](docs/guide/eval.md).
 
@@ -661,13 +661,13 @@ On successful completion (exit code 0), archive files are automatically cleaned 
 
 If the agent loop ends without a clean stop — the context could not be truncated further, the model hit a length limit, the `max_total_tokens` cap was reached, `max_iterations` was exhausted, or the final answer never parsed as findings JSON — the extracted findings may be partial. By default (`on_incomplete: fail`) Clausura fails closed: the run exits with code 2 and a clear error message, so an incomplete review can never silently pass a `max_findings: 0` gate. With `on_incomplete: pass`, the previous behavior is kept (gating rules evaluate the partial findings), but a warning is logged and the SARIF output is annotated with `"properties": {"incomplete": true}` on the run.
 
-Every incomplete run carries a **reason code** (`context_limit`, `iteration_limit`, `token_cap`, `length`, `timeout`, `malformed_json`) in the error message, the SARIF `invocations[0].properties.incompleteReason`, and — with `--summary <path>` — a standalone machine-readable summary JSON. A final answer that stays unparseable after the schema-retry budget no longer discards the run: findings persisted to the ledger mid-run are merged back and the run is reported `incomplete_reason=malformed_json`; the raw answer is preserved in the run event log as `findings_parse_failed` events (error class + 2 KB preview).
+Every incomplete run carries a **reason code** (`context_limit`, `iteration_limit`, `token_cap`, `length`, `timeout`, `malformed_json`) in the error message, the SARIF `invocations[0].properties.incompleteReason`, and — with `--summary <path>` — a standalone machine-readable summary JSON. A final answer that stays unparseable after the schema-retry budget no longer discards the run: findings persisted to the ledger mid-run are merged back and the run is reported `incomplete_reason=malformed_json`; the raw answer is preserved in the run event log as `findings_parse_failed` events (error class + 2 KB preview). Recovery can also extract findings after an iteration, context or length limit, but it never clears that original incomplete reason or proves that the requested sweep finished.
 
 ### Sharded audits for large PRs
 
 A PR with a multi-thousand-line diff cannot be reviewed by one agent run — the model spends its budget reading and produces no findings. Adding a `sharding:` section switches `clausura run` to the sharded path: per-file diffs (with context) are grouped into bounded shards, a deterministic pre-scan flags candidate hotspots (routes, SQL, string-built SQL, request bodies, `fs.*`, auth, logging, exec) in each shard's manifest, and each shard runs in its own small budget (e.g. 300k tokens / 12 iterations). A shard that still ends incomplete is bisected — by files, or by hunks for a single oversized file — and retried. Findings are deduplicated across shards and evaluated against the normal gating rules.
 
-Exit semantics keep security findings and audit infrastructure failures separate: gate violations exit 1; a shard that never completes exits 2 with `status: incomplete` / `reason: shard_incomplete` in the always-written summary JSON (`<output>.summary.json`, per-shard status table included). See [`docs/guide/sharding.md`](docs/guide/sharding.md) and [`examples/sharded-security-audit.yaml`](examples/sharded-security-audit.yaml).
+Exit semantics keep security findings and audit infrastructure failures separate: gate violations exit 1; a shard that never completes exits 2 with `status: incomplete` / `reason: shard_incomplete` in the always-written summary JSON (`<output>.summary.json`, per-shard status table included). A gate violation never hides incomplete status, and strict `on_shard_incomplete: fail` returns exit 2 even when partial findings also violate a gate. See [`docs/guide/sharding.md`](docs/guide/sharding.md) and [`examples/sharded-security-audit.yaml`](examples/sharded-security-audit.yaml).
 
 ### Findings schema retries
 
@@ -713,19 +713,19 @@ The `shell_exec` tool is locked by default (empty allowlist = no commands). Expl
 
 **Per-command timeout.** Each command is killed after `shell_timeout_secs` (default 120; override with `--shell-timeout` or `CLAUSURA_SHELL_TIMEOUT`) and the tool returns a `Command timed out after Ns and was killed` result.
 
-Tool outputs are truncated at 32 KB or 1000 lines (whichever comes first). When a spill store is attached (always, in `clausura run`), the *full* output is first written to `{workspace}/.clausura/archives/tool-output-{task_id}-{seq}.txt`, and the truncated result carries a locator hint — the agent can page through the rest with `read_file`'s `offset`/`limit` instead of losing it. Without truncation, a `[output truncated ...]` marker is still appended — narrow the query or use `read_file`'s `offset`/`limit` to page through large outputs.
+Tool outputs are truncated at 32 KB or 1000 lines (whichever comes first). For `git_diff`, `shell_exec`, `list_files` and `grep`, a spill store writes the *full* output to `{workspace}/.clausura/archives/tool-output-{task_id}-{seq}.txt`, and the truncated result carries a locator hint for paging with `read_file`. `read_file` itself instead points to the original file and the exact next `offset`, so unread lines are never misrepresented as a complete spill file. When no spill is available, the marker asks the agent to narrow the query or page with `offset`/`limit`.
 
 The agent loop also detects **repeat tool calls** (same tool, same arguments — argument order normalized): at 3/5/8 identical consecutive invocations it injects an escalating advisory reminder, so the model breaks out of loops before `max_iterations` expires.
 
 ### Run event log (append-only)
 
-Every run writes an append-only JSON-lines event log at `{workspace}/.clausura/archives/run-{task_id}.events.jsonl`: the full LLM request/response at each step, every tool call and result, context-truncation events (with archive paths and compaction summaries), and checkpoints carrying the complete message state. Failed CI runs can be audited and partially replayed from this log alone; successful runs clean it up with the other archives.
+Every run writes an append-only JSON-lines event log at `{workspace}/.clausura/archives/run-{task_id}.events.jsonl`: the full LLM request/response at each step, every tool call and result, context-truncation events (with archive paths and compaction summaries), and checkpoints carrying the complete message state. Failed CI runs can be audited and partially replayed from this log alone; successful runs clean it up with the other archives. Eval runs preserve it regardless of exit code.
 
 ### Memory snapshots (SQLite checkpoints)
 
-On every run, the agent's message history is serialized (MessagePack) and saved to `~/.clausura/checkpoints.db`. You can resume a truncated or interrupted run with `--resume`. Snapshots include a thread ID, version number, and truncation flag. The same state is also recorded as a `checkpoint` event in the workspace's append-only run event log, so `--resume` **falls back to the event log** when the SQLite store is unavailable — e.g. in ephemeral CI containers without a persistent home/volume, where checkpoints previously did not survive between runs.
+On every run, the agent's message history is serialized (MessagePack) and saved to `~/.clausura/checkpoints.db`. You can resume a truncated or interrupted run with `--resume`. Automatic and final checkpoints share a workspace-scoped thread ID of the form `task-name@/absolute/workspace`, preventing one project's state from being restored in another. Restored system prompts are rebuilt rather than duplicated. Snapshots include a thread ID, version number, and truncation flag. The same state is also recorded as a `checkpoint` event in the workspace's append-only run event log, so `--resume` **falls back to the event log** when the SQLite store is unavailable — e.g. in ephemeral CI containers without a persistent home/volume, where checkpoints previously did not survive between runs.
 
-Use `clausura snapshot list` and `clausura snapshot show` to inspect saved state (SQLite store only).
+Use `clausura snapshot list` and `clausura snapshot show` to inspect saved state (SQLite store only). Legacy unscoped checkpoints are not restored into a different workspace.
 
 ### SARIF output
 

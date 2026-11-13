@@ -94,8 +94,9 @@ class GatingTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
-        # Remove only this test's checkpoints, keeping the user's real state.
-        subprocess.run([str(BINARY), "snapshot", "delete", "--thread", "task-" + self.task["name"]],
+        # Remove only this test's workspace-scoped checkpoints.
+        thread_id = f"task-{self.task['name']}@{self.root.resolve()}"
+        subprocess.run([str(BINARY), "snapshot", "delete", "--thread", thread_id],
                        env=self.env, capture_output=True, check=True)
         self.tmp.cleanup()
 
@@ -209,6 +210,28 @@ class GatingTests(unittest.TestCase):
         self.run_cli(expected=0)
         self.assertEqual(self.summary()["findings_count"], 0)
 
+    def test_strict_shard_incomplete_writes_outputs_and_outranks_gate(self):
+        self.setup_sharded_repo()
+        finding = {"rule_id": "lsp-error", "severity": "error", "message": "partial finding", "evidence": "test"}
+        self.respond([finding], reason="tool_calls")
+        self.respond(reason="length")
+        self.run_cli(expected=2)
+        self.assertEqual(self.summary()["status"], "incomplete")
+        self.assertEqual(self.summary()["reason"], "shard_incomplete")
+        self.assertEqual(self.summary()["findings_count"], 1)
+        self.assertTrue(self.sarif()["properties"]["incomplete"])
+
+    def test_gate_violation_does_not_mark_incomplete_shards_complete(self):
+        self.setup_sharded_repo()
+        self.task["sharding"].update(on_shard_incomplete="bisect", max_splits=0)
+        finding = {"rule_id": "lsp-error", "severity": "error", "message": "partial finding", "evidence": "test"}
+        self.respond([finding], reason="tool_calls")
+        self.respond(reason="length")
+        self.run_cli(expected=1)
+        self.assertEqual(self.summary()["status"], "incomplete")
+        self.assertEqual(self.summary()["reason"], "shard_incomplete")
+        self.assertTrue(self.sarif()["properties"]["incomplete"])
+
     def test_sharded_run_obeys_overall_deadline(self):
         self.setup_sharded_repo()
         self.task["timeout_secs"] = 1
@@ -235,6 +258,15 @@ class GatingTests(unittest.TestCase):
         self.run_cli(expected=0)
         self.assertEqual(len(self.requests), 2)
         self.assertEqual(self.summary()["status"], "complete")
+
+    def test_recovery_after_iteration_limit_stays_incomplete(self):
+        self.task["max_iterations"] = 1
+        self.respond(reason="tool_calls")
+        self.respond()
+        self.run_cli(expected=2)
+        self.assertEqual(self.summary()["status"], "incomplete")
+        self.assertEqual(self.summary()["reason"], "iteration_limit")
+        self.assertTrue(self.sarif()["properties"]["incomplete"])
 
     def test_task_deadline_includes_provider_backoff(self):
         self.task["timeout_secs"] = 1
@@ -269,6 +301,32 @@ class GatingTests(unittest.TestCase):
         self.run_cli(expected=0)
         self.assertEqual(self.requests[0]["model"], "mock-model")
 
+    def test_proceed_with_caution_uses_lenient_findings(self):
+        self.task["ambiguity_policy"] = "proceed_with_caution"
+        self.respond(text="not findings JSON")
+        self.run_cli(expected=0)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.summary()["status"], "complete")
+        self.assertEqual(self.summary()["findings_count"], 0)
+
+    def test_ci_context_renders_prompt_and_sarif(self):
+        self.task["prompt_template"] = "Review {{repo}} PR {{pr_number}} at {{commit_sha}} on {{branch}}"
+        self.env.update(GITHUB_ACTIONS="true", GITHUB_REPOSITORY="acme/repo",
+                        GITHUB_REF="refs/pull/42/merge", GITHUB_SHA="abc123",
+                        GITHUB_HEAD_REF="feature/review")
+        self.respond()
+        self.run_cli(expected=0)
+        prompt = self.requests[0]["messages"][0]["content"]
+        self.assertIn("acme/repo", prompt)
+        self.assertIn("42", prompt)
+        self.assertIn("abc123", prompt)
+        self.assertIn("feature/review", prompt)
+        ci = self.sarif()["properties"]["ci"]
+        self.assertEqual(ci["repo"], "acme/repo")
+        self.assertEqual(ci["pr_number"], "42")
+        self.assertEqual(ci["commit_sha"], "abc123")
+        self.assertEqual(ci["branch"], "feature/review")
+
     def test_custom_vendor_uses_configured_auth_header_and_key_env(self):
         self.task["vendor"].update(type="custom", auth_header="X-Test-Key", api_key_env="GATING_MOCK_API_KEY")
         self.env["GATING_MOCK_API_KEY"] = "custom-mock-key"
@@ -282,6 +340,25 @@ class GatingTests(unittest.TestCase):
         self.respond()
         self.run_cli("--model", "cli-model", expected=0)
         self.assertEqual(self.requests[0]["model"], "cli-model")
+
+    def test_eval_preserves_success_event_log_and_run_metrics(self):
+        config = self.root / "review.yaml"
+        config.write_text(json.dumps({"version": "1", "task": self.task}))
+        eval_config = self.root / "eval.yaml"
+        eval_config.write_text(json.dumps({"scenarios": [{
+            "name": "smoke", "workspace": ".", "config": "review.yaml", "runs": 1,
+        }]}))
+        self.respond()
+        result = subprocess.run([str(BINARY), "eval", "--config", str(eval_config),
+                                 "--scenario", "smoke", "--out-dir", str(self.root / "eval-out")],
+                                cwd=self.root, env=self.env, capture_output=True, text=True, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.root / "eval-out/smoke/default/run-0/run.events.jsonl"
+        self.assertTrue(log.exists(), "successful eval must preserve its event log")
+        report = json.loads((self.root / "eval-out/eval-report.json").read_text())
+        metrics = report["scenarios"][0]["variants"][0]["run_metrics"][0]
+        self.assertEqual(metrics["status"], "complete")
+        self.assertEqual(metrics["llm_requests"], 1)
 
     def test_documented_examples_validate(self):
         for name in ["mcp-lsp-review.yaml", "skill-based-review.yaml"]:

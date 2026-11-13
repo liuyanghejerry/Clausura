@@ -24,10 +24,10 @@ To compare several models on the same corpus, use a model matrix:
 
 ```bash
 clausura eval --config eval/eval.yaml --models eval/models.yaml \
-  --variant default --runs 2 --out-dir eval-results/matrix
+  --variant default --runs 3 --out-dir eval-results/matrix
 ```
 
-This writes `eval-matrix.{json,md}` (cross-model recall summary and
+This writes `eval-matrix.{json,md}` (cross-model rule-recall summary and
 per-scenario table) plus one full report per model. See `eval/README.md`
 for the matrix format and `eval/results/` for published data.
 
@@ -36,13 +36,16 @@ before/after comparison workflow (`--baseline`).
 
 ## Metric semantics
 
-- `success` = the run finished cleanly (no truncation / iteration cap /
-  overflow). The gate exit code is deliberately not part of it: a scenario
-  whose ground truth is real issues correctly exits 1.
-- `recall` = ground-truth rules whose expected findings were reported.
+- `success` = the executor reports a clean finish (no truncation / iteration
+  cap / overflow). The gate exit code is deliberately not part of it: a
+  scenario whose ground truth is real issues correctly exits 1.
+- `rule recall` = ground-truth rule categories whose configured finding-count
+  thresholds were met. This is not per-instance or source-location recall.
 - `mean tokens` / `mean LLM calls` = cost and iteration pressure.
 - `compactions` / `spills` / `reminders` / `recovery success` = mechanism
-  effects, counted from the run event log (`run-*.events.jsonl`).
+  effects, counted from preserved run event logs (`run-*.events.jsonl`).
+- `run_metrics` = unaggregated per-run status, errors and mechanism metrics;
+  aggregate tables alone are not the audit record.
 
 ## When to run
 

@@ -594,6 +594,7 @@ impl Config {
             }
             (parts.join("\n"), resolved)
         };
+        let prompt_template = crate::ci::render_template(&prompt_template);
 
         Ok(Config {
             config_path,

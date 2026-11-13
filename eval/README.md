@@ -14,9 +14,10 @@ clausura eval --config eval.yaml --model gpt-5.4-mini --runs 3
 
 Outputs (under `eval-results/` by default):
 
-- `eval-report.json` — machine-readable full report
+- `eval-report.json` — machine-readable full report, including unaggregated
+  `run_metrics` with per-run `status` and `errors`
 - `eval-report.md` — summary table
-- `<scenario>/<variant>/run-<i>.events.jsonl` — per-run event logs (audit)
+- `<scenario>/<variant>/run-<i>/run.events.jsonl` — per-run event logs (audit)
 - `<scenario>/<variant>/run-<i>/output.sarif` — per-run SARIF
 - `eval-comparison.md` — when `--baseline` is given
 
@@ -24,18 +25,20 @@ Outputs (under `eval-results/` by default):
 
 | Metric | Meaning |
 |---|---|
-| success | clean finish (no truncation / iteration cap / overflow) |
-| recall | ground-truth findings actually reported |
+| success | clean finish according to the executor report, never inferred from a missing event log |
+| rule recall | ground-truth rule categories meeting their finding-count threshold |
 | mean tokens | billed tokens per run (cost) |
 | mean LLM calls | agent iterations |
 | compactions | auto-compact summaries applied |
 | spills | oversized tool outputs preserved to disk |
 | reminders | repeat-call advisories injected |
-| recovery success | findings-recovery attempts that succeeded |
+| recovery success | recovered runs / runs with at least one recovery attempt |
 
 Note: **success ignores the gate exit code**. Scenarios whose ground truth is
-real issues correctly exit 1 — the verdict is a scenario property; recall is
-the quality metric.
+real issues correctly exit 1 — the verdict is a scenario property. Rule recall
+is not per-instance or source-location recall; use `truth_overreported` and
+`unexpected_rule_ids` as additional precision signals, not as a full precision
+score.
 
 ## Comparing implementations
 
@@ -96,7 +99,7 @@ or mixed vendors. Each entry may set `vendor` and `api_key_env`; without
 ```bash
 export CLAUSURA_API_KEY="$OPENROUTER_API_KEY"
 clausura eval --config eval/eval.yaml --models eval/models.yaml \
-  --variant default --runs 2 --out-dir eval-results/matrix
+  --variant default --runs 3 --out-dir eval-results/matrix
 ```
 
 Outputs under `eval-results/matrix/`:
@@ -125,4 +128,4 @@ not abort the others.
 Only real, unedited harness output belongs there — never hand-written
 numbers.
 
-Latest published matrix: [2026-11-11, eight models via OpenRouter, three repeats](results/2026-11-11-openrouter-runs3/eval-matrix.md).
+Most recent historical matrix (pre-hardening; see its errata): [2026-11-11, eight models via OpenRouter, three repeats](results/2026-11-11-openrouter-runs3/eval-matrix.md).

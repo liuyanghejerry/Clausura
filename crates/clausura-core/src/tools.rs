@@ -87,19 +87,21 @@ impl SpillStore {
     }
 }
 
-/// Truncate tool output to at most 32 KB or 1000 lines, whichever comes first.
-/// Appends a marker when truncation occurs.
-fn truncate_output_with_spill(output: String, spill: Option<&SpillStore>) -> String {
-    let mut keep_end = output.len();
+fn output_keep_end(output: &str) -> usize {
     let mut offset = 0usize;
     for (lines_kept, line) in output.split_inclusive('\n').enumerate() {
         if lines_kept >= MAX_OUTPUT_LINES || offset + line.len() > MAX_OUTPUT_BYTES {
-            keep_end = offset;
-            break;
+            return offset;
         }
         offset += line.len();
     }
+    output.len()
+}
 
+/// Truncate tool output to at most 32 KB or 1000 lines, whichever comes first.
+/// Appends a marker when truncation occurs.
+fn truncate_output_with_spill(output: String, spill: Option<&SpillStore>) -> String {
+    let keep_end = output_keep_end(&output);
     if keep_end == output.len() {
         return output;
     }
@@ -118,6 +120,22 @@ fn truncate_output_with_spill(output: String, spill: Option<&SpillStore>) -> Str
             "\n... [output truncated: limit is 32KB or 1000 lines, use offset/limit or a narrower query]",
         ),
     }
+    truncated
+}
+
+fn truncate_read_file_output(output: String, path: &str, offset: usize) -> String {
+    let keep_end = output_keep_end(&output);
+    if keep_end == output.len() {
+        return output;
+    }
+    let consumed_lines = output[..keep_end].lines().count();
+    let next_offset = offset + consumed_lines;
+    let mut truncated = output[..keep_end].to_string();
+    truncated.truncate(truncated.trim_end_matches('\n').len());
+    truncated.push_str(&format!(
+        "\n... [output truncated: limit is 32KB or 1000 lines; \
+         resume from the original file {path} with read_file (offset={next_offset}, limit=1000)]"
+    ));
     truncated
 }
 
@@ -174,7 +192,6 @@ impl Default for ToolRegistry {
 /// Reads a file relative to the workspace root. Path traversal is rejected.
 pub struct ReadFileTool {
     workspace_root: PathBuf,
-    spill: Option<Arc<SpillStore>>,
 }
 
 /// Resolve a path relative to the workspace root, enforcing sandbox restrictions.
@@ -215,14 +232,11 @@ impl ReadFileTool {
         let canonical_root = workspace_root.canonicalize().unwrap_or(workspace_root);
         Self {
             workspace_root: canonical_root,
-            spill: None,
         }
     }
 
-    /// Attach a spill store (if any) so oversized outputs are saved to disk
-    /// instead of being lost to truncation.
-    pub fn with_spill_maybe(mut self, store: Option<Arc<SpillStore>>) -> Self {
-        self.spill = store;
+    /// Kept for caller compatibility; truncated reads resume from the original file.
+    pub fn with_spill_maybe(self, _store: Option<Arc<SpillStore>>) -> Self {
         self
     }
 
@@ -302,9 +316,10 @@ impl Tool for ReadFileTool {
             }
         }
 
-        Ok(truncate_output_with_spill(
+        Ok(truncate_read_file_output(
             result_lines.join("\n"),
-            self.spill.as_deref(),
+            path_str,
+            offset,
         ))
     }
 }
@@ -1518,7 +1533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_output_spills_full_content_to_archives() {
+    async fn test_read_file_truncation_resumes_from_original_file() {
         let (_tmp, root) = setup_workspace();
         let test_file = root.join("big.txt");
         let mut content = String::new();
@@ -1527,41 +1542,24 @@ mod tests {
         }
         std::fs::write(&test_file, &content).unwrap();
 
-        let tool = ReadFileTool::new(root.clone())
-            .with_spill_maybe(Some(Arc::new(SpillStore::new(root.clone(), "spill-test"))));
+        let tool = ReadFileTool::new(root.clone());
         let result = tool
             .execute(serde_json::json!({"path": "big.txt"}))
             .await
             .unwrap();
 
-        // The inline result is truncated and carries a locator hint...
         assert!(result.contains("[output truncated:"));
-        assert!(result.contains("saved to"));
-        assert!(result.contains("tool-output-spill-test-1.txt"));
-        assert!(result.contains("read_file (offset/limit)"));
+        assert!(result.contains("original file big.txt"));
+        assert!(result.contains("offset=1001"));
+        assert!(!result.contains("saved to"));
         assert!(!result.contains("line 1500"));
 
-        // ...and the full *tool output* (everything the tool read before the
-        // truncation marker was applied) is recoverable from the spill file.
-        // read_file caps its read at 1001 lines when no limit is given, so
-        // the spill holds those 1001 lines — the agent can page further with
-        // offset/limit.
-        let spill = root
-            .join(".clausura")
-            .join("archives")
-            .join("tool-output-spill-test-1.txt");
-        assert!(spill.exists(), "spill file should exist");
-        let spilled = std::fs::read_to_string(&spill).unwrap();
-        let expected: String = content.lines().take(1001).collect::<Vec<_>>().join("\n");
-        assert_eq!(
-            spilled, expected,
-            "spill file must hold the full pre-truncation output"
-        );
-        assert!(spilled.contains("line 1001"));
-        assert!(
-            !spilled.contains("line 1002"),
-            "read never reached line 1002"
-        );
+        let remainder = tool
+            .execute(serde_json::json!({"path": "big.txt", "offset": 1001, "limit": 500}))
+            .await
+            .unwrap();
+        assert!(remainder.starts_with("line 1001\n"));
+        assert!(remainder.ends_with("line 1500"));
     }
 
     #[tokio::test]

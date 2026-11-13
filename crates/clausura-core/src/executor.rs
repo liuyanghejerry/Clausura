@@ -16,15 +16,28 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExecutionOptions {
+    /// Keep context archives, spill files and event logs after a successful run.
+    pub preserve_archives: bool,
+}
+
 /// Execute a full task lifecycle.
 ///
 /// Orchestrates: config → provider → agent → rule engine → SARIF → checkpoint.
 /// Exit codes: 0 = pass, 1 = rule violation, 2 = error, 3 = config error.
 pub async fn execute_task(config: &Config) -> ExecutionReport {
+    execute_task_with_options(config, ExecutionOptions::default()).await
+}
+
+pub async fn execute_task_with_options(
+    config: &Config,
+    options: ExecutionOptions,
+) -> ExecutionReport {
     let start = Instant::now();
     let report = match tokio::time::timeout(
         std::time::Duration::from_secs(config.task.timeout_secs),
-        execute_task_inner(config),
+        execute_task_inner(config, options),
     )
     .await
     {
@@ -90,7 +103,7 @@ fn execution_error(
     }
 }
 
-async fn execute_task_inner(config: &Config) -> ExecutionReport {
+async fn execute_task_inner(config: &Config, options: ExecutionOptions) -> ExecutionReport {
     if let Some(sharding) = &config.task.sharding {
         // Shard runs do not support MCP preflight. Never silently skip a
         // configured required check when selecting this execution path.
@@ -103,9 +116,9 @@ async fn execute_task_inner(config: &Config) -> ExecutionReport {
                 None,
             );
         }
-        return execute_sharded_task(config, sharding).await;
+        return execute_sharded_task(config, sharding, options).await;
     }
-    execute_single_task(config).await
+    execute_single_task(config, options).await
 }
 
 /// Guidance prepended to the user prompt for every shard review. Keeps the
@@ -291,10 +304,14 @@ fn dedup_findings(findings: Vec<Finding>) -> Vec<Finding> {
 /// agent run per shard, bisect-and-retry on incomplete shards, findings
 /// aggregated through the gating rules.
 ///
-/// Exit semantics separate security findings from audit infrastructure
-/// failures: a gate violation exits 1; otherwise any shard that never
-/// completed exits 2 with `status: incomplete` / `reason: shard_incomplete`.
-async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> ExecutionReport {
+/// A gate violation exits 1 without hiding incomplete status. Otherwise an
+/// unfinished shard exits 2 with `reason: shard_incomplete`; strict fail
+/// policy always exits 2, even when partial findings violate a gate.
+async fn execute_sharded_task(
+    config: &Config,
+    sharding: &ShardingConfig,
+    options: ExecutionOptions,
+) -> ExecutionReport {
     let start = Instant::now();
     let task_id = config.task.id.clone();
     let workspace = config.workspace.clone();
@@ -356,6 +373,7 @@ async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> Exe
     let mut shard_records: Vec<ShardRecord> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut incomplete_shards = 0usize;
+    let mut strict_incomplete = false;
 
     while let Some((shard, splits_used, shard_no, rate_retries)) = queue.pop_front() {
         let shard_task_id = format!("{}-shard-{}", task_id, shard_no);
@@ -512,7 +530,9 @@ async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> Exe
                     tokens: agent_result.usage.total_tokens,
                     attempts: attempt,
                 });
-                cleanup_archives(&workspace, &shard_task_id);
+                if !options.preserve_archives {
+                    cleanup_archives(&workspace, &shard_task_id);
+                }
             }
             Some(reason) => {
                 let bisectable = matches!(
@@ -547,19 +567,18 @@ async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> Exe
                          failing closed (on_shard_incomplete=fail)",
                         reason.as_str()
                     ));
-                    return ExecutionReport {
-                        task_id,
-                        exit_code: 2,
-                        findings: dedup_findings(all_findings),
-                        token_usage: total_usage,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        snapshot_id: None,
-                        errors,
-                        violations: vec![],
-                        status: RunStatus::Incomplete,
-                        incomplete_reason: Some(IncompleteReason::Other),
-                        verification: None,
-                    };
+                    strict_incomplete = true;
+                    incomplete_shards += 1;
+                    shard_records.push(ShardRecord {
+                        shard: shard_no,
+                        files: shard.paths().into_iter().map(str::to_string).collect(),
+                        status: "incomplete",
+                        reason: Some(reason.as_str().to_string()),
+                        findings: shard_findings,
+                        tokens: agent_result.usage.total_tokens,
+                        attempts: attempt,
+                    });
+                    break;
                 }
 
                 errors.push(format!(
@@ -587,15 +606,23 @@ async fn execute_sharded_task(config: &Config, sharding: &ShardingConfig) -> Exe
         crate::jev::verify_findings(&config.task.verify, all_findings).await;
     let gate_result = RuleEngine::evaluate(&all_findings, &config.task.gating_rules);
 
-    // Security findings outrank infrastructure failures in the exit code
-    // only when a gate actually fails; otherwise an incomplete audit must
-    // not pass.
-    let (exit_code, status, reason_code) = if gate_result.exit_code != 0 {
-        (gate_result.exit_code, RunStatus::Complete, None)
-    } else if incomplete_shards > 0 {
-        (2, RunStatus::Incomplete, Some("shard_incomplete"))
+    // A gate violation may determine the exit code for bisect/pass policies,
+    // but it must never make an incomplete audit look complete. Strict
+    // `on_shard_incomplete=fail` always returns the infrastructure error.
+    let status = if incomplete_shards > 0 {
+        RunStatus::Incomplete
     } else {
-        (0, RunStatus::Complete, None)
+        RunStatus::Complete
+    };
+    let reason_code = (incomplete_shards > 0).then_some("shard_incomplete");
+    let exit_code = if strict_incomplete {
+        2
+    } else if gate_result.exit_code != 0 {
+        gate_result.exit_code
+    } else if incomplete_shards > 0 {
+        2
+    } else {
+        0
     };
 
     if let Err(e) = SarifFormatter::write_to_file_with_status(
@@ -689,7 +716,14 @@ fn write_sharded_summary(
     }
 }
 
-async fn execute_single_task(config: &Config) -> ExecutionReport {
+fn checkpoint_thread_id(task_id: &str, workspace: &Path) -> String {
+    let root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    format!("{task_id}@{}", root.display())
+}
+
+async fn execute_single_task(config: &Config, options: ExecutionOptions) -> ExecutionReport {
     let start = Instant::now();
     let task_id = config.task.id.clone();
 
@@ -805,7 +839,8 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
             };
         }
     };
-    let snapshot_mgr = SnapshotManager::new(checkpoint_store);
+    let snapshot_mgr = SnapshotManager::new(checkpoint_store)
+        .with_execution_thread_id(checkpoint_thread_id(&task_id, &config.workspace));
 
     let mut initial_messages = if config.resume {
         match snapshot_mgr.restore_snapshot(&task_id, true) {
@@ -834,6 +869,10 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
             config.task.prompt_template.clone(),
         )]
     };
+
+    if config.resume {
+        initial_messages.retain(|message| message.role != Role::System);
+    }
 
     if let Some((base, head)) = &config.review_range {
         initial_messages.push(Message::new(
@@ -975,7 +1014,7 @@ async fn execute_single_task(config: &Config) -> ExecutionReport {
         );
     }
 
-    if exit_code == 0 {
+    if exit_code == 0 && !options.preserve_archives {
         cleanup_archives(&config.workspace, &task_id);
     }
 

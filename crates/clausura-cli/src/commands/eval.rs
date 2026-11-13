@@ -186,6 +186,7 @@ async fn execute_matrix(
                 if matrix_report.commit.is_empty() {
                     matrix_report.commit = report.commit.clone();
                     matrix_report.branch = report.branch.clone();
+                    matrix_report.source_tree_dirty = report.source_tree_dirty;
                 }
                 write_report(&model_dir, &report)?;
                 matrix_report.models.push(MatrixModelReport {

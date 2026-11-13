@@ -93,9 +93,15 @@ separate:
 
 | Outcome | Exit | Summary JSON |
 |---|---|---|
-| Gate violation (real findings) | 1 | `status: complete` |
+| Gate violation with every shard complete | 1 | `status: complete` |
 | All shards complete, no violation | 0 | `status: complete` |
-| Some shard never completed | 2 | `status: incomplete`, `reason: shard_incomplete` |
+| Gate violation with an incomplete shard (`bisect`/`pass`) | 1 | `status: incomplete`, `reason: shard_incomplete` |
+| Some shard never completed, no gate violation | 2 | `status: incomplete`, `reason: shard_incomplete` |
+| Any incomplete shard under `on_shard_incomplete: fail` | 2 | `status: incomplete`, `reason: shard_incomplete` |
+
+A gate violation never hides incomplete status. Strict `fail` also takes
+precedence over the gate's exit code, and all outcomes write SARIF and the
+summary.
 
 A sharded run always writes a summary JSON next to the SARIF output
 (`<output>.summary.json`, or `--summary <path>`) with per-shard statuses:

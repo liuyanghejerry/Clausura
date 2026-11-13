@@ -5,6 +5,7 @@ use crate::types::{CheckpointError, Message, Role, Snapshot, SnapshotMeta};
 pub struct SnapshotManager {
     store: CheckpointStore,
     auto_save_interval: u32,
+    execution_thread_id: Option<String>,
 }
 
 impl SnapshotManager {
@@ -13,6 +14,7 @@ impl SnapshotManager {
         Self {
             store,
             auto_save_interval: 3,
+            execution_thread_id: None,
         }
     }
 
@@ -21,7 +23,18 @@ impl SnapshotManager {
         Self {
             store,
             auto_save_interval: interval,
+            execution_thread_id: None,
         }
+    }
+
+    /// Bind both automatic and final task checkpoints to one execution thread.
+    pub fn with_execution_thread_id(mut self, thread_id: String) -> Self {
+        self.execution_thread_id = Some(thread_id);
+        self
+    }
+
+    fn execution_thread<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.execution_thread_id.as_deref().unwrap_or(fallback)
     }
 
     /// Save current state as a snapshot.
@@ -31,7 +44,8 @@ impl SnapshotManager {
         messages: &[Message],
         truncated: bool,
     ) -> Result<uuid::Uuid, CheckpointError> {
-        self.store.save(thread_id, messages, truncated)
+        self.store
+            .save(self.execution_thread(thread_id), messages, truncated)
     }
 
     /// Restore the most recent snapshot for a thread.
@@ -41,6 +55,7 @@ impl SnapshotManager {
         thread_id: &str,
         resume: bool,
     ) -> Result<Option<Snapshot>, CheckpointError> {
+        let thread_id = self.execution_thread(thread_id);
         let result = self.store.load(thread_id)?;
         match result {
             Some((checkpoint_id, mut messages, truncated, version)) => {
@@ -296,5 +311,31 @@ mod tests {
         assert_eq!(all[0].thread_id, "t1");
         assert_eq!(all[1].thread_id, "t2");
         assert_eq!(all[2].thread_id, "t1");
+    }
+
+    #[test]
+    fn test_execution_thread_binding_isolates_automatic_and_final_saves() {
+        let (manager, _tmp) = setup_manager();
+        let manager = manager.with_execution_thread_id("task-review@/workspace/a".into());
+        manager
+            .save_snapshot("task-review", &make_messages(), false)
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .list_snapshots("task-review@/workspace/a", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(manager
+            .list_snapshots("task-review", 10)
+            .unwrap()
+            .is_empty());
+        let restored = manager
+            .restore_snapshot("task-review", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.meta.thread_id, "task-review@/workspace/a");
     }
 }

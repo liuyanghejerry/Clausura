@@ -361,10 +361,11 @@ normal gating rules.
 | `per_shard` | (all unset) | `token_budget`, `max_total_tokens`, `max_iterations`, `timeout_secs` overrides per shard. |
 | `risk_patterns` | `{}` | Extra deterministic pre-scan patterns (tag → regex on added lines). |
 
-Sharded runs always write a summary JSON (`<output>.summary.json`, or
-`--summary`) listing per-shard statuses; a shard that never completes yields
-exit 2 with `status: incomplete` / `reason: shard_incomplete`, separate from
-gate violations (exit 1).
+Sharded runs always write SARIF and a summary JSON (`<output>.summary.json`,
+or `--summary`) listing per-shard statuses. A shard that never completes marks
+the run `status: incomplete` / `reason: shard_incomplete`, even when partial
+findings also violate a gate. Under `on_shard_incomplete: fail`, exit 2 takes
+precedence over a gate violation.
 
 → [Sharded audits deep dive](sharding.md)
 
