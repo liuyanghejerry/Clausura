@@ -82,6 +82,8 @@ struct YamlTaskConfig {
     #[serde(default)]
     max_total_tokens: Option<u64>,
     #[serde(default)]
+    max_cost_usd: Option<f64>,
+    #[serde(default)]
     auto_compact: bool,
     #[serde(default = "default_max_compactions")]
     max_compactions: u32,
@@ -141,6 +143,8 @@ struct YamlShardBudget {
     max_iterations: Option<u32>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    max_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +162,8 @@ struct YamlShardingConfig {
     context_lines: u32,
     #[serde(default)]
     per_shard: YamlShardBudget,
+    #[serde(default)]
+    max_total_cost_usd: Option<f64>,
     #[serde(default)]
     on_shard_incomplete: String,
     #[serde(default)]
@@ -308,6 +314,15 @@ fn validate_yaml(yaml: &YamlConfig) -> Result<(), ConfigError> {
             "task.token_budget must be > 0".into(),
         ));
     }
+    if yaml
+        .task
+        .max_cost_usd
+        .is_some_and(|usd| !usd.is_finite() || usd <= 0.0)
+    {
+        return Err(ConfigError::ValidationError(
+            "task.max_cost_usd must be a positive number when set".into(),
+        ));
+    }
     if yaml.task.max_total_tokens == Some(0) {
         return Err(ConfigError::ValidationError(
             "task.max_total_tokens must be > 0 when set".into(),
@@ -366,6 +381,16 @@ fn validate_yaml(yaml: &YamlConfig) -> Result<(), ConfigError> {
             return Err(ConfigError::ValidationError(
                 "sharding.per_shard values must be > 0 when set".into(),
             ));
+        }
+        for (name, v) in [
+            ("sharding.per_shard.max_cost_usd", b.max_cost_usd),
+            ("sharding.max_total_cost_usd", sh.max_total_cost_usd),
+        ] {
+            if v.is_some_and(|usd| !usd.is_finite() || usd <= 0.0) {
+                return Err(ConfigError::ValidationError(format!(
+                    "{name} must be a positive number when set"
+                )));
+            }
         }
     }
     Ok(())
@@ -438,6 +463,7 @@ impl Config {
                     tool_allowlist: vec![],
                     token_budget: default_token_budget(),
                     max_total_tokens: None,
+                    max_cost_usd: None,
                     auto_compact: false,
                     max_compactions: default_max_compactions(),
                     findings_ledger: default_findings_ledger(),
@@ -499,6 +525,11 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .or(yaml_task.max_total_tokens);
+
+        let max_cost_usd = std::env::var("CLAUSURA_MAX_COST_USD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(yaml_task.max_cost_usd);
 
         // Auto-compact: summarize dropped messages instead of bare truncation.
         let auto_compact = match std::env::var("CLAUSURA_AUTO_COMPACT") {
@@ -608,6 +639,7 @@ impl Config {
                 tool_allowlist: yaml_task.tool_allowlist,
                 token_budget,
                 max_total_tokens,
+                max_cost_usd,
                 auto_compact,
                 max_compactions,
                 findings_ledger,
@@ -663,7 +695,9 @@ impl Config {
                             max_total_tokens: s.per_shard.max_total_tokens,
                             max_iterations: s.per_shard.max_iterations,
                             timeout_secs: s.per_shard.timeout_secs,
+                            max_cost_usd: s.per_shard.max_cost_usd,
                         },
+                        max_total_cost_usd: s.max_total_cost_usd,
                         on_shard_incomplete: policy,
                         risk_patterns: s.risk_patterns,
                     }
@@ -2481,6 +2515,8 @@ task:
       max_total_tokens: 300000
       max_iterations: 12
       timeout_secs: 300
+      max_cost_usd: 0.5
+    max_total_cost_usd: 4.0
     risk_patterns:
       danger-zone: "danger_zone\\("
 "#;
@@ -2512,6 +2548,8 @@ task:
         );
         assert_eq!(sharding.per_shard.token_budget, Some(300000));
         assert_eq!(sharding.per_shard.max_iterations, Some(12));
+        assert_eq!(sharding.per_shard.max_cost_usd, Some(0.5));
+        assert_eq!(sharding.max_total_cost_usd, Some(4.0));
         assert_eq!(
             sharding
                 .risk_patterns

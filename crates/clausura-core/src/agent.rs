@@ -79,6 +79,9 @@ async fn recover_findings_json(
                 break;
             }
         }
+        if crate::cost::cost_cap_reached(contract, total_usage) {
+            break;
+        }
         if let Some(log) = event_log {
             log.append(&RunEvent::FindingsRecoveryAttempt {
                 attempt: (attempt + 1) as u32,
@@ -137,6 +140,7 @@ pub async fn run_agent_loop(config: AgentConfig<'_>) -> Result<AgentResult, Prov
 }
 
 async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, ProviderError> {
+    crate::cost::ensure_priced(config.contract)?;
     let start = Instant::now();
     let max_iterations: u32 = config.contract.max_iterations;
     let mut messages = config.initial_messages;
@@ -192,6 +196,14 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
                 break_reason = Some(IncompleteReason::TokenCap);
                 break;
             }
+        }
+
+        // USD cap (only when configured): the same cumulative usage, priced
+        // per model, so the cap means dollars regardless of which model the
+        // task runs on.
+        if crate::cost::cost_cap_reached(config.contract, &total_usage) {
+            break_reason = Some(IncompleteReason::CostCap);
+            break;
         }
 
         if cm.should_truncate(&messages) {
@@ -1436,6 +1448,7 @@ mod tests {
             tool_allowlist: vec!["git".into()],
             token_budget: 100000,
             max_total_tokens: None,
+            max_cost_usd: None,
             auto_compact: false,
             max_compactions: 3,
             findings_ledger: true,
@@ -1972,6 +1985,79 @@ mod tests {
             "Expected truncated=true once cumulative tokens reach max_total_tokens"
         );
         assert_eq!(result.incomplete_reason, Some(IncompleteReason::TokenCap));
+    }
+
+    /// `max_cost_usd` stops the loop on dollars: two calls that stay far
+    /// under any token cap still cross a USD cap, and the run is marked
+    /// incomplete with `cost_cap`.
+    #[tokio::test]
+    async fn test_agent_loop_breaks_on_max_cost_usd() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+
+        let per_call = Usage {
+            input_tokens: 55000,
+            output_tokens: 5000,
+            total_tokens: 60000,
+        };
+        let mut contract = test_contract();
+        contract.model = "gpt-4o".into();
+        let one_call_usd = crate::cost::usage_cost_usd("gpt-4o", &per_call).unwrap();
+        // Room for one call but not two.
+        contract.max_cost_usd = Some(one_call_usd * 1.5);
+
+        let tool_call = ToolCall {
+            id: "call_1".into(),
+            name: "git_diff".into(),
+            arguments: serde_json::json!({}),
+        };
+        let mut mock = MockProvider::new("test-model");
+        for _ in 0..4 {
+            mock.add_response(ChatResponse {
+                message: Message::new(Role::Assistant, "Running tool..."),
+                usage: per_call.clone(),
+                finish_reason: FinishReason::ToolCalls,
+                tool_calls: Some(vec![tool_call.clone()]),
+            });
+        }
+
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+            event_log: None,
+        };
+
+        let result = run_agent_loop(config).await.unwrap();
+        assert_eq!(result.usage.total_tokens, 120000);
+        assert!(result.truncated);
+        assert_eq!(result.incomplete_reason, Some(IncompleteReason::CostCap));
+    }
+
+    /// A USD cap on a model with no known price is refused before any LLM
+    /// call, instead of running with a cap that can never trigger.
+    #[tokio::test]
+    async fn test_agent_loop_refuses_unpriced_model_with_cost_cap() {
+        let (_tmp, root) = setup_agent_env();
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+        let mut contract = test_contract();
+        contract.model = "no-such-model-xyz".into();
+        contract.max_cost_usd = Some(1.0);
+        let mock = MockProvider::new("test-model");
+        let config = AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review")],
+            workspace_root: root.clone(),
+            snapshot_mgr: None,
+            event_log: None,
+        };
+        let err = run_agent_loop(config).await.unwrap_err();
+        assert!(matches!(err, ProviderError::BadRequest(_)), "{err}");
     }
 
     /// Iteration exhaustion without a clean `Stop` reports
