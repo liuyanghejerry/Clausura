@@ -210,6 +210,9 @@ pub enum IncompleteReason {
     IterationLimit,
     /// The cumulative `max_total_tokens` cap was reached.
     TokenCap,
+    /// The `max_cost_usd` cap (or the sharded run's `max_total_cost_usd`)
+    /// was reached.
+    CostCap,
     /// The model stopped at its own output length limit.
     Length,
     /// The provider's content filter ended the run.
@@ -229,6 +232,7 @@ impl IncompleteReason {
             IncompleteReason::ContextLimit => "context_limit",
             IncompleteReason::IterationLimit => "iteration_limit",
             IncompleteReason::TokenCap => "token_cap",
+            IncompleteReason::CostCap => "cost_cap",
             IncompleteReason::Length => "length",
             IncompleteReason::ContentFilter => "content_filter",
             IncompleteReason::Timeout => "timeout",
@@ -459,6 +463,9 @@ pub struct ShardBudget {
     pub max_iterations: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Per-shard USD cap, priced from the model's token prices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
 }
 
 /// Sharding configuration. Presence of this section switches `clausura run`
@@ -487,6 +494,12 @@ pub struct ShardingConfig {
     /// Budget overrides applied to each shard's agent run.
     #[serde(default)]
     pub per_shard: ShardBudget,
+    /// USD cap for the whole sharded run. Each shard runs under the smaller
+    /// of `per_shard.max_cost_usd` and what is left of this cap; once it is
+    /// spent, the remaining shards are not started and the run is marked
+    /// incomplete (`cost_cap`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_cost_usd: Option<f64>,
     /// Policy when a shard ends incomplete. Default `bisect`.
     #[serde(default)]
     pub on_shard_incomplete: ShardIncompletePolicy,
@@ -629,6 +642,13 @@ pub struct TaskContract {
     /// incomplete. `None` means no cap.
     #[serde(default)]
     pub max_total_tokens: Option<u64>,
+    /// Optional cap on the USD cost of one run, priced from the provider's
+    /// reported input/output tokens with `llm-budget`'s price table. When
+    /// reached, the agent loop stops and the run is marked incomplete
+    /// (`cost_cap`). A model with no known price is refused up front rather
+    /// than run uncapped. `None` means no cap.
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
     /// When true, the agent loop summarizes messages dropped by context
     /// truncation with an LLM call and injects the summary at the truncation
     /// boundary instead of a bare "context trimmed" hint. Default false.
@@ -1021,6 +1041,7 @@ mod tests {
             tool_allowlist: vec![],
             token_budget: 32000,
             max_total_tokens: None,
+            max_cost_usd: None,
             auto_compact: false,
             max_compactions: 3,
             findings_ledger: true,

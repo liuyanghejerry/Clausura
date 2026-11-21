@@ -375,8 +375,42 @@ async fn execute_sharded_task(
     let mut incomplete_shards = 0usize;
     let mut strict_incomplete = false;
 
+    // Whole-run USD cap: every shard's spend is booked here, and each shard
+    // runs under what is left of it.
+    let fleet_budget = match sharding.max_total_cost_usd {
+        Some(cap) => match llm_budget::AgentBudget::builder(task_id.clone(), cap).build() {
+            Ok(b) => Some(b),
+            Err(e) => {
+                return execution_error(
+                    config,
+                    start,
+                    format!("Invalid sharding.max_total_cost_usd: {e}"),
+                    None,
+                )
+            }
+        },
+        None => None,
+    };
+
     while let Some((shard, splits_used, shard_no, rate_retries)) = queue.pop_front() {
         let shard_task_id = format!("{}-shard-{}", task_id, shard_no);
+        if fleet_budget.as_ref().is_some_and(|b| b.is_exhausted()) {
+            errors.push(format!(
+                "shard {shard_no} ({}) not started: sharding.max_total_cost_usd spent",
+                shard.paths().join(", ")
+            ));
+            incomplete_shards += 1;
+            shard_records.push(ShardRecord {
+                shard: shard_no,
+                files: shard.paths().into_iter().map(str::to_string).collect(),
+                status: "incomplete",
+                reason: Some(IncompleteReason::CostCap.as_str().to_string()),
+                findings: 0,
+                tokens: 0,
+                attempts: 0,
+            });
+            continue;
+        }
         let mut contract = config.task.clone();
         contract.id = shard_task_id.clone();
         contract.name = format!("{} (shard {})", config.task.name, shard_no);
@@ -391,6 +425,13 @@ async fn execute_sharded_task(
         }
         if let Some(ts) = sharding.per_shard.timeout_secs {
             contract.timeout_secs = ts;
+        }
+        if let Some(usd) = sharding.per_shard.max_cost_usd {
+            contract.max_cost_usd = Some(usd);
+        }
+        if let Some(fleet) = &fleet_budget {
+            let left = fleet.remaining_usd();
+            contract.max_cost_usd = Some(contract.max_cost_usd.map_or(left, |usd| usd.min(left)));
         }
         contract.prompt_template = shard_prompt(&config.task.prompt_template);
 
@@ -516,6 +557,22 @@ async fn execute_sharded_task(
         total_usage.input_tokens += agent_result.usage.input_tokens;
         total_usage.output_tokens += agent_result.usage.output_tokens;
         total_usage.total_tokens += agent_result.usage.total_tokens;
+        if let Some(fleet) = &fleet_budget {
+            // The agent loop refuses an unpriced model up front when a cap is
+            // set, so a price exists here.
+            if let Some(usd) = crate::cost::usage_cost_usd(&contract.model, &agent_result.usage) {
+                fleet.charge_usd_force(
+                    usd,
+                    llm_budget::ChargeContext::new()
+                        .task(shard_task_id.clone())
+                        .model(contract.model.clone())
+                        .tokens(
+                            agent_result.usage.input_tokens,
+                            agent_result.usage.output_tokens,
+                        ),
+                );
+            }
+        }
         let shard_findings = agent_result.findings.len();
         all_findings.extend(agent_result.findings);
 
@@ -540,6 +597,7 @@ async fn execute_sharded_task(
                     IncompleteReason::ContextLimit
                         | IncompleteReason::IterationLimit
                         | IncompleteReason::TokenCap
+                        | IncompleteReason::CostCap
                         | IncompleteReason::Length
                         | IncompleteReason::Timeout
                 );
@@ -1688,6 +1746,7 @@ mod tests {
             max_splits: 3,
             context_lines: 20,
             per_shard: crate::types::ShardBudget::default(),
+            max_total_cost_usd: None,
             on_shard_incomplete: crate::types::ShardIncompletePolicy::Bisect,
             risk_patterns: Default::default(),
         }

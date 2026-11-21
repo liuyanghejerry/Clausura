@@ -27,6 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt",
 tracing-appender = "0.2"
 regex-lite = "0.1"
 tempfile = "3"
+llm-budget = { version = "0.10.0", default-features = false }
 
 [dev-dependencies]
 tokio-test = "0.4"
