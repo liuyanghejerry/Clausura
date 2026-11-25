@@ -52,6 +52,16 @@ pub async fn execute_task_with_options(
     if report.status == RunStatus::Error {
         write_error_outputs(config, &report);
     }
+    if let Some(md_path) = &config.markdown {
+        if let Err(e) =
+            crate::markdown::MarkdownFormatter::write_to_file(&report, &config.task.name, md_path)
+        {
+            eprintln!(
+                "Warning: Failed to write Markdown report {}: {e}",
+                md_path.display()
+            );
+        }
+    }
     report
 }
 
@@ -321,6 +331,55 @@ pub async fn plan_sharding_preview(
     Ok((file_diffs.len(), total_bytes, shards.len()))
 }
 
+/// Apply inline `clausura-ignore:` suppressions, optional `--write-baseline`
+/// export, and optional `--baseline` legacy filtering before gating.
+fn apply_suppression_and_baseline(
+    config: &Config,
+    findings: Vec<Finding>,
+) -> Result<Vec<Finding>, String> {
+    let (findings, suppressed) =
+        crate::suppression::apply_inline_suppressions(&config.workspace, findings);
+    if !suppressed.is_empty() {
+        eprintln!(
+            "Suppressed {} finding(s) via inline clausura-ignore directives",
+            suppressed.len()
+        );
+    }
+
+    if let Some(write_path) = &config.write_baseline {
+        if let Err(e) = crate::suppression::write_baseline(write_path, &findings) {
+            eprintln!(
+                "Warning: Failed to write baseline {}: {e}",
+                write_path.display()
+            );
+        }
+    }
+
+    if let Some(baseline_path) = &config.baseline {
+        let baseline = crate::suppression::load_baseline(baseline_path)?;
+        let (remaining, baselined) = crate::suppression::filter_baseline(findings, &baseline);
+        if baselined > 0 {
+            eprintln!(
+                "Filtered {} legacy finding(s) matching baseline {}",
+                baselined,
+                baseline_path.display()
+            );
+        }
+        return Ok(remaining);
+    }
+
+    Ok(findings)
+}
+
+fn warn_ungated_high_severity(gate_result: &crate::types::GateResult) {
+    if !gate_result.ungated_high_severity_rules.is_empty() {
+        eprintln!(
+            "Warning: high-severity finding(s) with rule_id(s) [{}] did not match any configured gating rule",
+            gate_result.ungated_high_severity_rules.join(", ")
+        );
+    }
+}
+
 /// Deduplicate findings across shards (overlap/adjacent-line aware).
 fn dedup_findings(findings: Vec<Finding>) -> Vec<Finding> {
     crate::agent::dedup_findings(findings)
@@ -370,7 +429,7 @@ async fn execute_sharded_task(
         temperature: config.task.temperature,
         prompt_caching: config.task.prompt_caching,
     };
-    let provider: Arc<Box<dyn crate::provider::Provider>> = Arc::new(
+    let provider: Arc<dyn crate::provider::Provider> = Arc::from(
         match create_provider_with_options(
             &config.task.vendor,
             &config.task.model,
@@ -560,7 +619,7 @@ async fn execute_sharded_task(
 
                 let agent_config = AgentConfig {
                     contract: &contract,
-                    provider: provider.as_ref().as_ref(),
+                    provider: provider.as_ref(),
                     tools: &tools,
                     initial_messages,
                     workspace_root: workspace,
@@ -774,9 +833,19 @@ async fn execute_sharded_task(
     shard_records.sort_by_key(|r| r.shard);
 
     let all_findings = dedup_findings(all_findings);
-    let (all_findings, verification) =
-        crate::jev::verify_findings(&config.task.verify, all_findings).await;
+    let all_findings = match apply_suppression_and_baseline(config, all_findings) {
+        Ok(f) => f,
+        Err(e) => return execution_error(config, start, e, None),
+    };
+    let (all_findings, verification) = crate::jev::verify_findings_with_context(
+        &config.task.verify,
+        all_findings,
+        Some(&workspace),
+        Some(provider),
+    )
+    .await;
     let gate_result = RuleEngine::evaluate(&all_findings, &config.task.gating_rules);
+    warn_ungated_high_severity(&gate_result);
 
     // A gate violation may determine the exit code for bisect/pass policies,
     // but it must never make an incomplete audit look complete. Strict
@@ -919,30 +988,32 @@ async fn execute_single_task(config: &Config, options: ExecutionOptions) -> Exec
         temperature: config.task.temperature,
         prompt_caching: config.task.prompt_caching,
     };
-    let provider = match create_provider_with_options(
-        &config.task.vendor,
-        &config.task.model,
-        &config.api_key.clone().unwrap_or_default(),
-        config.task.timeout_secs,
-        &provider_opts,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            return ExecutionReport {
-                task_id,
-                exit_code: 2,
-                findings: vec![],
-                token_usage: Usage::default(),
-                duration_ms: start.elapsed().as_millis() as u64,
-                snapshot_id: None,
-                errors: vec![format!("Provider init error: {}", e)],
-                violations: vec![],
-                status: RunStatus::Error,
-                incomplete_reason: None,
-                verification: None,
-            };
-        }
-    };
+    let provider: Arc<dyn crate::provider::Provider> = Arc::from(
+        match create_provider_with_options(
+            &config.task.vendor,
+            &config.task.model,
+            &config.api_key.clone().unwrap_or_default(),
+            config.task.timeout_secs,
+            &provider_opts,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return ExecutionReport {
+                    task_id,
+                    exit_code: 2,
+                    findings: vec![],
+                    token_usage: Usage::default(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    snapshot_id: None,
+                    errors: vec![format!("Provider init error: {}", e)],
+                    violations: vec![],
+                    status: RunStatus::Error,
+                    incomplete_reason: None,
+                    verification: None,
+                };
+            }
+        },
+    );
 
     // Append-only run event log: audit trail + checkpoint fallback for
     // resume in ephemeral CI environments where ~/.clausura does not survive.
@@ -1158,11 +1229,21 @@ async fn execute_single_task(config: &Config, options: ExecutionOptions) -> Exec
     // Merge preflight findings (deterministic) with verified agent findings.
     // Deterministic preflight diagnostics (e.g. LSP compile errors) must never
     // be filtered out by the probabilistic verifier.
-    let (verified_agent_findings, verification) =
-        crate::jev::verify_findings(&config.task.verify, agent_result.findings).await;
+    let (verified_agent_findings, verification) = crate::jev::verify_findings_with_context(
+        &config.task.verify,
+        agent_result.findings,
+        Some(&config.workspace),
+        Some(provider),
+    )
+    .await;
     let all_findings = [preflight_findings, verified_agent_findings].concat();
+    let all_findings = match apply_suppression_and_baseline(config, all_findings) {
+        Ok(f) => f,
+        Err(e) => return execution_error(config, start, e, None),
+    };
 
     let gate_result = RuleEngine::evaluate(&all_findings, &config.task.gating_rules);
+    warn_ungated_high_severity(&gate_result);
 
     // Fail closed on incomplete runs (context truncated, iteration limit,
     // token cap, or malformed final answer): a partial sweep with zero
@@ -1546,6 +1627,8 @@ mod tests {
             min_severity: Severity::Error,
             max_findings: 0,
             action: GateAction::Fail,
+            paths: vec![],
+            exclude_paths: vec![],
         }];
         let result = RuleEngine::evaluate(&findings, &rules);
         assert_eq!(result.exit_code, 1);

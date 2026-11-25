@@ -399,11 +399,17 @@ An array of gating rules, evaluated in order. Each rule:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `rule` | string | Rule ID. Matches `finding.rule_id`. |
+| `rule` | string | Rule ID or `*` wildcard pattern (e.g. `sql-injection`, `lsp-*`, `*`). Matches `finding.rule_id`. |
 | `description` | string | Human-readable description. |
 | `min_severity` | string | Severity threshold: `hint`, `info`, `warning`, `error`. |
 | `max_findings` | number | Maximum allowed findings at or above this severity. |
 | `action` | string | What to do when exceeded: `fail` (exit 1), `warn` (log only), `ignore` (skip). |
+| `paths` | string[] | Optional include path globs (e.g. `["src/**"]`). Empty matches all files. |
+| `exclude_paths` | string[] | Optional exclude path globs (e.g. `["tests/**", "**/*_test.rs"]`). |
+
+**Inline suppression & baselines:**
+- Add `clausura-ignore: <rule_id[,rule_id]|*> -- <reason>` as a trailing comment on the flagged line or as a standalone comment on the line immediately above it to suppress specific findings.
+- Use `clausura run --write-baseline .clausura-baseline.json` to snapshot accepted legacy findings, then pass `--baseline .clausura-baseline.json` in CI to gate only newly introduced findings.
 
 → [Gating rules deep dive](gating.md)
 
@@ -421,9 +427,12 @@ verification with a warning.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Master switch. `CLAUSURA_VERIFY=1` overrides. |
+| `provider` | `jev` | Backend: `jev` (TypeSafe System One) or `llm` (LLM-as-a-Judge with surrounding source code context). |
 | `threshold` | `0.5` | Keep-threshold on P(genuine), clamped to [0, 1]. |
-| `model` | `jev-latest` | Decision model id. |
-| `base_url` | `https://api.typesafe.ai` | API base URL; `/v1/systemone` is appended. |
+| `model` | `jev-latest` | Decision or judge model id. With `provider: llm` and no `verify.vendor`, reuses the main task provider/model. |
+| `vendor` | (none) | Optional separate vendor config when `provider: llm` uses a dedicated judge model. |
+| `context_lines` | `15` | Lines before and after `finding.location` sent to `provider: llm`. |
+| `base_url` | `https://api.typesafe.ai` | API base URL for `jev`; `/v1/systemone` is appended. |
 | `api_key_env` | `TYPESAFE_API_KEY` | Env var holding the decision API key. |
 | `timeout_secs` | `30` | Per-request timeout. |
 | `max_findings` | `100` | Cost guard; excess findings pass through unverified. |

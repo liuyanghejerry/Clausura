@@ -61,6 +61,16 @@ fn default_runs() -> u32 {
     3
 }
 
+/// Optional location expectation for finer-grained recall beyond rule counts.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExpectedLocation {
+    pub file: String,
+    #[serde(default)]
+    pub line_start: Option<u32>,
+    #[serde(default)]
+    pub line_end: Option<u32>,
+}
+
 /// A ground-truth expectation: at least `min_findings` findings with this
 /// rule_id must be reported. An optional `max_findings` bounds over-reporting
 /// (precision): reporting more than that many counts as overreported —
@@ -71,6 +81,8 @@ pub struct GroundTruthRule {
     pub min_findings: u32,
     #[serde(default)]
     pub max_findings: Option<u32>,
+    #[serde(default)]
+    pub locations: Vec<ExpectedLocation>,
 }
 
 /// A config variant: a name plus a partial YAML object merged over the
@@ -137,6 +149,15 @@ pub struct RunMetrics {
     pub truth_overreported: u32,
     /// Findings whose rule_id has no ground-truth entry.
     pub unexpected_rule_ids: Vec<String>,
+    /// Expected source locations matched by findings (when configured in ground truth).
+    #[serde(default)]
+    pub location_matched: u32,
+    /// Total expected source locations configured in ground truth.
+    #[serde(default)]
+    pub location_total: u32,
+    /// Findings filtered out by the optional pre-gating verifier.
+    #[serde(default)]
+    pub verification_filtered: u32,
     /// Execution outcome from the executor, independent of event-log health.
     #[serde(default)]
     pub status: crate::types::RunStatus,
@@ -152,6 +173,38 @@ impl RunMetrics {
             1.0
         } else {
             self.truth_matched as f64 / self.truth_total as f64
+        }
+    }
+
+    /// Location-level recall when ground truth specifies expected file/line locations.
+    pub fn location_recall(&self) -> Option<f64> {
+        if self.location_total == 0 {
+            None
+        } else {
+            Some(self.location_matched as f64 / self.location_total as f64)
+        }
+    }
+
+    /// Rule-category precision signal: fraction of reported rule categories
+    /// that match ground truth (penalizing unexpected rule IDs and over-reporting).
+    pub fn rule_precision(&self) -> f64 {
+        let denom =
+            self.truth_matched + self.unexpected_rule_ids.len() as u32 + self.truth_overreported;
+        if denom == 0 {
+            1.0
+        } else {
+            self.truth_matched as f64 / denom as f64
+        }
+    }
+
+    /// Harmonic mean (F1) of rule recall and rule precision.
+    pub fn rule_f1(&self) -> f64 {
+        let r = self.recall();
+        let p = self.rule_precision();
+        if r + p == 0.0 {
+            0.0
+        } else {
+            2.0 * r * p / (r + p)
         }
     }
 
@@ -188,6 +241,11 @@ pub fn metrics_from_run(
         total_tokens: report.token_usage.total_tokens,
         findings_count: report.findings.len() as u32,
         truth_total: ground_truth.len() as u32,
+        verification_filtered: report
+            .verification
+            .as_ref()
+            .map(|v| v.filtered as u32)
+            .unwrap_or(0),
         ..Default::default()
     };
 
@@ -212,20 +270,46 @@ pub fn metrics_from_run(
     }
     m.recovered = !m.truncated && m.recovery_attempts > 0;
 
-    // Ground truth evaluation.
+    // Ground truth evaluation (rule-level and optional location-level).
     let truth_ids: Vec<&str> = ground_truth.iter().map(|r| r.rule_id.as_str()).collect();
     for rule in ground_truth {
-        let count = report
+        let matching: Vec<&crate::types::Finding> = report
             .findings
             .iter()
             .filter(|f| f.rule_id == rule.rule_id)
-            .count() as u32;
+            .collect();
+        let count = matching.len() as u32;
         if count >= rule.min_findings {
             m.truth_matched += 1;
         }
         if let Some(max) = rule.max_findings {
             if count > max {
                 m.truth_overreported += 1;
+            }
+        }
+        for exp in &rule.locations {
+            m.location_total += 1;
+            let exp_file = exp.file.trim().trim_start_matches("./").replace('\\', "/");
+            let found = matching.iter().any(|f| {
+                let Some(ref loc) = f.location else {
+                    return false;
+                };
+                let got_file = loc.file.trim().trim_start_matches("./").replace('\\', "/");
+                if got_file != exp_file {
+                    return false;
+                }
+                match (exp.line_start, exp.line_end) {
+                    (Some(s), Some(e)) => {
+                        loc.line_start <= e.saturating_add(2) && loc.line_end.saturating_add(2) >= s
+                    }
+                    (Some(s), None) => {
+                        loc.line_start <= s.saturating_add(2) && loc.line_end.saturating_add(2) >= s
+                    }
+                    _ => true,
+                }
+            });
+            if found {
+                m.location_matched += 1;
             }
         }
     }
@@ -1170,11 +1254,13 @@ mod tests {
                 rule_id: "sql-injection".into(),
                 min_findings: 1,
                 max_findings: None,
+                locations: vec![],
             },
             GroundTruthRule {
                 rule_id: "hardcoded-secret".into(),
                 min_findings: 2,
                 max_findings: Some(2),
+                locations: vec![],
             },
         ];
         let mut report = empty_report();
@@ -1190,6 +1276,8 @@ mod tests {
         assert_eq!(m.recall(), 1.0);
         assert_eq!(m.truth_overreported, 0);
         assert_eq!(m.unexpected_rule_ids, vec!["unexpected-rule"]);
+        assert!((m.rule_precision() - (2.0 / 3.0)).abs() < 1e-6);
+        assert!(m.rule_f1() > 0.79 && m.rule_f1() < 0.81);
 
         // Over-reporting: 3 hardcoded-secret findings against max 2.
         report.findings = vec![
@@ -1607,5 +1695,50 @@ models:
             matches!(err, EvalError::VariantNotFound(ref name) if name == "defualt"),
             "expected VariantNotFound, got {err}"
         );
+    }
+
+    #[test]
+    fn test_metrics_location_recall_and_verification_filtered() {
+        let truth = vec![GroundTruthRule {
+            rule_id: "sql-injection".into(),
+            min_findings: 1,
+            max_findings: None,
+            locations: vec![
+                ExpectedLocation {
+                    file: "src/db.rs".into(),
+                    line_start: Some(20),
+                    line_end: Some(22),
+                },
+                ExpectedLocation {
+                    file: "src/other.rs".into(),
+                    line_start: Some(5),
+                    line_end: None,
+                },
+            ],
+        }];
+        let mut f = finding("sql-injection");
+        f.location = Some(crate::types::Location {
+            file: "./src/db.rs".into(),
+            line_start: 21,
+            line_end: 21,
+            column_start: 1,
+            column_end: 1,
+        });
+        let mut report = empty_report();
+        report.findings = vec![f];
+        report.verification = Some(crate::types::VerificationSummary {
+            model: "jev-latest".into(),
+            threshold: 0.5,
+            verified: 1,
+            filtered: 3,
+            failed: 0,
+            skipped: 0,
+            filtered_findings: vec![],
+        });
+        let m = metrics_from_run("s", "v", 0, &report, &[], &truth);
+        assert_eq!(m.location_matched, 1);
+        assert_eq!(m.location_total, 2);
+        assert_eq!(m.location_recall(), Some(0.5));
+        assert_eq!(m.verification_filtered, 3);
     }
 }

@@ -56,6 +56,20 @@ pub struct RunArgs {
     #[arg(long)]
     pub summary: Option<PathBuf>,
 
+    /// Optional path for a developer-friendly Markdown review report
+    /// (suitable for GitHub Job Summaries or PR comments)
+    #[arg(long)]
+    pub markdown: Option<PathBuf>,
+
+    /// Optional baseline JSON file; legacy findings matching this baseline are
+    /// excluded from gating so only newly introduced findings block CI
+    #[arg(long)]
+    pub baseline: Option<PathBuf>,
+
+    /// Write the run's findings as a baseline JSON file at this path
+    #[arg(long)]
+    pub write_baseline: Option<PathBuf>,
+
     /// Resume from last checkpoint
     #[arg(long)]
     pub resume: bool,
@@ -127,6 +141,9 @@ pub async fn execute(args: RunArgs) -> i32 {
         }
     };
     config.summary = args.summary;
+    config.markdown = args.markdown;
+    config.baseline = args.baseline;
+    config.write_baseline = args.write_baseline;
 
     if args.validate_config {
         step(2, total_steps, "Validating configuration...");

@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use colored::*;
 use commands::eval::EvalArgs;
+use commands::init::InitArgs;
 use commands::run::RunArgs;
 use commands::snapshot::SnapshotArgs;
 use std::io::IsTerminal;
@@ -15,6 +16,7 @@ mod commands;
     long_about = "Clausura runs deterministic agent tasks in CI pipelines.\n\
                    \n\
                    EXAMPLES:\n  \
+                   clausura init                            Scaffold .clausura.yaml and starter skill\n  \
                    clausura run --config .clausura.yaml    Run a task\n  \
                    clausura run --dry-run                   Validate config and print plan\n  \
                    clausura snapshot list                   List checkpoints\n  \
@@ -28,6 +30,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize .clausura.yaml and a starter skill for this repository
+    Init(InitArgs),
     /// Run a Clausura task
     Run(Box<RunArgs>),
     /// Manage checkpoints
@@ -43,6 +47,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Init(args) => {
+            commands::init::execute(args).map_err(|e| {
+                eprintln!("{}: {}", "Error".red().bold(), e);
+                e
+            })?;
+            Ok(())
+        }
         Commands::Run(args) => {
             let exit_code = commands::run::execute(*args).await;
             std::process::exit(exit_code);

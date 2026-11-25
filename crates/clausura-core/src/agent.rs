@@ -3928,6 +3928,8 @@ mod tests {
             min_severity: crate::types::Severity::Error,
             max_findings: 0,
             action: crate::types::GateAction::Fail,
+            paths: vec![],
+            exclude_paths: vec![],
         }];
         let prompt = build_system_prompt(&contract, true);
         assert!(prompt.contains("`hardcoded-secret`"));
@@ -3951,6 +3953,8 @@ mod tests {
             min_severity: crate::types::Severity::Error,
             max_findings: 0,
             action: crate::types::GateAction::Fail,
+            paths: vec![],
+            exclude_paths: vec![],
         }];
         let mut tools = default_tools(root.clone(), &[], 120, &[], None);
         tools.register_report_finding(

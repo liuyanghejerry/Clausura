@@ -77,3 +77,51 @@ fn test_eval_missing_key_fails_loud() {
     .stderr(predicate::str::contains("Missing API key"));
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn test_init_scaffolds_rust_project_and_validates() {
+    let tmp = std::env::temp_dir().join(format!("clausura-init-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+
+    Command::cargo_bin("clausura")
+        .unwrap()
+        .args([
+            "init",
+            "--workspace",
+            tmp.to_str().unwrap(),
+            "--with-workflow",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Rust project"));
+
+    assert!(tmp.join(".clausura.yaml").exists());
+    assert!(tmp.join(".clausura/skills/rust-review/SKILL.md").exists());
+    assert!(tmp.join(".github/workflows/clausura.yml").exists());
+
+    // Generated config must validate cleanly.
+    Command::cargo_bin("clausura")
+        .unwrap()
+        .args([
+            "run",
+            "--config",
+            tmp.join(".clausura.yaml").to_str().unwrap(),
+            "--workspace",
+            tmp.to_str().unwrap(),
+            "--validate-config",
+        ])
+        .assert()
+        .success();
+
+    // Second run without --force refuses to overwrite.
+    Command::cargo_bin("clausura")
+        .unwrap()
+        .args(["init", "--workspace", tmp.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
