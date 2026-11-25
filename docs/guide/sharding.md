@@ -11,28 +11,30 @@ finish.
 Adding a `sharding:` section to `.clausura.yaml` switches `clausura run` to
 the sharded path:
 
-1. **Collect** — changed files are listed via `git diff --name-only` between
-   `git merge-base <base> HEAD` and `HEAD`, then each file's diff is taken
-   with `--unified=<context_lines>`.
+1. **Collect** — a single `git diff --unified=<context_lines>` between
+   `git merge-base <base> HEAD` and `HEAD` is split into per-file diffs
+   (skipping `.clausura*` files).
 2. **Pre-scan** — a deterministic regex scanner (`risk.rs`) flags candidate
    hotspots on added lines: new routes, SQL statements, string-built SQL,
    request-body entry points, filesystem access, auth checks, logging, and
    process execution. No LLM calls.
 3. **Plan** — files are grouped into shards under `max_diff_bytes` /
    `max_files_per_shard` (default 128 KiB / 8 files).
-4. **Review** — each shard runs its own bounded agent loop. The initial
-   message contains the shard manifest (file, changed lines, diff bytes,
-   risk tags, candidate hotspots) plus the diffs themselves — inline, so no
-   tool round-trips are needed just to read the input. The prompt instructs
-   the agent to read surrounding source only to validate a potential
-   finding.
+4. **Review** — each shard runs its own bounded agent loop (serially by
+   default, or up to `concurrency` shards in parallel with shared rate-limit
+   backoff). The initial message contains the shard manifest (file, changed
+   lines, diff bytes, risk tags, candidate hotspots, and a compact list of
+   all changed files in the PR) plus the diffs themselves — inline, so no
+   tool round-trips are needed just to read the input. Completed shards are
+   checkpointed to disk so `--resume` skips already-finished shards.
 5. **Retry** — a shard that ends incomplete (`context_limit`,
    `iteration_limit`, `token_cap`, `length`, `timeout`) is bisected — by file
    list, or by hunk boundaries for a single oversized file — and both halves
    are re-run, up to `max_splits` times.
-6. **Aggregate** — findings from all shards are deduplicated
-   (rule + location + message) and evaluated against the normal gating
-   rules; SARIF and a run summary are written.
+6. **Aggregate** — findings from all shards are deduplicated by `rule_id`,
+   normalized file path, and overlapping/adjacent line ranges (backfilling
+   missing evidence) and evaluated against the normal gating rules; SARIF
+   and a run summary are written.
 
 ## Configuration
 
@@ -45,6 +47,7 @@ task:
     max_files_per_shard: 8     # file-count cap per shard
     max_splits: 3              # bisect depth on incomplete retries
     context_lines: 20          # --unified context per hunk
+    concurrency: 1             # max concurrent shards (default 1; env CLAUSURA_SHARD_CONCURRENCY)
     on_shard_incomplete: bisect   # bisect | fail | pass
     per_shard:                 # budget overrides for each shard run
       token_budget: 300000
@@ -139,14 +142,23 @@ Typical CI policy:
 - `pass` — keep the shard's partial findings and continue; the run is still
   marked incomplete (exit 2 when no gate fails).
 
-## Limitations (v1)
+## Resuming sharded runs and MCP tools
 
-- Shards run serially (determinism, rate limits). A `concurrency` knob may
-  follow.
+- **Shard checkpoints (`--resume`)** — Each completed shard appends its record,
+  findings, and token usage to
+  `.clausura/archives/shard-checkpoint-<task_id>.jsonl`. Re-running with
+  `--resume` skips already-completed shards and reuses their saved findings
+  without re-billing them. Fresh runs clear stale checkpoints; exit-0 runs
+  clean up the checkpoint file unless archives are preserved.
+- **Persistent MCP tools** — Configured `mcp_servers` are started once per
+  sharded run in the workspace directory and shared across all shards (no
+  per-call cold restarts).
+
+## Limitations
+
 - The pre-scan is regex-based by design. Run MCP preflight checks
   (Semgrep, CodeQL, LSP) in a separate non-sharded task for semantic scanning.
-- MCP tools/preflight are not available inside shard runs. A sharded task
-  with configured preflight checks returns an error rather than skipping them.
+- Configured `preflight` checks are not run inside sharded tasks and return an
+  error rather than being silently skipped.
 - Each shard attempt starts with a fresh findings ledger; previous ledgers
-  are retained for audit. Checkpoint restoration and `--resume` are supported
-  by non-sharded tasks; the sharded summary JSON is the aggregate record.
+  are retained for audit.

@@ -282,18 +282,22 @@ task:
                                                # Supports local paths and named references.
 
   # Limits
-  token_budget: 32000                # Default. Context-window budget: older messages are
-                                     # truncated (and archived) when the conversation
-                                     # approaches this size.
+  token_budget: 32000                # Default. Context-window budget: older tool outputs are
+                                     # pruned in place first, then older messages are truncated
+                                     # (and archived) when the conversation approaches this size.
   max_total_tokens: 200000           # Optional. Cap on cumulative billed tokens across all
                                      # LLM calls in one run; the run stops (marked incomplete)
                                      # when reached. Unset means no cap.
+  max_output_tokens: 16384           # Optional. Per-response output token limit (Anthropic
+                                     # defaults to 16384).
+  temperature: 0.0                   # Optional. Sampling temperature (0.0..=2.0).
+  prompt_caching: true               # Default. Enable Anthropic prompt caching on system + tools.
   auto_compact: false                # Default. When true, dropped context is summarized with
                                      # an LLM call and injected back instead of a bare hint.
   max_compactions: 3                 # Default. Per-run cap on auto-compact calls. 0 disables.
-  findings_ledger: true              # Default. Persist interim findings to a disk ledger and
-                                     # merge them back before the final answer, so findings from
-                                     # truncated iterations are never lost.
+  findings_ledger: true              # Default. Persist interim and `report_finding` findings to
+                                     # a disk ledger and merge them back before the final answer,
+                                     # so findings from truncated iterations are never lost.
   timeout_secs: 300                  # Default. Max wall-clock time in seconds.
   max_iterations: 10                 # Default. Max agent loop iterations.
   shell_timeout_secs: 120            # Default. Per-command timeout for shell_exec.
@@ -376,6 +380,10 @@ open-ended analysis; verification only audits its output. Set the key via
 | `CLAUSURA_ON_INCOMPLETE` | `task.on_incomplete` |
 | `CLAUSURA_TOKEN_BUDGET` | `task.token_budget`  |
 | `CLAUSURA_MAX_TOTAL_TOKENS` | `task.max_total_tokens` |
+| `CLAUSURA_MAX_OUTPUT_TOKENS` | `task.max_output_tokens` |
+| `CLAUSURA_TEMPERATURE`  | `task.temperature`   |
+| `CLAUSURA_PROMPT_CACHING` | `task.prompt_caching` |
+| `CLAUSURA_SHARD_CONCURRENCY` | `task.sharding.concurrency` |
 | `CLAUSURA_TIMEOUT`      | `task.timeout_secs`  |
 | `CLAUSURA_SHELL_TIMEOUT` | `task.shell_timeout_secs` |
 | `CLAUSURA_MAX_ITERATIONS` | `task.max_iterations` |
@@ -533,7 +541,7 @@ task:
         GITHUB_TOKEN: "${GITHUB_TOKEN}"
 ```
 
-Clausura spawns each server at task start, performs the MCP initialize handshake, discovers available tools via `tools/list`, and registers them as `mcp__<server>__<tool>` in the agent's tool list.
+Clausura spawns each server once at task start inside the workspace directory, performs the MCP initialize handshake, discovers available tools via `tools/list`, registers them as `mcp__<server>__<tool>` in the agent's tool list, and keeps the server process alive across tool calls (with automatic reconnect on pipe errors and spill-backed truncation on oversized outputs). Configured MCP tools are also shared across sharded audit runs; only `preflight` checks require a separate non-sharded task.
 
 ### Preflight checks
 
@@ -618,7 +626,8 @@ Clausura Action** in the complete workflow above:
 ```
 
 The Action installs Clausura and executes the review once; it is not an
-install-only step. MCP tools/preflight currently require the non-sharded path.
+install-only step. Persistent MCP tools work in both single-task and sharded
+runs; `preflight` checks require the non-sharded path.
 
 ## Architecture
 
@@ -691,7 +700,7 @@ Each LLM request has its own per-request timeout (default 120s), independent of 
 
 ### Tool sandboxing
 
-Five built-in tools plus on-demand skill loading:
+Built-in tools plus on-demand skill loading and incremental finding persistence:
 
 | Tool          | Description                                      | Restrictions                           |
 |---------------|--------------------------------------------------|----------------------------------------|
@@ -701,6 +710,9 @@ Five built-in tools plus on-demand skill loading:
 | `git_diff`    | Run `git diff` with optional base ref, staged mode, a `path` filter for a single file's diff, and a `context` line count per hunk | Operates inside workspace only  |
 | `shell_exec`  | Execute an allowed command (argv form, no shell) | Restricted to `tool_allowlist` argv prefixes; dangerous flags denied; scrubbed env |
 | `read_skill`  | Load a configured review skill's full body by name (progressive disclosure) | Only serves skills resolved from `skill_prompts` at config load; no filesystem access |
+| `report_finding` | Persist a schema-validated finding incrementally during the loop (and warn on non-configured gating `rule_id`s) | Writes only to in-memory store and task ledger; no arbitrary filesystem access |
+
+Batches of multiple built-in read-only tool calls (`read_file`, `list_files`, `grep`, `git_diff`, `read_skill`) execute concurrently while preserving result order; side-effecting or external tools (`shell_exec`, `report_finding`, MCP) execute serially.
 
 The `shell_exec` tool is locked by default (empty allowlist = no commands). Explicitly list allowed commands to enable it. It takes an `argv` array (e.g. `{"argv": ["git", "status"]}`) and executes `argv[0]` directly **without a shell** — shell metacharacters like `;`, `|`, `$()` or `>` are passed through as literal arguments and have no effect, so they cannot be used to bypass the allowlist. Commands run with `current_dir` set to the workspace root, but allowed commands can access paths outside the workspace via arguments.
 
@@ -712,7 +724,7 @@ The `shell_exec` tool is locked by default (empty allowlist = no commands). Expl
 
 **Per-command timeout.** Each command is killed after `shell_timeout_secs` (default 120; override with `--shell-timeout` or `CLAUSURA_SHELL_TIMEOUT`) and the tool returns a `Command timed out after Ns and was killed` result.
 
-Tool outputs are truncated at 32 KB or 1000 lines (whichever comes first). For `git_diff`, `shell_exec`, `list_files` and `grep`, a spill store writes the *full* output to `{workspace}/.clausura/archives/tool-output-{task_id}-{seq}.txt`, and the truncated result carries a locator hint for paging with `read_file`. `read_file` itself instead points to the original file and the exact next `offset`, so unread lines are never misrepresented as a complete spill file. When no spill is available, the marker asks the agent to narrow the query or page with `offset`/`limit`.
+Tool outputs are truncated at 1000 lines or a dynamic byte limit scaled to `token_budget` (~25% of budget, clamped to `[2 KiB, 32 KiB]`), whichever comes first. For `git_diff`, `shell_exec`, `list_files`, `grep`, and MCP tools, a spill store writes the *full* output to `{workspace}/.clausura/archives/tool-output-{task_id}-{seq}.txt`, and the truncated result carries a locator hint for paging with `read_file`. `read_file` itself instead points to the original file and the exact next `offset`, so unread lines are never misrepresented as a complete spill file. When no spill is available, the marker asks the agent to narrow the query or page with `offset`/`limit`. When approaching `token_budget`, older oversized tool outputs are pruned in place (preserving a short preview and locator line, and leaving the latest tool batch intact) before falling back to full message truncation.
 
 The agent loop also detects **repeat tool calls** (same tool, same arguments — argument order normalized): at 3/5/8 identical consecutive invocations it injects an escalating advisory reminder, so the model breaks out of loops before `max_iterations` expires.
 

@@ -43,11 +43,15 @@ task:
   token_budget: 32000                # Context-window budget. Drives message truncation.
   max_total_tokens: 200000           # Optional. Cumulative token cap across all LLM calls.
                                      # Unset = no cap. When reached, run stops (incomplete).
+  max_output_tokens: 16384           # Optional. Per-response output token cap (Anthropic
+                                     # defaults to 16384; unset uses provider default for others).
+  temperature: 0.0                   # Optional. Sampling temperature in 0.0..=2.0.
+  prompt_caching: true               # Enable Anthropic prompt caching on system + tools.
   auto_compact: false                # Optional. Summarize dropped context with an LLM call
                                      # instead of a bare truncation hint.
   max_compactions: 3                 # Per-run cap on auto-compact calls. 0 disables.
-  findings_ledger: true              # Persist interim findings to a disk ledger and merge
-                                     # them back before the final answer (lossless memory).
+  findings_ledger: true              # Persist interim and `report_finding` findings to a disk
+                                     # ledger and merge them back before the final answer.
   timeout_secs: 300                  # Max wall-clock time for the entire run.
   max_iterations: 10                 # Max agent loop iterations (tool calls + LLM turns).
   shell_timeout_secs: 120            # Per-command timeout for shell_exec.
@@ -73,6 +77,7 @@ task:
     max_files_per_shard: 8           # File-count cap per shard.
     max_splits: 3                    # Bisect depth on incomplete retries.
     context_lines: 20                # --unified context per hunk in per-file diffs.
+    concurrency: 1                   # Max shards executed concurrently (default 1 = serial).
     on_shard_incomplete: bisect      # bisect | fail | pass.
     per_shard:                       # Budget overrides for each shard run.
       token_budget: 300000
@@ -224,6 +229,24 @@ task:
   max_total_tokens: 200000   # stop after $X worth of API calls
 ```
 
+### `task.max_output_tokens`
+
+**Default: unset (16384 for Anthropic; provider default for others).** Per-response output token cap forwarded to the provider as `max_tokens`. Useful for large multi-finding JSON responses where lower defaults risk truncation (`FinishReason::Length`).
+
+Env override: `CLAUSURA_MAX_OUTPUT_TOKENS`.
+
+### `task.temperature`
+
+**Default: unset (provider default).** Optional sampling temperature in `0.0..=2.0`. Set to `0.0` for more deterministic CI reviews.
+
+Env override: `CLAUSURA_TEMPERATURE`.
+
+### `task.prompt_caching`
+
+**Default: true.** Enables Anthropic prompt caching (`cache_control: {"type": "ephemeral"}`) on the system prompt and the final tool definition so multi-turn agent loops reuse cached prefixes. Ignored by non-Anthropic providers.
+
+Env override: `CLAUSURA_PROMPT_CACHING=false`.
+
 ### `task.auto_compact`
 
 **Default: false.** When the conversation exceeds `token_budget`, Clausura truncates older messages and injects a bare "context trimmed" hint. With `auto_compact: true`, the dropped messages are instead **summarized with one extra LLM call** and the summary is injected at the truncation boundary — the agent keeps remembering earlier findings, files examined, and decisions across truncation instead of relying on the `read_file`-the-archive hint.
@@ -357,6 +380,7 @@ normal gating rules.
 | `max_files_per_shard` | `8` | File-count cap per shard. |
 | `max_splits` | `3` | Bisect depth for incomplete shards. |
 | `context_lines` | `20` | `--unified` context per hunk (max 100). |
+| `concurrency` | `1` | Max shards executed concurrently (`CLAUSURA_SHARD_CONCURRENCY` overrides). |
 | `on_shard_incomplete` | `bisect` | `bisect`, `fail`, or `pass`. |
 | `per_shard` | (all unset) | `token_budget`, `max_total_tokens`, `max_iterations`, `timeout_secs` overrides per shard. |
 | `risk_patterns` | `{}` | Extra deterministic pre-scan patterns (tag → regex on added lines). |
@@ -386,12 +410,13 @@ An array of gating rules, evaluated in order. Each rule:
 ### `task.verify`
 
 **Default: disabled.** Optional fail-open filter that runs before gating:
-each finding is scored by a System One decision model (TypeSafe Jev) with a
+each agent-produced finding is scored by a System One decision model (TypeSafe Jev) with a
 yes/no question — *is this finding genuine and supported by its evidence?* —
 and findings below `threshold` are excluded from gating, SARIF, and the
 report (audited under `verification.filtered_findings` in the run summary).
-Request errors keep the finding; a missing API key skips verification with a
-warning.
+Deterministic `preflight` findings bypass probabilistic verification and always
+proceed to gating. Request errors keep the finding; a missing API key skips
+verification with a warning.
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -449,6 +474,13 @@ clausura snapshot delete --thread <ID>                   Delete all checkpoints 
 | `CLAUSURA_ON_INCOMPLETE` | `task.on_incomplete` | `fail` |
 | `CLAUSURA_TOKEN_BUDGET` | `task.token_budget` | `32000` |
 | `CLAUSURA_MAX_TOTAL_TOKENS` | `task.max_total_tokens` | `200000` |
+| `CLAUSURA_MAX_OUTPUT_TOKENS` | `task.max_output_tokens` | `16384` |
+| `CLAUSURA_TEMPERATURE` | `task.temperature` | `0.0` |
+| `CLAUSURA_PROMPT_CACHING` | `task.prompt_caching` | `false` |
+| `CLAUSURA_AUTO_COMPACT` | `task.auto_compact` | `true` |
+| `CLAUSURA_MAX_COMPACTIONS` | `task.max_compactions` | `3` |
+| `CLAUSURA_FINDINGS_LEDGER` | `task.findings_ledger` | `false` |
+| `CLAUSURA_SHARD_CONCURRENCY` | `task.sharding.concurrency` | `4` |
 | `CLAUSURA_TIMEOUT` | `task.timeout_secs` | `300` |
 | `CLAUSURA_SHELL_TIMEOUT` | `task.shell_timeout_secs` | `120` |
 | `CLAUSURA_MAX_ITERATIONS` | `task.max_iterations` | `10` |
