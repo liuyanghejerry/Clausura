@@ -174,9 +174,16 @@ struct McpClient {
     session: Arc<Mutex<McpSession>>,
 }
 
-/// Owns the live server process and spawn metadata needed to reconnect if the
-/// server exits unexpectedly.
-struct McpSession {
+/// Persistent MCP session over either a local stdio subprocess or a remote
+/// Streamable HTTP / SSE endpoint (MCP 2025-06-18).
+enum McpSession {
+    Stdio(Box<StdioSession>),
+    Http(HttpSession),
+}
+
+/// Owns the live stdio server process and spawn metadata needed to reconnect if
+/// the server exits unexpectedly.
+struct StdioSession {
     command: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
@@ -185,7 +192,272 @@ struct McpSession {
     live: Option<McpChild>,
 }
 
-impl McpSession {
+/// Remote Streamable HTTP / SSE MCP client session.
+struct HttpSession {
+    client: reqwest::Client,
+    url: String,
+    headers: Vec<(String, String)>,
+    session_id: Option<String>,
+    next_id: u64,
+    timeout_secs: u64,
+}
+
+impl HttpSession {
+    fn new(
+        url: String,
+        headers: Vec<(String, String)>,
+        timeout_secs: u64,
+    ) -> Result<Self, McpError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs.max(CONNECT_TIMEOUT_SECS)))
+            .build()
+            .map_err(|e| McpError::Io(format!("HTTP client init failed: {e}")))?;
+        Ok(Self {
+            client,
+            url,
+            headers,
+            session_id: None,
+            next_id: 1,
+            timeout_secs,
+        })
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Expand `${ENV_VAR}` placeholders in remote header values.
+    fn expand_env(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw;
+        while let Some(start) = rest.find("${") {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 2..];
+            if let Some(end) = after.find('}') {
+                let var_name = &after[..end];
+                if let Ok(val) = std::env::var(var_name) {
+                    out.push_str(&val);
+                }
+                rest = &after[end + 1..];
+            } else {
+                out.push_str("${");
+                rest = after;
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    async fn post_rpc(
+        &mut self,
+        payload: &Value,
+        expected_id: Option<u64>,
+        timeout_secs: u64,
+    ) -> Result<Option<Value>, McpError> {
+        let mut req = self
+            .client
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(ref sid) = self.session_id {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), Self::expand_env(v));
+        }
+
+        let resp =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), req.json(payload).send())
+                .await
+                .map_err(|_| {
+                    McpError::Timeout(format!("MCP HTTP request timed out after {timeout_secs}s"))
+                })?
+                .map_err(|e| McpError::Io(format!("MCP HTTP error: {e}")))?;
+
+        let status = resp.status();
+        if let Some(sid) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+        {
+            self.session_id = Some(sid.to_string());
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| McpError::Io(format!("MCP HTTP read error: {e}")))?;
+
+        if !status.is_success() {
+            return Err(McpError::Io(format!(
+                "MCP HTTP {}: {}",
+                status,
+                body.chars().take(300).collect::<String>()
+            )));
+        }
+
+        let Some(exp_id) = expected_id else {
+            return Ok(None);
+        };
+
+        let looks_like_sse = content_type.contains("text/event-stream")
+            || body.trim_start().starts_with("event:")
+            || body.trim_start().starts_with("data:");
+        let msg: Value = if looks_like_sse {
+            parse_sse_rpc_response(&body, exp_id)?
+        } else {
+            serde_json::from_str(&body)
+                .map_err(|e| McpError::Protocol(format!("MCP HTTP JSON parse: {e}")))?
+        };
+
+        if let Some(err) = msg.get("error") {
+            let code = err["code"].as_i64().unwrap_or(-1);
+            let message = err["message"].as_str().unwrap_or("unknown error");
+            return Err(McpError::RpcError {
+                code,
+                message: message.to_string(),
+            });
+        }
+        Ok(Some(msg))
+    }
+
+    async fn handshake(&mut self) -> Result<(), McpError> {
+        let init_id = self.next_id();
+        let init_req = serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": init_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "clausura",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }
+        });
+        let _ = self
+            .post_rpc(&init_req, Some(init_id), CONNECT_TIMEOUT_SECS)
+            .await?;
+
+        let notif = serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "method": "notifications/initialized",
+        });
+        let _ = self.post_rpc(&notif, None, CONNECT_TIMEOUT_SECS).await;
+        Ok(())
+    }
+
+    async fn list_tools(&mut self) -> Result<Vec<ToolDef>, McpError> {
+        let id = self.next_id();
+        let req = serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": id,
+            "method": "tools/list",
+            "params": {}
+        });
+        let resp = self
+            .post_rpc(&req, Some(id), CONNECT_TIMEOUT_SECS)
+            .await?
+            .ok_or_else(|| McpError::Protocol("tools/list returned empty response".into()))?;
+        parse_tools_list_response(&resp)
+    }
+
+    async fn call_tool(&mut self, tool_name: &str, args: Value) -> Result<String, McpError> {
+        let id = self.next_id();
+        let req = serde_json::json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": args,
+            }
+        });
+        let result = self
+            .post_rpc(&req, Some(id), self.timeout_secs)
+            .await?
+            .ok_or_else(|| {
+                McpError::Protocol(format!("tools/call '{tool_name}' empty response"))
+            })?;
+        extract_tool_call_output(tool_name, &result)
+    }
+}
+
+/// Extract the JSON-RPC response matching `expected_id` from a
+/// `text/event-stream` (SSE) payload.
+fn parse_sse_rpc_response(body: &str, expected_id: u64) -> Result<Value, McpError> {
+    let mut last_valid: Option<Value> = None;
+    for raw_line in body.lines() {
+        let Some(data) = raw_line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = data.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(payload) {
+            if val.get("id").and_then(|v| v.as_u64()) == Some(expected_id) {
+                return Ok(val);
+            }
+            if val.get("id").is_some() {
+                last_valid = Some(val);
+            }
+        }
+    }
+    last_valid.ok_or_else(|| {
+        McpError::Protocol("SSE stream contained no matching JSON-RPC response".into())
+    })
+}
+
+fn parse_tools_list_response(resp: &Value) -> Result<Vec<ToolDef>, McpError> {
+    let tools_array = resp["result"]["tools"]
+        .as_array()
+        .ok_or_else(|| McpError::Protocol("tools/list: missing 'tools' array".into()))?;
+
+    let mut tools = Vec::with_capacity(tools_array.len());
+    for t in tools_array {
+        let name = t["name"]
+            .as_str()
+            .ok_or_else(|| McpError::Protocol("tool missing 'name'".into()))?
+            .to_string();
+        let description = t["description"].as_str().unwrap_or("").to_string();
+        let parameters = t
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+
+        tools.push(ToolDef {
+            name,
+            description,
+            parameters,
+        });
+    }
+    Ok(tools)
+}
+
+fn extract_tool_call_output(tool_name: &str, result: &Value) -> Result<String, McpError> {
+    if result["result"]["isError"].as_bool() == Some(true) {
+        return Err(McpError::Protocol(format!(
+            "Tool '{tool_name}' reported an error: {}",
+            extract_text_content(&result["result"]["content"]).unwrap_or_default()
+        )));
+    }
+    let content = &result["result"]["content"];
+    Ok(extract_text_content(content).unwrap_or_else(|| result.to_string()))
+}
+
+impl StdioSession {
     async fn ensure_connected(&mut self) -> Result<&mut McpChild, McpError> {
         if self.live.is_none() {
             let mut child = spawn_server(
@@ -245,50 +517,68 @@ impl McpSession {
             Err(e) => return Err(e),
         };
 
-        if result["result"]["isError"].as_bool() == Some(true) {
-            return Err(McpError::Protocol(format!(
-                "Tool '{tool_name}' reported an error: {}",
-                extract_text_content(&result["result"]["content"]).unwrap_or_default()
-            )));
-        }
-
-        let content = &result["result"]["content"];
-        let text = extract_text_content(content).unwrap_or_else(|| result.to_string());
-        Ok(text)
+        extract_tool_call_output(tool_name, &result)
     }
+}
 
-    /// Execute a tool call on the persistent session, reconnecting once if the
-    /// underlying server process closed its stdio pipes unexpectedly.
+impl McpSession {
+    /// Execute a tool call on the persistent session, reconnecting once if a
+    /// stdio server process closed its pipes unexpectedly.
     async fn call_tool(
         session: &Arc<Mutex<McpSession>>,
         tool_name: &str,
         args: Value,
     ) -> Result<String, McpError> {
         let mut guard = session.lock().await;
-        match guard.call_tool_once(tool_name, args.clone()).await {
-            Ok(output) => Ok(output),
-            Err(McpError::Io(first_err)) => {
-                tracing::warn!(
-                    tool = tool_name,
-                    error = %first_err,
-                    "MCP server connection lost; reconnecting once"
-                );
-                guard.live = None;
-                guard.call_tool_once(tool_name, args).await
-            }
-            Err(e) => Err(e),
+        match &mut *guard {
+            McpSession::Stdio(stdio) => match stdio.call_tool_once(tool_name, args.clone()).await {
+                Ok(output) => Ok(output),
+                Err(McpError::Io(first_err)) => {
+                    tracing::warn!(
+                        tool = tool_name,
+                        error = %first_err,
+                        "MCP server connection lost; reconnecting once"
+                    );
+                    stdio.live = None;
+                    stdio.call_tool_once(tool_name, args).await
+                }
+                Err(e) => Err(e),
+            },
+            McpSession::Http(http) => http.call_tool(tool_name, args).await,
         }
     }
 }
 
 impl McpClient {
-    /// Spawn the server, perform initialize handshake, discover tools, and keep
-    /// the initialized child alive in a persistent session.
+    /// Connect to an MCP server over either remote Streamable HTTP (`cfg.url`)
+    /// or a local persistent stdio subprocess (`cfg.command`), perform the
+    /// initialize handshake, and discover tools.
     async fn connect(
         cfg: &McpServerConfig,
         tool_timeout_secs: u64,
         workspace_root: Option<PathBuf>,
     ) -> Result<Self, McpError> {
+        if let Some(ref url) = cfg.url {
+            if !url.trim().is_empty() {
+                let headers: Vec<(String, String)> = cfg
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let mut http = HttpSession::new(url.clone(), headers, tool_timeout_secs)?;
+                http.handshake().await?;
+                let tools = http.list_tools().await?;
+                if tools.is_empty() {
+                    return Err(McpError::Protocol("MCP server returned no tools".into()));
+                }
+                return Ok(Self {
+                    name: cfg.name.clone(),
+                    tools,
+                    session: Arc::new(Mutex::new(McpSession::Http(http))),
+                });
+            }
+        }
+
         let env: Vec<(String, String)> = cfg
             .env
             .iter()
@@ -316,14 +606,14 @@ impl McpClient {
             return Err(McpError::Protocol("MCP server returned no tools".into()));
         }
 
-        let session = Arc::new(Mutex::new(McpSession {
+        let session = Arc::new(Mutex::new(McpSession::Stdio(Box::new(StdioSession {
             command: cfg.command.clone(),
             args: cfg.args.clone(),
             env,
             workspace_root,
             timeout_secs: tool_timeout_secs,
             live: Some(child),
-        }));
+        }))));
 
         Ok(Self {
             name: cfg.name.clone(),
@@ -766,6 +1056,8 @@ while True:
                 tool_desc.into(),
             ],
             env: std::collections::HashMap::new(),
+            url: None,
+            headers: std::collections::HashMap::new(),
         }
     }
 
@@ -856,6 +1148,8 @@ while True:
                 "Read env var".into(),
             ],
             env,
+            url: None,
+            headers: std::collections::HashMap::new(),
         };
 
         let manager = McpClientManager::start(&[cfg], 30)
@@ -902,6 +1196,8 @@ while True:
             command: "nonexistent-command-xyz-12345".into(),
             args: vec![],
             env: std::collections::HashMap::new(),
+            url: None,
+            headers: std::collections::HashMap::new(),
         };
 
         let manager = McpClientManager::start(&[cfg], 30).await;
@@ -1081,5 +1377,97 @@ while True:
             out.contains("saved to .clausura/archives/tool-output-mcp-spill-1.txt"),
             "oversized MCP output must spill to disk, got: {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_remote_streamable_http_json_and_session_header() {
+        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/mcp"))
+            .and(matchers::header("x-custom-token", "secret-val"))
+            .and(matchers::body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("mcp-session-id", "sess-42")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": {"name": "remote", "version": "1.0"}
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/mcp"))
+            .and(matchers::header("mcp-session-id", "sess-42"))
+            .and(matchers::body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/mcp"))
+            .and(matchers::header("mcp-session-id", "sess-42"))
+            .and(matchers::body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "tools": [{
+                        "name": "scan",
+                        "description": "Remote scan",
+                        "inputSchema": {"type": "object"}
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/mcp"))
+            .and(matchers::header("mcp-session-id", "sess-42"))
+            .and(matchers::body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"remote-ok\"}]}}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Custom-Token".into(), "secret-val".into());
+        let cfg = McpServerConfig {
+            name: "remote".into(),
+            command: String::new(),
+            args: vec![],
+            env: std::collections::HashMap::new(),
+            url: Some(format!("{}/mcp", server.uri())),
+            headers,
+        };
+
+        let manager = McpClientManager::start(&[cfg], 10)
+            .await
+            .expect("remote HTTP MCP server should connect");
+        let mut reg = ToolRegistry::new();
+        manager.register_all(&mut reg);
+
+        let tool = reg
+            .get("mcp__remote__scan")
+            .expect("remote tool registered");
+        let out = tool.execute(json!({"path": "src"})).await.unwrap();
+        assert_eq!(out, "remote-ok");
     }
 }

@@ -44,6 +44,14 @@ pub struct Config {
     /// `status`, `reason`, findings count, exit code, token usage, and
     /// duration. `None` disables the summary (non-sharded default).
     pub summary: Option<PathBuf>,
+    /// Optional path for a rendered Markdown review report (`--markdown`).
+    pub markdown: Option<PathBuf>,
+    /// Optional baseline JSON file (`--baseline`); matching legacy findings are
+    /// excluded from gating so only newly introduced findings block CI.
+    pub baseline: Option<PathBuf>,
+    /// Optional path to write the current findings as a baseline file
+    /// (`--write-baseline`).
+    pub write_baseline: Option<PathBuf>,
     /// Explicit committed review range (merge-base SHA, head SHA), set by `--base`.
     pub review_range: Option<(String, String)>,
     /// Whether to resume from a previous checkpoint.
@@ -125,16 +133,25 @@ struct YamlGateRule {
     min_severity: String,
     max_findings: u32,
     action: String,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    exclude_paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct YamlMcpServerConfig {
     name: String,
+    #[serde(default)]
     command: String,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    headers: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -346,7 +363,8 @@ fn validate_yaml(yaml: &YamlConfig) -> Result<(), ConfigError> {
             "task.timeout_secs must be > 0".into(),
         ));
     }
-    // Validate MCP server names are non-empty and unique.
+    // Validate MCP server names are non-empty, unique, and specify either
+    // a stdio `command` or a remote `url` (mutually exclusive).
     {
         let mut seen = std::collections::HashSet::new();
         for s in &yaml.task.mcp_servers {
@@ -358,6 +376,20 @@ fn validate_yaml(yaml: &YamlConfig) -> Result<(), ConfigError> {
             if !seen.insert(&s.name) {
                 return Err(ConfigError::ValidationError(format!(
                     "Duplicate MCP server name: '{}'",
+                    s.name
+                )));
+            }
+            let has_cmd = !s.command.trim().is_empty();
+            let has_url = s.url.as_deref().is_some_and(|u| !u.trim().is_empty());
+            if !has_cmd && !has_url {
+                return Err(ConfigError::ValidationError(format!(
+                    "MCP server '{}': must specify either 'command' or 'url'",
+                    s.name
+                )));
+            }
+            if has_cmd && has_url {
+                return Err(ConfigError::ValidationError(format!(
+                    "MCP server '{}': specify either 'command' or 'url', not both",
                     s.name
                 )));
             }
@@ -624,6 +656,8 @@ impl Config {
                 min_severity: parse_severity(&g.min_severity),
                 max_findings: g.max_findings,
                 action: parse_gate_action(&g.action),
+                paths: g.paths.clone(),
+                exclude_paths: g.exclude_paths.clone(),
             })
             .collect();
 
@@ -682,6 +716,8 @@ impl Config {
                         command: s.command,
                         args: s.args,
                         env: s.env,
+                        url: s.url,
+                        headers: s.headers,
                     })
                     .collect(),
                 preflight: yaml_task
@@ -735,6 +771,9 @@ impl Config {
             workspace,
             output,
             summary: None,
+            markdown: None,
+            baseline: None,
+            write_baseline: None,
             review_range: None,
             resume,
             log_format,

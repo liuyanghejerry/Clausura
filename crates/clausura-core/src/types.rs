@@ -155,6 +155,12 @@ pub struct GateRule {
     pub min_severity: Severity,
     pub max_findings: u32,
     pub action: GateAction,
+    /// Optional include path globs (empty = match all files).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// Optional exclude path globs (e.g. `tests/**`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_paths: Vec<String>,
 }
 
 /// Rule evaluation violation
@@ -172,6 +178,10 @@ pub struct RuleViolation {
 pub struct GateResult {
     pub exit_code: u32,
     pub violations: Vec<RuleViolation>,
+    /// Distinct `rule_id`s of Warning/Error findings that did not match any
+    /// configured gating rule (surfaced as a warning to catch typos).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ungated_high_severity_rules: Vec<String>,
 }
 
 /// Ambiguity policy
@@ -518,11 +528,23 @@ fn default_shard_context_lines() -> u32 {
     20
 }
 
-/// Findings verification via a System One decision model (e.g. TypeSafe Jev).
+/// Backend used for optional pre-gating findings verification.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum VerifyProvider {
+    /// TypeSafe Jev System One decision model (default, backward compatible).
+    #[default]
+    Jev,
+    /// LLM-as-a-Judge verifier that inspects surrounding source code lines.
+    Llm,
+}
+
+/// Findings verification via a System One decision model (e.g. TypeSafe Jev)
+/// or an LLM-as-a-Judge verifier inspecting surrounding source code.
 ///
-/// When enabled, every finding is scored with a yes/no question ("is this
-/// finding genuine and supported by its own evidence?") and findings whose
-/// calibrated probability falls below `threshold` are excluded from gating.
+/// When enabled, every finding is scored and findings whose probability of
+/// being genuine falls below `threshold` are excluded from gating.
 /// Verification is fail-open: call failures keep the finding, and a missing
 /// API key disables verification with a warning instead of failing the run.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -530,16 +552,23 @@ pub struct VerifyConfig {
     /// Master switch. Default false.
     #[serde(default)]
     pub enabled: bool,
+    /// Verification backend (`jev` or `llm`). Default `jev`.
+    #[serde(default)]
+    pub provider: VerifyProvider,
     /// Keep-threshold on P(finding is genuine), in [0, 1]. Default 0.5.
     #[serde(default = "default_verify_threshold")]
     pub threshold: f64,
-    /// Decision model id. Default `jev-latest`.
+    /// Decision or judge model id. Default `jev-latest` (for `provider: llm`,
+    /// omit or leave default to reuse the main task's provider/model).
     #[serde(default = "default_verify_model")]
     pub model: String,
-    /// API base URL; the `/v1/systemone` endpoint path is appended to it.
+    /// Optional vendor override when `provider: llm` uses a separate judge model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<VendorConfig>,
+    /// API base URL for `jev`; `/v1/systemone` is appended to it.
     #[serde(default = "default_verify_base_url")]
     pub base_url: String,
-    /// Env var holding the decision-model API key. Default `TYPESAFE_API_KEY`.
+    /// Env var holding the verifier API key. Default `TYPESAFE_API_KEY` for `jev`.
     #[serde(default = "default_verify_api_key_env")]
     pub api_key_env: String,
     /// Per-request timeout in seconds. Default 30.
@@ -549,20 +578,31 @@ pub struct VerifyConfig {
     /// unverified. Default 100.
     #[serde(default = "default_verify_max_findings")]
     pub max_findings: usize,
+    /// Lines of source code context before and after `finding.location` passed
+    /// to `provider: llm`. Default 15.
+    #[serde(default = "default_verify_context_lines")]
+    pub context_lines: usize,
 }
 
 impl Default for VerifyConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: VerifyProvider::default(),
             threshold: default_verify_threshold(),
             model: default_verify_model(),
+            vendor: None,
             base_url: default_verify_base_url(),
             api_key_env: default_verify_api_key_env(),
             timeout_secs: default_verify_timeout_secs(),
             max_findings: default_verify_max_findings(),
+            context_lines: default_verify_context_lines(),
         }
     }
+}
+
+fn default_verify_context_lines() -> usize {
+    15
 }
 
 fn default_verify_threshold() -> f64 {
@@ -826,13 +866,14 @@ pub enum ConfigError {
 
 /// Configuration for a single MCP (Model Context Protocol) server.
 ///
-/// Describes how to spawn and communicate with an external MCP server
-/// process over stdio transport.
+/// Supports either a local stdio process (`command` + `args` + `env`) or a
+/// remote Streamable HTTP / SSE server (`url` + `headers`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct McpServerConfig {
     /// Unique name for this server (used as tool prefix).
     pub name: String,
-    /// Command to spawn the MCP server process.
+    /// Command to spawn a local stdio MCP server process.
+    #[serde(default)]
     pub command: String,
     /// Arguments passed to the command.
     #[serde(default)]
@@ -840,6 +881,12 @@ pub struct McpServerConfig {
     /// Environment variables injected into the server process.
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Optional remote Streamable HTTP / SSE MCP endpoint URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Optional HTTP headers sent with remote MCP requests (supports `${ENV_VAR}` expansion).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 /// A preflight check — an MCP tool call that runs *before* the agent loop.

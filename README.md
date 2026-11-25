@@ -136,7 +136,7 @@ Uses the OpenAI-compatible API format (`/chat/completions`) with configurable ba
 
 ### 1. Create a configuration file
 
-Create `.clausura.yaml` (or `.clausura.yml`) in your project root:
+Run `clausura init` (auto-detects Rust, TypeScript/JS, Python, or Go and scaffolds `.clausura.yaml`, a starter skill, and optionally `--with-workflow` for GitHub Actions), or create `.clausura.yaml` (or `.clausura.yml`) manually in your project root:
 
 ```yaml
 version: "1"
@@ -409,6 +409,9 @@ clausura run [OPTIONS]
       --workspace <PATH>    Workspace root            [default: cwd]
       --output <PATH>       SARIF output path          [default: clausura-output.sarif]
       --summary <PATH>      Machine-readable run summary JSON (status, reason, findings count, usage)
+      --markdown <PATH>     Developer-friendly Markdown review report (GitHub Step Summary / PR comment)
+      --baseline <PATH>     Filter out legacy findings matching a saved baseline JSON
+      --write-baseline <P>  Write current findings as a baseline JSON file
       --resume              Resume from last checkpoint
       --log-format <FMT>    Log format (json|pretty)   [default: json]
       --dry-run             Validate config and print the execution plan
@@ -539,6 +542,10 @@ task:
       args: ["-y", "@anthropic/mcp-server-github"]
       env:
         GITHUB_TOKEN: "${GITHUB_TOKEN}"
+    - name: remote-scanner
+      url: "https://mcp.internal.company.com/mcp"
+      headers:
+        Authorization: "Bearer ${SCANNER_TOKEN}"
 ```
 
 Clausura spawns each server once at task start inside the workspace directory, performs the MCP initialize handshake, discovers available tools via `tools/list`, registers them as `mcp__<server>__<tool>` in the agent's tool list, and keeps the server process alive across tool calls (with automatic reconnect on pipe errors and spill-backed truncation on oversized outputs). Configured MCP tools are also shared across sharded audit runs; only `preflight` checks require a separate non-sharded task.

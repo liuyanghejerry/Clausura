@@ -38,6 +38,14 @@ inputs:
   timeout:
     description: 'Override timeout in seconds'
     required: false
+  post_pr_comment:
+    description: 'Post or update a Markdown review summary comment on the pull request'
+    required: false
+    default: 'false'
+  github_token:
+    description: 'GitHub token with pull-requests:write permission (used when post_pr_comment is true)'
+    required: false
+    default: ${{ github.token }}
 
 outputs:
   exit_code:
@@ -122,6 +130,8 @@ runs:
         INPUT_VENDOR: ${{ inputs.vendor }}
         INPUT_TOKEN_BUDGET: ${{ inputs.token_budget }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_POST_PR_COMMENT: ${{ inputs.post_pr_comment }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github_token }}
       run: bash "$GITHUB_ACTION_PATH/scripts/run-action.sh"
 
     - name: Upload review reports
