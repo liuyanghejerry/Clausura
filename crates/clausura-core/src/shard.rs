@@ -153,6 +153,17 @@ fn bisect_file_hunks(file: &FileDiff) -> Option<(FileDiff, FileDiff)> {
 /// Build the shard manifest for the agent's initial message: per-file
 /// metadata plus the deterministic pre-scan hotspots.
 pub fn build_manifest(shard: &Shard, risk_hits: &[RiskHit]) -> String {
+    build_manifest_with_overview(shard, risk_hits, &[])
+}
+
+/// Build the shard manifest, optionally including a compact list of all
+/// changed files in the PR so the reviewer has cross-file awareness without
+/// reading the entire repository.
+pub fn build_manifest_with_overview(
+    shard: &Shard,
+    risk_hits: &[RiskHit],
+    all_pr_files: &[String],
+) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(
@@ -196,7 +207,97 @@ pub fn build_manifest(shard: &Shard, risk_hits: &[RiskHit]) -> String {
             let _ = writeln!(out, "- {}:{} [{}] {}", h.file, h.line, h.tag, h.snippet);
         }
     }
+
+    if all_pr_files.len() > shard.files.len() {
+        const MAX_OVERVIEW_FILES: usize = 60;
+        let _ = writeln!(
+            out,
+            "\nPR CHANGED FILES ({} total; inspect outside this shard only if needed to validate a finding):",
+            all_pr_files.len()
+        );
+        for f in all_pr_files.iter().take(MAX_OVERVIEW_FILES) {
+            let _ = writeln!(out, "- {f}");
+        }
+        if all_pr_files.len() > MAX_OVERVIEW_FILES {
+            let _ = writeln!(
+                out,
+                "- ... (+{} more files)",
+                all_pr_files.len() - MAX_OVERVIEW_FILES
+            );
+        }
+    }
     out
+}
+
+/// Split a multi-file `git diff` output into per-file [`FileDiff`] entries in
+/// a single pass, avoiding per-file `git diff` subprocess invocations.
+/// Skips Clausura's own config/archive files.
+pub fn split_unified_diff_by_file(full_diff: &str) -> Vec<FileDiff> {
+    let mut sections: Vec<String> = Vec::new();
+    for line in full_diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            sections.push(String::new());
+        }
+        if let Some(cur) = sections.last_mut() {
+            cur.push_str(line);
+        }
+    }
+
+    let mut out = Vec::with_capacity(sections.len());
+    for section in sections {
+        let Some(path) = extract_diff_section_path(&section) else {
+            continue;
+        };
+        if path.is_empty()
+            || path == ".clausura.yaml"
+            || path == ".clausura.yml"
+            || path.starts_with(".clausura/")
+        {
+            continue;
+        }
+        out.push(FileDiff::new(path, section));
+    }
+    out
+}
+
+/// Extract the workspace-relative file path from one `diff --git ...` section.
+fn extract_diff_section_path(section: &str) -> Option<String> {
+    let mut from_minus: Option<String> = None;
+    for line in section.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let p = unquote_git_path(rest.trim());
+            if p != "/dev/null" {
+                return Some(p.strip_prefix("b/").unwrap_or(&p).to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            let p = unquote_git_path(rest.trim());
+            if p != "/dev/null" {
+                from_minus = Some(p.strip_prefix("a/").unwrap_or(&p).to_string());
+            }
+        } else if line.starts_with("@@") {
+            break;
+        }
+    }
+    if let Some(p) = from_minus {
+        return Some(p);
+    }
+    // Fallback for binary/mode-only diffs without --- / +++ lines:
+    // parse `diff --git a/<p> b/<p>`.
+    let header = section.lines().next()?.strip_prefix("diff --git ")?;
+    if let Some(idx) = header.rfind(" b/") {
+        return Some(unquote_git_path(&header[idx + 3..]));
+    }
+    None
+}
+
+fn unquote_git_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        serde_json::from_str::<String>(trimmed)
+            .unwrap_or_else(|_| trimmed[1..trimmed.len() - 1].to_string())
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Extract the min/max added line numbers from a unified diff.
@@ -378,5 +479,49 @@ mod tests {
         let manifest = build_manifest(&shard, &[]);
         assert!(manifest.contains("RISK_TAGS: (none)"));
         assert!(manifest.contains("none flagged by the deterministic pre-scan"));
+    }
+
+    #[test]
+    fn test_build_manifest_with_pr_overview() {
+        let shard = Shard {
+            files: vec![file("src/a.ts", 50)],
+        };
+        let all_files = vec![
+            "src/a.ts".to_string(),
+            "src/b.ts".to_string(),
+            "src/c.ts".to_string(),
+        ];
+        let manifest = build_manifest_with_overview(&shard, &[], &all_files);
+        assert!(manifest.contains("PR CHANGED FILES (3 total"));
+        assert!(manifest.contains("- src/b.ts"));
+        assert!(manifest.contains("- src/c.ts"));
+    }
+
+    #[test]
+    fn test_split_unified_diff_by_file_parses_multiple_and_skips_clausura() {
+        let full = "\
+diff --git a/src/a.ts b/src/a.ts
+--- a/src/a.ts
++++ b/src/a.ts
+@@ -1,2 +1,3 @@
+ line1
++added_a
+diff --git a/.clausura.yaml b/.clausura.yaml
+--- a/.clausura.yaml
++++ b/.clausura.yaml
+@@ -1 +1 @@
++version: 1
+diff --git a/src/deleted.ts b/src/deleted.ts
+--- a/src/deleted.ts
++++ /dev/null
+@@ -1,2 +0,0 @@
+-gone
+";
+        let diffs = split_unified_diff_by_file(full);
+        assert_eq!(diffs.len(), 2);
+        assert_eq!(diffs[0].path, "src/a.ts");
+        assert!(diffs[0].diff.contains("+added_a"));
+        assert_eq!(diffs[1].path, "src/deleted.ts");
+        assert_eq!(diffs[1].changed_lines, None);
     }
 }

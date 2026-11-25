@@ -207,12 +207,13 @@ fn skill_description(body: &str) -> String {
         })
         .unwrap_or("")
         .trim();
-    let mut desc = first.to_string();
-    if desc.len() > 160 {
-        desc.truncate(157);
+    if first.chars().count() > 160 {
+        let mut desc: String = first.chars().take(157).collect();
         desc.push_str("...");
+        desc
+    } else {
+        first.to_string()
     }
-    desc
 }
 
 // ---------------------------------------------------------------------------
@@ -417,5 +418,14 @@ mod tests {
         // "trailing/" should normalize to "trailing/SKILL.md"
         let result = resolve_skill("trailing/", tmp.path()).unwrap();
         assert_eq!(result, "body");
+    }
+
+    #[test]
+    fn test_skill_description_truncates_multibyte_utf8_without_panic() {
+        let long_cjk = "检查代码中的安全漏洞和潜在性能问题".repeat(20);
+        assert!(long_cjk.chars().count() > 160);
+        let desc = skill_description(&long_cjk);
+        assert!(desc.ends_with("..."));
+        assert_eq!(desc.chars().count(), 160);
     }
 }

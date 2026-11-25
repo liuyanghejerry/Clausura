@@ -493,6 +493,13 @@ pub struct ShardingConfig {
     /// Extra risk-scanner patterns: tag → regex (matched on added lines).
     #[serde(default)]
     pub risk_patterns: std::collections::BTreeMap<String, String>,
+    /// Max shards executed concurrently. Default 1 (serial).
+    #[serde(default = "default_shard_concurrency")]
+    pub concurrency: usize,
+}
+
+fn default_shard_concurrency() -> usize {
+    1
 }
 
 fn default_max_diff_bytes() -> usize {
@@ -629,6 +636,18 @@ pub struct TaskContract {
     /// incomplete. `None` means no cap.
     #[serde(default)]
     pub max_total_tokens: Option<u64>,
+    /// Optional per-response output token limit forwarded to the provider.
+    /// For Anthropic, overrides the default 16384 `max_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Optional sampling temperature (0.0..=2.0). Unset uses the provider
+    /// default. Set to `0.0` for more deterministic CI runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Enable Anthropic prompt caching (`cache_control: {"type": "ephemeral"}`)
+    /// on system prompt and tool definitions. Default true.
+    #[serde(default = "default_prompt_caching")]
+    pub prompt_caching: bool,
     /// When true, the agent loop summarizes messages dropped by context
     /// truncation with an LLM call and injects the summary at the truncation
     /// boundary instead of a bare "context trimmed" hint. Default false.
@@ -691,6 +710,10 @@ fn default_max_compactions() -> u32 {
 }
 
 fn default_findings_ledger() -> bool {
+    true
+}
+
+fn default_prompt_caching() -> bool {
     true
 }
 
@@ -1021,6 +1044,9 @@ mod tests {
             tool_allowlist: vec![],
             token_budget: 32000,
             max_total_tokens: None,
+            max_output_tokens: None,
+            temperature: None,
+            prompt_caching: true,
             auto_compact: false,
             max_compactions: 3,
             findings_ledger: true,

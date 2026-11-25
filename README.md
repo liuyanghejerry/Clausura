@@ -279,8 +279,7 @@ task:
   # Prompt
   prompt_template: "{{task_description}}"  # Default. The agent's system prompt.
   skill_prompts: []                           # Optional. Reuse community skill files.
-                                               # Supports local paths, named references,
-                                               # and remote URLs.
+                                               # Supports local paths and named references.
 
   # Limits
   token_budget: 32000                # Default. Context-window budget: older messages are
@@ -799,7 +798,7 @@ clausura/
 ### Dependencies
 
 - **CLI**: clap (arg parsing), colored + atty (terminal output)
-- **Core**: tokio (async), serde/serde_json/serde_yaml (serialization), reqwest (HTTP), tiktoken-rs (token counting), rusqlite (checkpoints), rmp-serde (binary serialization), regex-lite (grep pattern matching)
+- **Core**: tokio (async), serde/serde_json/serde_yaml (serialization), reqwest (HTTP), rusqlite (checkpoints), rmp-serde (binary serialization), regex-lite (grep pattern matching)
 - **LLM**: OpenAI-compatible chat completions API (works with OpenAI, DeepSeek, Groq, Ollama, etc.)
 
 ## License

@@ -6,10 +6,10 @@
 # Security advisories are also gated by `cargo audit` (see .cargo/audit.toml).
 # Keep both ignore lists in sync; leave empty by default.
 #
-# RUSTSEC-2024-0449 is an unmaintained-crate notice for unsafe-libyaml,
-# reached through serde_yaml. It is not a vulnerability and has no fixed
-# upgrade; exempt it until the YAML dependency is replaced.
-ignore = ["RUSTSEC-2024-0449"]
+# RUSTSEC-2026-0543 is an unmaintained-crate notice for chrono (not a
+# vulnerability; no fixed upgrade is available). Exempt it until chrono is
+# migrated to jiff/time.
+ignore = ["RUSTSEC-2026-0543"]
 
 [bans]
 # The tree retains some intentional minor-version duplicates (mostly windows-*

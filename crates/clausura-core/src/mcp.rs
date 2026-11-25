@@ -5,10 +5,11 @@
 //!
 //! Protocol: JSON-RPC 2.0 over stdio transport, MCP spec 2025-06-18.
 
-use crate::tools::ToolRegistry;
+use crate::tools::{SpillStore, ToolRegistry};
 use crate::types::{McpServerConfig, ToolDef, ToolError};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -44,19 +45,31 @@ impl McpClientManager {
     /// Servers that fail to start or handshake are silently skipped (a warning is
     /// logged). Returns `None` when the config list is empty.
     pub async fn start(servers: &[McpServerConfig], tool_timeout_secs: u64) -> Option<Self> {
+        Self::start_in_workspace(servers, tool_timeout_secs, None).await
+    }
+
+    /// Start all configured MCP servers with `current_dir` set to `workspace`
+    /// (when provided), keeping each server process alive for the lifetime of
+    /// the manager so stateful servers (e.g. LSP bridges) retain their indexes.
+    pub async fn start_in_workspace(
+        servers: &[McpServerConfig],
+        tool_timeout_secs: u64,
+        workspace: Option<&Path>,
+    ) -> Option<Self> {
         if servers.is_empty() {
             return None;
         }
 
+        let workspace_buf = workspace.map(Path::to_path_buf);
         let mut clients = Vec::with_capacity(servers.len());
 
         for cfg in servers {
-            match McpClient::connect(cfg, tool_timeout_secs).await {
+            match McpClient::connect(cfg, tool_timeout_secs, workspace_buf.clone()).await {
                 Ok(client) => {
                     tracing::info!(
                         server = %cfg.name,
                         tool_count = client.tools.len(),
-                        "MCP server connected"
+                        "MCP server connected (persistent session)"
                     );
                     clients.push(client);
                 }
@@ -79,15 +92,25 @@ impl McpClientManager {
 
     /// Register all discovered MCP tools into the given `ToolRegistry`.
     pub fn register_all(&self, registry: &mut ToolRegistry) {
+        self.register_all_with_spill(registry, None);
+    }
+
+    /// Register all discovered MCP tools into `registry`, applying `spill`
+    /// truncation to oversized tool outputs when provided.
+    pub fn register_all_with_spill(
+        &self,
+        registry: &mut ToolRegistry,
+        spill: Option<Arc<SpillStore>>,
+    ) {
         for client in &self.clients {
-            let shared = Arc::new(Mutex::new(client.clone_channel()));
             for tool in &client.tools {
                 let adapter = McpToolAdapter {
-                    server_name: client.name.clone(),
+                    full_name: format!("mcp__{}__{}", client.name, tool.name),
+                    full_description: format!("[MCP:{}] {}", client.name, tool.description),
                     tool_name: tool.name.clone(),
-                    description: tool.description.clone(),
                     parameters: tool.parameters.clone(),
-                    client: shared.clone(),
+                    session: client.session.clone(),
+                    spill: spill.clone(),
                 };
                 registry.register(adapter);
             }
@@ -114,8 +137,7 @@ impl McpClientManager {
                     server_name
                 ))
             })?;
-        let channel = client.clone_channel();
-        McpClient::call_tool(&channel, tool_name, args)
+        McpSession::call_tool(&client.session, tool_name, args)
             .await
             .map_err(|e| {
                 ToolError::ExecutionFailed(format!(
@@ -139,36 +161,141 @@ impl McpClientManager {
 }
 
 // ---------------------------------------------------------------------------
-// McpClient
+// McpClient & Persistent McpSession
 // ---------------------------------------------------------------------------
 
-/// A live connection to a single MCP server over stdio.
+/// A persistent connection to a single MCP server over stdio.
 struct McpClient {
     /// Server name from config.
     name: String,
     /// Tools discovered via `tools/list`.
     tools: Vec<ToolDef>,
-    /// Command and args to re-spawn channel-clone connections.
+    /// Shared persistent session (reuses the spawned server process across calls).
+    session: Arc<Mutex<McpSession>>,
+}
+
+/// Owns the live server process and spawn metadata needed to reconnect if the
+/// server exits unexpectedly.
+struct McpSession {
     command: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
-    /// Per-call timeout for tool execution.
-    tool_timeout_secs: u64,
+    workspace_root: Option<PathBuf>,
+    timeout_secs: u64,
+    live: Option<McpChild>,
+}
+
+impl McpSession {
+    async fn ensure_connected(&mut self) -> Result<&mut McpChild, McpError> {
+        if self.live.is_none() {
+            let mut child = spawn_server(
+                &self.command,
+                &self.args,
+                &self.env,
+                self.workspace_root.as_deref(),
+            )?;
+            tokio::time::timeout(
+                Duration::from_secs(CONNECT_TIMEOUT_SECS),
+                McpClient::handshake(&mut child),
+            )
+            .await
+            .map_err(|_| McpError::Timeout("MCP handshake timed out".into()))??;
+            self.live = Some(child);
+        }
+        Ok(self.live.as_mut().expect("live child initialized above"))
+    }
+
+    async fn call_tool_once(&mut self, tool_name: &str, args: Value) -> Result<String, McpError> {
+        let timeout = Duration::from_secs(self.timeout_secs);
+        let result = match tokio::time::timeout(timeout, async {
+            let child = self.ensure_connected().await?;
+            let id = child.next_id();
+            let req = serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": args,
+                }
+            });
+            child.send(&req).await?;
+            child.recv_response(id).await
+        })
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_) => {
+                self.live = None;
+                return Err(McpError::Timeout(format!(
+                    "MCP tool '{}' timed out after {}s",
+                    tool_name, self.timeout_secs
+                )));
+            }
+        };
+
+        let result = match result {
+            Ok(v) => v,
+            Err(e @ McpError::Io(_)) | Err(e @ McpError::Timeout(_)) => {
+                // Drop the broken/desynchronized process so the next attempt
+                // gets a clean session.
+                self.live = None;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+
+        if result["result"]["isError"].as_bool() == Some(true) {
+            return Err(McpError::Protocol(format!(
+                "Tool '{tool_name}' reported an error: {}",
+                extract_text_content(&result["result"]["content"]).unwrap_or_default()
+            )));
+        }
+
+        let content = &result["result"]["content"];
+        let text = extract_text_content(content).unwrap_or_else(|| result.to_string());
+        Ok(text)
+    }
+
+    /// Execute a tool call on the persistent session, reconnecting once if the
+    /// underlying server process closed its stdio pipes unexpectedly.
+    async fn call_tool(
+        session: &Arc<Mutex<McpSession>>,
+        tool_name: &str,
+        args: Value,
+    ) -> Result<String, McpError> {
+        let mut guard = session.lock().await;
+        match guard.call_tool_once(tool_name, args.clone()).await {
+            Ok(output) => Ok(output),
+            Err(McpError::Io(first_err)) => {
+                tracing::warn!(
+                    tool = tool_name,
+                    error = %first_err,
+                    "MCP server connection lost; reconnecting once"
+                );
+                guard.live = None;
+                guard.call_tool_once(tool_name, args).await
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl McpClient {
-    /// Spawn the server, perform initialize handshake, and discover tools.
-    async fn connect(cfg: &McpServerConfig, tool_timeout_secs: u64) -> Result<Self, McpError> {
+    /// Spawn the server, perform initialize handshake, discover tools, and keep
+    /// the initialized child alive in a persistent session.
+    async fn connect(
+        cfg: &McpServerConfig,
+        tool_timeout_secs: u64,
+        workspace_root: Option<PathBuf>,
+    ) -> Result<Self, McpError> {
         let env: Vec<(String, String)> = cfg
             .env
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        // Spawn a temporary connection just for the handshake + tools/list.
-        // We'll re-spawn per-call connections via clone_channel() to keep
-        // the implementation simple and avoid shared-state complexity.
-        let mut child = spawn_server(&cfg.command, &cfg.args, &env)?;
+        let mut child = spawn_server(&cfg.command, &cfg.args, &env, workspace_root.as_deref())?;
 
         // Perform handshake with timeout.
         tokio::time::timeout(
@@ -185,33 +312,24 @@ impl McpClient {
         .await
         .map_err(|_| McpError::Timeout("MCP tools/list timed out".into()))??;
 
-        // Kill the handshake process — each tool call spawns its own.
-        // kill_on_drop(true) will clean up when child is dropped.
-        drop(child);
-
         if tools.is_empty() {
             return Err(McpError::Protocol("MCP server returned no tools".into()));
         }
 
-        Ok(Self {
-            name: cfg.name.clone(),
-            tools,
+        let session = Arc::new(Mutex::new(McpSession {
             command: cfg.command.clone(),
             args: cfg.args.clone(),
             env,
-            tool_timeout_secs,
-        })
-    }
+            workspace_root,
+            timeout_secs: tool_timeout_secs,
+            live: Some(child),
+        }));
 
-    /// Clone the spawn parameters so each `tools/call` gets its own process.
-    /// This avoids shared mutable state on the stdio pipes.
-    fn clone_channel(&self) -> McpClientChannel {
-        McpClientChannel {
-            command: self.command.clone(),
-            args: self.args.clone(),
-            env: self.env.clone(),
-            timeout_secs: self.tool_timeout_secs,
-        }
+        Ok(Self {
+            name: cfg.name.clone(),
+            tools,
+            session,
+        })
     }
 
     // ---- Protocol methods (operate on a live spawned child) ----
@@ -283,67 +401,6 @@ impl McpClient {
 
         Ok(tools)
     }
-
-    /// Call a tool on a re-spawned connection with a timeout.
-    /// Each call spawns a fresh process, runs the full handshake, then
-    /// sends the single `tools/call` request.
-    async fn call_tool(
-        channel: &McpClientChannel,
-        tool_name: &str,
-        args: Value,
-    ) -> Result<String, McpError> {
-        tokio::time::timeout(
-            Duration::from_secs(channel.timeout_secs),
-            Self::call_tool_inner(channel, tool_name, args),
-        )
-        .await
-        .map_err(|_| {
-            McpError::Timeout(format!(
-                "MCP tool '{}' timed out after {}s",
-                tool_name, channel.timeout_secs
-            ))
-        })?
-    }
-
-    async fn call_tool_inner(
-        channel: &McpClientChannel,
-        tool_name: &str,
-        args: Value,
-    ) -> Result<String, McpError> {
-        let mut child = spawn_server(&channel.command, &channel.args, &channel.env)?;
-
-        // Run handshake on the new connection.
-        Self::handshake(&mut child).await?;
-
-        let id = child.next_id();
-        let req = serde_json::json!({
-            "jsonrpc": JSONRPC_VERSION,
-            "id": id,
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": args,
-            }
-        });
-
-        child.send(&req).await?;
-
-        let result = child.recv_response(id).await?;
-
-        if result["result"]["isError"].as_bool() == Some(true) {
-            return Err(McpError::Protocol(format!(
-                "Tool '{tool_name}' reported an error: {}",
-                extract_text_content(&result["result"]["content"]).unwrap_or_default()
-            )));
-        }
-
-        // Extract the tool result content.
-        // MCP spec: result is { content: [{ type: "text", text: "..." }] }
-        let content = &result["result"]["content"];
-        let text = extract_text_content(content).unwrap_or_else(|| result.to_string());
-
-        Ok(text)
-    }
 }
 
 /// Extract text from MCP tool result content array.
@@ -363,20 +420,6 @@ fn extract_text_content(content: &Value) -> Option<String> {
     } else {
         Some(parts.join("\n"))
     }
-}
-
-// ---------------------------------------------------------------------------
-// McpClientChannel
-// ---------------------------------------------------------------------------
-
-/// Lightweight clone of the spawn parameters, used to create a fresh
-/// process for each tool call.
-#[derive(Clone)]
-struct McpClientChannel {
-    command: String,
-    args: Vec<String>,
-    env: Vec<(String, String)>,
-    timeout_secs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -463,9 +506,13 @@ fn spawn_server(
     command: &str,
     args: &[String],
     env: &[(String, String)],
+    workspace_root: Option<&Path>,
 ) -> Result<McpChild, McpError> {
     let mut cmd = tokio::process::Command::new(command);
     cmd.args(args);
+    if let Some(dir) = workspace_root {
+        cmd.current_dir(dir);
+    }
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::inherit());
@@ -517,33 +564,25 @@ fn spawn_server(
 // McpToolAdapter
 // ---------------------------------------------------------------------------
 
-/// Wraps an MCP tool so it implements the local `Tool` trait.
-///
-/// Each `execute` call spawns a fresh MCP server process, sends a single
-/// `tools/call` request, and returns the result. This keeps the implementation
-/// simple and avoids shared mutable state on stdio pipes.
+/// Wraps an MCP tool so it implements the local `Tool` trait, backed by the
+/// server's persistent session and optional spill-backed output truncation.
 struct McpToolAdapter {
-    server_name: String,
+    full_name: String,
+    full_description: String,
     tool_name: String,
-    description: String,
     parameters: Value,
-    client: Arc<Mutex<McpClientChannel>>,
+    session: Arc<Mutex<McpSession>>,
+    spill: Option<Arc<SpillStore>>,
 }
 
 #[async_trait]
 impl crate::tools::Tool for McpToolAdapter {
     fn name(&self) -> &str {
-        // Leak a static string to satisfy the lifetime requirement.
-        // The tool name is stable for the lifetime of the adapter.
-        // We use Box::leak here because Tool::name() returns &str with no
-        // lifetime parameter, and we need to construct the name dynamically.
-        // Since the adapter lives for the duration of the task, leaking is
-        // acceptable.
-        &*Box::leak(format!("mcp__{}__{}", self.server_name, self.tool_name).into_boxed_str())
+        &self.full_name
     }
 
     fn description(&self) -> &str {
-        &*Box::leak(format!("[MCP:{}] {}", self.server_name, self.description).into_boxed_str())
+        &self.full_description
     }
 
     fn parameters(&self) -> Value {
@@ -551,13 +590,11 @@ impl crate::tools::Tool for McpToolAdapter {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let channel = {
-            let guard = self.client.lock().await;
-            guard.clone()
-        };
-
-        match McpClient::call_tool(&channel, &self.tool_name, args).await {
-            Ok(output) => Ok(output),
+        match McpSession::call_tool(&self.session, &self.tool_name, args).await {
+            Ok(output) => Ok(match &self.spill {
+                Some(store) => store.truncate_or_spill(output),
+                None => output,
+            }),
             Err(McpError::Io(msg)) => Err(ToolError::ExecutionFailed(format!(
                 "MCP tool '{}': I/O error: {msg}",
                 self.tool_name
@@ -651,19 +688,18 @@ def recv():
         sys.exit(0)
     return json.loads(line)
 
-# === MCP protocol loop (each connection triggers one session) ===
+# === Persistent MCP session: one initialize handshake, then request loop ===
+req = recv()
+send({{"jsonrpc":"2.0","id":req['id'],"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"test","version":"0.1"}}}}}})
+
+# ---- notifications/initialized ----
+req = recv()
+
+call_count = 0
 while True:
-    # ---- initialize ----
-    req = recv()
-    send({{"jsonrpc":"2.0","id":req['id'],"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"test","version":"0.1"}}}}}})
-
-    # ---- notifications/initialized ----
-    req = recv()
-
-    # ---- actual request: tools/list or tools/call ----
     req = recv()
     method = req['method']
-    rid = req['id']
+    rid = req.get('id')
 
     if method == 'tools/list':
         if mode == 'empty-tools':
@@ -676,6 +712,7 @@ while True:
             send({{"jsonrpc":"2.0","id":rid,"result":{{"tools":[{{"name":"{tool_name}","description":"{tool_desc}","inputSchema":{{"type":"object","properties":{{}}}}}}]}}}})
 
     elif method == 'tools/call':
+        call_count += 1
         if mode == 'call-error':
             send({{"jsonrpc":"2.0","id":rid,"error":{{"code":-32602,"message":"Invalid params"}}}})
         elif mode == 'call-crash':
@@ -683,6 +720,14 @@ while True:
         elif mode == 'echo-env':
             val = os.environ.get('MCP_TEST_VAR', '(unset)')
             send({{"jsonrpc":"2.0","id":rid,"result":{{"content":[{{"type":"text","text":val}}]}}}})
+        elif mode == 'pid-count':
+            payload = json.dumps({{"pid": os.getpid(), "count": call_count}})
+            send({{"jsonrpc":"2.0","id":rid,"result":{{"content":[{{"type":"text","text":payload}}]}}}})
+        elif mode == 'echo-cwd':
+            send({{"jsonrpc":"2.0","id":rid,"result":{{"content":[{{"type":"text","text":os.getcwd()}}]}}}})
+        elif mode == 'big-output':
+            big = "diagnostic line payload\\n" * 400
+            send({{"jsonrpc":"2.0","id":rid,"result":{{"content":[{{"type":"text","text":big}}]}}}})
         else:
             tool_args = req['params']['arguments']
             send({{"jsonrpc":"2.0","id":rid,"result":{{"content":[{{"type":"text","text":json.dumps(tool_args)}}]}}}})
@@ -964,5 +1009,77 @@ while True:
         let content = json!([{"type": "text"}]);
         // Missing "text" key → contributes nothing → empty parts → None
         assert_eq!(extract_text_content(&content), None);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_reuses_persistent_process_across_calls() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_server_cfg(
+            &tmp,
+            "stateful",
+            "ping",
+            "Return pid and count",
+            "pid-count",
+        );
+
+        let manager = McpClientManager::start_in_workspace(&[cfg], 30, Some(tmp.path()))
+            .await
+            .expect("manager should start");
+        let mut registry = ToolRegistry::new();
+        manager.register_all(&mut registry);
+
+        let tool = registry.get("mcp__stateful__ping").unwrap();
+        let r1: Value = serde_json::from_str(&tool.execute(json!({})).await.unwrap()).unwrap();
+        let r2: Value = serde_json::from_str(&tool.execute(json!({})).await.unwrap()).unwrap();
+
+        assert_eq!(
+            r1["pid"], r2["pid"],
+            "persistent MCP session must reuse the same server PID across calls"
+        );
+        assert_eq!(r1["count"], 1);
+        assert_eq!(r2["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_runs_in_workspace_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("project-root");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let cfg = test_server_cfg(&tmp, "cwd-srv", "pwd", "Return cwd", "echo-cwd");
+
+        let manager = McpClientManager::start_in_workspace(&[cfg], 30, Some(&workspace))
+            .await
+            .expect("manager should start");
+        let mut registry = ToolRegistry::new();
+        manager.register_all(&mut registry);
+
+        let tool = registry.get("mcp__cwd-srv__pwd").unwrap();
+        let out = tool.execute(json!({})).await.unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&out).unwrap(),
+            std::fs::canonicalize(&workspace).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_output_spills_when_exceeding_limit() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_server_cfg(&tmp, "diag-srv", "diag", "Big diagnostics", "big-output");
+
+        let manager = McpClientManager::start_in_workspace(&[cfg], 30, Some(tmp.path()))
+            .await
+            .expect("manager should start");
+        let spill = Arc::new(
+            SpillStore::new(tmp.path().to_path_buf(), "mcp-spill").with_token_budget(4000),
+        );
+        let mut registry = ToolRegistry::new();
+        manager.register_all_with_spill(&mut registry, Some(spill));
+
+        let tool = registry.get("mcp__diag-srv__diag").unwrap();
+        let out = tool.execute(json!({})).await.unwrap().replace('\\', "/");
+        assert!(
+            out.contains("saved to .clausura/archives/tool-output-mcp-spill-1.txt"),
+            "oversized MCP output must spill to disk, got: {out}"
+        );
     }
 }

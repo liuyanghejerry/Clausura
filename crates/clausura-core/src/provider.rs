@@ -116,6 +116,89 @@ fn log_retries_exhausted(max_retries: u32, err: &ProviderError) {
     );
 }
 
+/// Shared HTTP POST + exponential-backoff retry loop used by all LLM providers.
+///
+/// Retries on HTTP 429, 5xx (honoring `Retry-After` on 429/503), and transient
+/// timeout/connect errors. Fails immediately on auth errors and 4xx bad requests.
+async fn send_json_with_retry(
+    client: &Client,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &serde_json::Value,
+    max_retries: u32,
+    treat_403_as_auth: bool,
+) -> Result<serde_json::Value, ProviderError> {
+    let mut last_error = None;
+    let mut retry_after = None;
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            tokio::time::sleep(retry_delay(attempt, retry_after.take())).await;
+        }
+
+        let mut req = client.post(url).header("Content-Type", "application/json");
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let response = req.json(body).send().await;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    let text = resp.text().await.map_err(ProviderError::NetworkError)?;
+                    return serde_json::from_str(&text).map_err(ProviderError::JsonError);
+                } else if status.as_u16() == 429 {
+                    retry_after = retry_after_secs(&resp);
+                    log_retry(
+                        attempt,
+                        max_retries,
+                        &format!("rate limited (HTTP {status})"),
+                    );
+                    last_error = Some(ProviderError::RateLimited("Rate limited".into()));
+                    continue;
+                } else if status.is_server_error() {
+                    if status.as_u16() == 503 {
+                        retry_after = retry_after_secs(&resp);
+                    }
+                    log_retry(
+                        attempt,
+                        max_retries,
+                        &format!("server error (HTTP {status})"),
+                    );
+                    last_error = Some(ProviderError::ServerError(format!("HTTP {}", status)));
+                    continue;
+                } else if status.as_u16() == 401 || (treat_403_as_auth && status.as_u16() == 403) {
+                    return Err(ProviderError::AuthError("Invalid API key".into()));
+                } else {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(ProviderError::BadRequest(format!(
+                        "HTTP {}: {}",
+                        status, text
+                    )));
+                }
+            }
+            Err(e) => {
+                if e.is_timeout() {
+                    log_retry(attempt, max_retries, "request timed out");
+                    last_error = Some(ProviderError::Timeout("Request timed out".into()));
+                    continue;
+                } else if e.is_connect() {
+                    log_retry(attempt, max_retries, "connection error");
+                    last_error = Some(ProviderError::NetworkError(e));
+                    continue;
+                } else {
+                    return Err(ProviderError::NetworkError(e));
+                }
+            }
+        }
+    }
+
+    let err =
+        last_error.unwrap_or_else(|| ProviderError::ServerError("Max retries exceeded".into()));
+    log_retries_exhausted(max_retries, &err);
+    Err(err)
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI-compatible provider
 // ---------------------------------------------------------------------------
@@ -128,6 +211,8 @@ pub struct OpenAIProviderConfig {
     pub base_url: String,
     pub max_retries: u32,
     pub timeout_secs: u64,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f64>,
 }
 
 impl Default for OpenAIProviderConfig {
@@ -138,6 +223,8 @@ impl Default for OpenAIProviderConfig {
             base_url: "https://api.openai.com/v1".to_string(),
             max_retries: 3,
             timeout_secs: 120,
+            max_tokens: None,
+            temperature: None,
         }
     }
 }
@@ -152,7 +239,11 @@ pub(crate) fn serialize_messages_openai(messages: &[Message]) -> Vec<serde_json:
             });
             if m.role == Role::Assistant {
                 if let Some(ref tc_vec) = m.tool_calls {
-                    obj["content"] = serde_json::Value::Null;
+                    obj["content"] = if m.content.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(m.content)
+                    };
                     let tool_calls_json: Vec<serde_json::Value> = tc_vec
                         .iter()
                         .map(|tc| {
@@ -224,6 +315,12 @@ impl OpenAICompatibleProvider {
             "messages": serialize_messages_openai(messages),
         });
 
+        if let Some(max_tokens) = self.config.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+        if let Some(temp) = self.config.temperature {
+            body["temperature"] = serde_json::json!(temp);
+        }
         if let Some(tools) = tools {
             body["tools"] = serialize_tool_defs(tools);
         }
@@ -239,82 +336,17 @@ impl OpenAICompatibleProvider {
     ) -> Result<ChatResponse, ProviderError> {
         let url = format!("{}/chat/completions", self.config.base_url);
         let body = self.build_request_body(messages, tools);
-
-        let mut last_error = None;
-        let mut retry_after = None;
-        for attempt in 0..=self.config.max_retries {
-            if attempt > 0 {
-                // Exponential backoff with jitter, honoring `Retry-After`.
-                tokio::time::sleep(retry_delay(attempt, retry_after.take())).await;
-            }
-
-            let response = self
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", self.config.api_key))
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await;
-
-            match response {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        let text = resp.text().await.map_err(ProviderError::NetworkError)?;
-                        let data: serde_json::Value =
-                            serde_json::from_str(&text).map_err(ProviderError::JsonError)?;
-                        return Self::parse_response(data);
-                    } else if status.as_u16() == 429 {
-                        retry_after = retry_after_secs(&resp);
-                        log_retry(
-                            attempt,
-                            self.config.max_retries,
-                            &format!("rate limited (HTTP {status})"),
-                        );
-                        last_error = Some(ProviderError::RateLimited("Rate limited".into()));
-                        continue;
-                    } else if status.is_server_error() {
-                        if status.as_u16() == 503 {
-                            retry_after = retry_after_secs(&resp);
-                        }
-                        log_retry(
-                            attempt,
-                            self.config.max_retries,
-                            &format!("server error (HTTP {status})"),
-                        );
-                        last_error = Some(ProviderError::ServerError(format!("HTTP {}", status)));
-                        continue;
-                    } else if status.as_u16() == 401 {
-                        return Err(ProviderError::AuthError("Invalid API key".into()));
-                    } else {
-                        let text = resp.text().await.unwrap_or_default();
-                        return Err(ProviderError::BadRequest(format!(
-                            "HTTP {}: {}",
-                            status, text
-                        )));
-                    }
-                }
-                Err(e) => {
-                    if e.is_timeout() {
-                        log_retry(attempt, self.config.max_retries, "request timed out");
-                        last_error = Some(ProviderError::Timeout("Request timed out".into()));
-                        continue;
-                    } else if e.is_connect() {
-                        log_retry(attempt, self.config.max_retries, "connection error");
-                        last_error = Some(ProviderError::NetworkError(e));
-                        continue;
-                    } else {
-                        return Err(ProviderError::NetworkError(e));
-                    }
-                }
-            }
-        }
-
-        let err =
-            last_error.unwrap_or_else(|| ProviderError::ServerError("Max retries exceeded".into()));
-        log_retries_exhausted(self.config.max_retries, &err);
-        Err(err)
+        let auth = format!("Bearer {}", self.config.api_key);
+        let data = send_json_with_retry(
+            &self.client,
+            &url,
+            &[("Authorization", auth.as_str())],
+            &body,
+            self.config.max_retries,
+            false,
+        )
+        .await?;
+        Self::parse_response(data)
     }
 
     /// Parse the OpenAI-style JSON response into our `ChatResponse`.
@@ -434,7 +466,14 @@ pub struct AnthropicProviderConfig {
     pub base_url: String,
     pub max_retries: u32,
     pub timeout_secs: u64,
+    pub max_tokens: u32,
+    pub temperature: Option<f64>,
+    pub prompt_caching: bool,
 }
+
+/// Default Anthropic max output tokens — high enough to accommodate large
+/// multi-finding JSON payloads without prematurely hitting `max_tokens`.
+pub const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 16384;
 
 impl Default for AnthropicProviderConfig {
     fn default() -> Self {
@@ -444,6 +483,9 @@ impl Default for AnthropicProviderConfig {
             base_url: "https://api.anthropic.com".to_string(),
             max_retries: 3,
             timeout_secs: 120,
+            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            temperature: None,
+            prompt_caching: false,
         }
     }
 }
@@ -470,18 +512,20 @@ impl AnthropicProvider {
             .collect()
     }
 
+    /// Convert internal messages to Anthropic Messages API format, merging any
+    /// adjacent messages that map to the same Anthropic role (`user` or
+    /// `assistant`) so the strict alternating-role API contract is never
+    /// violated (e.g. a `tool_result` followed by a repeat-call reminder or
+    /// consecutive initial user prompts).
     fn convert_messages_to_anthropic(messages: &[Message]) -> Vec<serde_json::Value> {
-        let mut result = Vec::new();
+        let mut raw: Vec<(&'static str, serde_json::Value)> = Vec::new();
         let mut index = 0;
         while index < messages.len() {
             let msg = &messages[index];
             match msg.role {
                 Role::System => {}
                 Role::User => {
-                    result.push(serde_json::json!({
-                        "role": "user",
-                        "content": msg.content,
-                    }));
+                    raw.push(("user", serde_json::json!(msg.content)));
                 }
                 Role::Assistant => {
                     let mut content_blocks = Vec::new();
@@ -501,10 +545,7 @@ impl AnthropicProvider {
                             })
                         }));
                     }
-                    result.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": content_blocks,
-                    }));
+                    raw.push(("assistant", serde_json::json!(content_blocks)));
                 }
                 Role::Tool => {
                     let mut content_blocks = Vec::new();
@@ -517,25 +558,56 @@ impl AnthropicProvider {
                         }));
                         index += 1;
                     }
-                    result.push(serde_json::json!({
-                        "role": "user",
-                        "content": content_blocks,
-                    }));
+                    raw.push(("user", serde_json::json!(content_blocks)));
                     continue;
                 }
             }
             index += 1;
         }
-        result
+
+        let to_blocks = |v: serde_json::Value| -> Vec<serde_json::Value> {
+            match v {
+                serde_json::Value::Array(arr) => arr,
+                serde_json::Value::String(s) => {
+                    if s.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![serde_json::json!({ "type": "text", "text": s })]
+                    }
+                }
+                other => vec![other],
+            }
+        };
+
+        let mut merged: Vec<(&'static str, serde_json::Value)> = Vec::with_capacity(raw.len());
+        for (role, content) in raw {
+            if let Some((last_role, last_content)) = merged.last_mut() {
+                if *last_role == role {
+                    let mut blocks = to_blocks(std::mem::take(last_content));
+                    blocks.extend(to_blocks(content));
+                    *last_content = serde_json::Value::Array(blocks);
+                    continue;
+                }
+            }
+            merged.push((role, content));
+        }
+
+        merged
+            .into_iter()
+            .map(|(role, content)| {
+                serde_json::json!({
+                    "role": role,
+                    "content": content,
+                })
+            })
+            .collect()
     }
 
-    async fn send_chat_request(
+    fn build_request_body(
         &self,
         messages: &[Message],
         tools: Option<&[ToolDef]>,
-    ) -> Result<ChatResponse, ProviderError> {
-        let url = format!("{}/v1/messages", self.config.base_url);
-
+    ) -> serde_json::Value {
         // Extract system message
         let system = messages
             .iter()
@@ -545,92 +617,60 @@ impl AnthropicProvider {
 
         let anthropic_messages = Self::convert_messages_to_anthropic(messages);
 
+        let system_value = if self.config.prompt_caching && !system.is_empty() {
+            serde_json::json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": { "type": "ephemeral" }
+            }])
+        } else {
+            serde_json::json!(system)
+        };
+
         let mut body = serde_json::json!({
             "model": self.config.model,
-            "max_tokens": 4096,
+            "max_tokens": self.config.max_tokens,
             "messages": anthropic_messages,
-            "system": system,
+            "system": system_value,
         });
 
+        if let Some(temp) = self.config.temperature {
+            body["temperature"] = serde_json::json!(temp);
+        }
+
         if let Some(tools) = tools {
-            body["tools"] = serde_json::json!(Self::convert_tools_to_anthropic(tools));
-        }
-
-        let mut last_error = None;
-        let mut retry_after = None;
-        for attempt in 0..=self.config.max_retries {
-            if attempt > 0 {
-                // Exponential backoff with jitter, honoring `Retry-After`.
-                tokio::time::sleep(retry_delay(attempt, retry_after.take())).await;
-            }
-
-            let response = self
-                .client
-                .post(&url)
-                .header("x-api-key", &self.config.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await;
-
-            match response {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        let text = resp.text().await.map_err(ProviderError::NetworkError)?;
-                        let data: serde_json::Value =
-                            serde_json::from_str(&text).map_err(ProviderError::JsonError)?;
-                        return Self::parse_response(&data);
-                    } else if status.as_u16() == 429 {
-                        retry_after = retry_after_secs(&resp);
-                        log_retry(
-                            attempt,
-                            self.config.max_retries,
-                            &format!("rate limited (HTTP {status})"),
-                        );
-                        last_error = Some(ProviderError::RateLimited("Rate limited".into()));
-                        continue;
-                    } else if status.is_server_error() {
-                        if status.as_u16() == 503 {
-                            retry_after = retry_after_secs(&resp);
-                        }
-                        log_retry(
-                            attempt,
-                            self.config.max_retries,
-                            &format!("server error (HTTP {status})"),
-                        );
-                        last_error = Some(ProviderError::ServerError(format!("HTTP {}", status)));
-                        continue;
-                    } else if status.as_u16() == 401 || status.as_u16() == 403 {
-                        return Err(ProviderError::AuthError("Invalid API key".into()));
-                    } else {
-                        let text = resp.text().await.unwrap_or_default();
-                        return Err(ProviderError::BadRequest(format!(
-                            "HTTP {}: {}",
-                            status, text
-                        )));
-                    }
-                }
-                Err(e) => {
-                    if e.is_timeout() || e.is_connect() {
-                        log_retry(
-                            attempt,
-                            self.config.max_retries,
-                            "timeout or connection error",
-                        );
-                        last_error = Some(ProviderError::NetworkError(e));
-                        continue;
-                    }
-                    return Err(ProviderError::NetworkError(e));
+            let mut anthropic_tools = Self::convert_tools_to_anthropic(tools);
+            if self.config.prompt_caching {
+                if let Some(last) = anthropic_tools.last_mut() {
+                    last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
                 }
             }
+            body["tools"] = serde_json::json!(anthropic_tools);
         }
 
-        let err =
-            last_error.unwrap_or_else(|| ProviderError::ServerError("Max retries exceeded".into()));
-        log_retries_exhausted(self.config.max_retries, &err);
-        Err(err)
+        body
+    }
+
+    async fn send_chat_request(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDef]>,
+    ) -> Result<ChatResponse, ProviderError> {
+        let url = format!("{}/v1/messages", self.config.base_url);
+        let body = self.build_request_body(messages, tools);
+        let data = send_json_with_retry(
+            &self.client,
+            &url,
+            &[
+                ("x-api-key", self.config.api_key.as_str()),
+                ("anthropic-version", "2023-06-01"),
+            ],
+            &body,
+            self.config.max_retries,
+            true,
+        )
+        .await?;
+        Self::parse_response(&data)
     }
 
     fn parse_response(data: &serde_json::Value) -> Result<ChatResponse, ProviderError> {
@@ -744,6 +784,8 @@ pub struct CustomProviderConfig {
     pub auth_header: String,
     pub max_retries: u32,
     pub timeout_secs: u64,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f64>,
 }
 
 impl Default for CustomProviderConfig {
@@ -755,6 +797,8 @@ impl Default for CustomProviderConfig {
             auth_header: "Authorization".to_string(),
             max_retries: 3,
             timeout_secs: 120,
+            max_tokens: None,
+            temperature: None,
         }
     }
 }
@@ -790,92 +834,31 @@ impl Provider for CustomProvider {
             "messages": serialize_messages_openai(messages),
         });
 
+        if let Some(max_tokens) = self.config.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+        if let Some(temp) = self.config.temperature {
+            body["temperature"] = serde_json::json!(temp);
+        }
         if !tools.is_empty() {
             body["tools"] = serialize_tool_defs(tools);
         }
 
-        let mut last_error = None;
-        let mut retry_after = None;
-        for attempt in 0..=self.config.max_retries {
-            if attempt > 0 {
-                // Exponential backoff with jitter, honoring `Retry-After`.
-                tokio::time::sleep(retry_delay(attempt, retry_after.take())).await;
-            }
-
-            let mut request = self
-                .client
-                .post(&url)
-                .header("Content-Type", "application/json");
-
-            // Use custom auth header
-            if self.config.auth_header.to_lowercase() == "authorization" {
-                request = request.header(
-                    &self.config.auth_header,
-                    format!("Bearer {}", self.config.api_key),
-                );
-            } else {
-                request = request.header(&self.config.auth_header, &self.config.api_key);
-            }
-
-            let response = request.json(&body).send().await;
-
-            match response {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        let text = resp.text().await.map_err(ProviderError::NetworkError)?;
-                        let data: serde_json::Value =
-                            serde_json::from_str(&text).map_err(ProviderError::JsonError)?;
-                        return OpenAICompatibleProvider::parse_response(data);
-                    } else if status.as_u16() == 429 {
-                        retry_after = retry_after_secs(&resp);
-                        log_retry(
-                            attempt,
-                            self.config.max_retries,
-                            &format!("rate limited (HTTP {status})"),
-                        );
-                        last_error = Some(ProviderError::RateLimited("Rate limited".into()));
-                        continue;
-                    } else if status.is_server_error() {
-                        if status.as_u16() == 503 {
-                            retry_after = retry_after_secs(&resp);
-                        }
-                        log_retry(
-                            attempt,
-                            self.config.max_retries,
-                            &format!("server error (HTTP {status})"),
-                        );
-                        last_error = Some(ProviderError::ServerError(format!("HTTP {}", status)));
-                        continue;
-                    } else if status.as_u16() == 401 || status.as_u16() == 403 {
-                        return Err(ProviderError::AuthError("Invalid API key".into()));
-                    } else {
-                        let text = resp.text().await.unwrap_or_default();
-                        return Err(ProviderError::BadRequest(format!(
-                            "HTTP {}: {}",
-                            status, text
-                        )));
-                    }
-                }
-                Err(e) => {
-                    if e.is_timeout() || e.is_connect() {
-                        log_retry(
-                            attempt,
-                            self.config.max_retries,
-                            "timeout or connection error",
-                        );
-                        last_error = Some(ProviderError::NetworkError(e));
-                        continue;
-                    }
-                    return Err(ProviderError::NetworkError(e));
-                }
-            }
-        }
-
-        let err =
-            last_error.unwrap_or_else(|| ProviderError::ServerError("Max retries exceeded".into()));
-        log_retries_exhausted(self.config.max_retries, &err);
-        Err(err)
+        let auth_val = if self.config.auth_header.to_lowercase() == "authorization" {
+            format!("Bearer {}", self.config.api_key)
+        } else {
+            self.config.api_key.clone()
+        };
+        let data = send_json_with_retry(
+            &self.client,
+            &url,
+            &[(self.config.auth_header.as_str(), auth_val.as_str())],
+            &body,
+            self.config.max_retries,
+            true,
+        )
+        .await?;
+        OpenAICompatibleProvider::parse_response(data)
     }
 
     fn count_tokens(&self, text: &str) -> u64 {
@@ -895,12 +878,37 @@ impl Provider for CustomProvider {
 // Provider factory
 // =========================================================================
 
+/// Optional provider tuning parameters forwarded from [`TaskContract`].
+#[derive(Debug, Clone, Default)]
+pub struct ProviderOptions {
+    pub max_output_tokens: Option<u32>,
+    pub temperature: Option<f64>,
+    pub prompt_caching: bool,
+}
+
 /// Create the right provider based on vendor configuration.
 pub fn create_provider(
     vendor: &VendorConfig,
     model: &str,
     api_key: &str,
     timeout_secs: u64,
+) -> Result<Box<dyn Provider>, ProviderError> {
+    create_provider_with_options(
+        vendor,
+        model,
+        api_key,
+        timeout_secs,
+        &ProviderOptions::default(),
+    )
+}
+
+/// Create the right provider based on vendor configuration and tuning options.
+pub fn create_provider_with_options(
+    vendor: &VendorConfig,
+    model: &str,
+    api_key: &str,
+    timeout_secs: u64,
+    options: &ProviderOptions,
 ) -> Result<Box<dyn Provider>, ProviderError> {
     match vendor.vendor_type {
         VendorType::OpenAiCompatible => {
@@ -909,6 +917,8 @@ pub fn create_provider(
                 api_key: api_key.to_string(),
                 base_url: vendor.effective_base_url().to_string(),
                 timeout_secs,
+                max_tokens: options.max_output_tokens,
+                temperature: options.temperature,
                 ..Default::default()
             })?;
             Ok(Box::new(provider))
@@ -919,6 +929,11 @@ pub fn create_provider(
                 api_key: api_key.to_string(),
                 base_url: vendor.effective_base_url().to_string(),
                 timeout_secs,
+                max_tokens: options
+                    .max_output_tokens
+                    .unwrap_or(DEFAULT_ANTHROPIC_MAX_TOKENS),
+                temperature: options.temperature,
+                prompt_caching: options.prompt_caching,
                 ..Default::default()
             })?;
             Ok(Box::new(provider))
@@ -930,6 +945,8 @@ pub fn create_provider(
                 base_url: vendor.effective_base_url().to_string(),
                 auth_header: vendor.auth_header_name().to_string(),
                 timeout_secs,
+                max_tokens: options.max_output_tokens,
+                temperature: options.temperature,
                 ..Default::default()
             })?;
             Ok(Box::new(provider))
@@ -1517,7 +1534,7 @@ pub mod tests {
             .and(matchers::path("/v1/messages"))
             .and(matchers::body_json(serde_json::json!({
                 "model": "claude-sonnet-5-5",
-                "max_tokens": 4096,
+                "max_tokens": DEFAULT_ANTHROPIC_MAX_TOKENS,
                 "system": "Review the code",
                 "messages": [
                     {"role": "user", "content": "Inspect a.rs"},
@@ -1676,5 +1693,129 @@ pub mod tests {
         let user_msg = &msgs[1];
         assert_eq!(user_msg["role"], "user");
         assert!(user_msg.get("tool_call_id").is_none());
+    }
+
+    #[test]
+    fn test_anthropic_merges_consecutive_user_and_tool_messages() {
+        let messages = vec![
+            Message::new(Role::System, "sys"),
+            Message::new(Role::User, "preflight summary"),
+            Message::new(Role::User, "review prompt"),
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "toolu_1".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({"pattern": "foo"}),
+                }]),
+            },
+            Message::with_tool_call(Role::Tool, "match line 1", "toolu_1".into()),
+            Message::new(Role::User, "repeat reminder"),
+        ];
+
+        let converted = AnthropicProvider::convert_messages_to_anthropic(&messages);
+        assert_eq!(converted.len(), 3);
+        assert_eq!(converted[0]["role"], "user");
+        let first_blocks = converted[0]["content"].as_array().unwrap();
+        assert_eq!(first_blocks.len(), 2);
+        assert_eq!(first_blocks[0]["text"], "preflight summary");
+        assert_eq!(first_blocks[1]["text"], "review prompt");
+
+        assert_eq!(converted[1]["role"], "assistant");
+
+        assert_eq!(converted[2]["role"], "user");
+        let last_blocks = converted[2]["content"].as_array().unwrap();
+        assert_eq!(last_blocks.len(), 2);
+        assert_eq!(last_blocks[0]["type"], "tool_result");
+        assert_eq!(last_blocks[0]["tool_use_id"], "toolu_1");
+        assert_eq!(last_blocks[1]["type"], "text");
+        assert_eq!(last_blocks[1]["text"], "repeat reminder");
+    }
+
+    #[test]
+    fn test_openai_build_body_forwards_max_tokens_and_temperature() {
+        let provider = OpenAICompatibleProvider::new(OpenAIProviderConfig {
+            base_url: "https://api.example.com/v1".into(),
+            api_key: "sk-test".into(),
+            max_tokens: Some(8192),
+            temperature: Some(0.0),
+            ..Default::default()
+        })
+        .unwrap();
+        let body = provider.build_request_body(&[Message::new(Role::User, "hi")], None);
+        assert_eq!(body["max_tokens"], 8192);
+        assert_eq!(body["temperature"], 0.0);
+    }
+
+    #[test]
+    fn test_openai_serialize_preserves_assistant_content_with_tool_calls() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: "Inspecting suspicious SQL query".into(),
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "db.rs"}),
+                }]),
+            },
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_2".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({"pattern": "SELECT"}),
+                }]),
+            },
+        ];
+        let serialized = serialize_messages_openai(&messages);
+        assert_eq!(serialized[0]["content"], "Inspecting suspicious SQL query");
+        assert!(serialized[1]["content"].is_null());
+    }
+
+    #[test]
+    fn test_anthropic_prompt_caching_marks_system_and_last_tool() {
+        let provider = AnthropicProvider::new(AnthropicProviderConfig {
+            base_url: "https://api.anthropic.com".into(),
+            api_key: "sk-ant-test".into(),
+            prompt_caching: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let tools = vec![
+            ToolDef {
+                name: "read_file".into(),
+                description: "Read file".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolDef {
+                name: "grep".into(),
+                description: "Search".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+        let body = provider.build_request_body(
+            &[
+                Message::new(Role::System, "You are a reviewer."),
+                Message::new(Role::User, "Review"),
+            ],
+            Some(&tools),
+        );
+
+        let sys_blocks = body["system"].as_array().unwrap();
+        assert_eq!(sys_blocks.len(), 1);
+        assert_eq!(sys_blocks[0]["type"], "text");
+        assert_eq!(sys_blocks[0]["cache_control"]["type"], "ephemeral");
+
+        let tool_defs = body["tools"].as_array().unwrap();
+        assert_eq!(tool_defs.len(), 2);
+        assert!(tool_defs[0].get("cache_control").is_none());
+        assert_eq!(tool_defs[1]["cache_control"]["type"], "ephemeral");
     }
 }
