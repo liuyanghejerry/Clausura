@@ -24,7 +24,7 @@ for line in sys.stdin:
         continue
     method = request["method"]
     if method == "initialize":
-        if mode == "hang" or (mode == "hang-call" and pathlib.Path(marker).exists()):
+        if mode == "hang":
             time.sleep(30)
         pathlib.Path(marker).touch()
         result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
@@ -33,6 +33,8 @@ for line in sys.stdin:
         result = {"tools": [{"name": "diagnostics", "description": "test diagnostics",
                             "inputSchema": {"type": "object"}}]}
     else:
+        if mode == "hang-call":
+            time.sleep(30)
         diagnostics = [{"severity": 1, "message": "type mismatch", "file": "a.rs", "line": 1}]
         if mode == "empty":
             diagnostics = []

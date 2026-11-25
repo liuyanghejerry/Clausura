@@ -50,6 +50,7 @@ pub struct SpillStore {
     task_id: String,
     seq: std::sync::atomic::AtomicU32,
     event_log: Option<Arc<crate::eventlog::EventLog>>,
+    max_inline_bytes: usize,
 }
 
 impl SpillStore {
@@ -59,7 +60,28 @@ impl SpillStore {
             task_id: task_id.to_string(),
             seq: std::sync::atomic::AtomicU32::new(0),
             event_log: None,
+            max_inline_bytes: MAX_OUTPUT_BYTES,
         }
+    }
+
+    /// Scale the inline tool-output byte limit to the task's `token_budget`
+    /// (~25% of budget at ~3 bytes/token, clamped to `[2 KiB, 32 KiB]`) so a
+    /// single tool call cannot immediately exhaust a small context budget.
+    pub fn with_token_budget(mut self, token_budget: u64) -> Self {
+        let scaled = (token_budget as usize).saturating_mul(3) / 4;
+        self.max_inline_bytes = scaled.clamp(2 * 1024, MAX_OUTPUT_BYTES);
+        self
+    }
+
+    /// Current inline byte limit before spilling to disk.
+    pub fn max_inline_bytes(&self) -> usize {
+        self.max_inline_bytes
+    }
+
+    /// Truncate `output` to this store's inline limit, spilling the full
+    /// output to disk when exceeded.
+    pub fn truncate_or_spill(&self, output: String) -> String {
+        truncate_output_with_spill(output, Some(self))
     }
 
     /// Record spills in the run event log (evaluation telemetry).
@@ -87,10 +109,10 @@ impl SpillStore {
     }
 }
 
-fn output_keep_end(output: &str) -> usize {
+fn output_keep_end(output: &str, max_bytes: usize) -> usize {
     let mut offset = 0usize;
     for (lines_kept, line) in output.split_inclusive('\n').enumerate() {
-        if lines_kept >= MAX_OUTPUT_LINES || offset + line.len() > MAX_OUTPUT_BYTES {
+        if lines_kept >= MAX_OUTPUT_LINES || offset + line.len() > max_bytes {
             return offset;
         }
         offset += line.len();
@@ -98,42 +120,59 @@ fn output_keep_end(output: &str) -> usize {
     output.len()
 }
 
-/// Truncate tool output to at most 32 KB or 1000 lines, whichever comes first.
+fn format_byte_limit(max_bytes: usize) -> String {
+    if max_bytes.is_multiple_of(1024) {
+        format!("{}KB", max_bytes / 1024)
+    } else {
+        format!("{} bytes", max_bytes)
+    }
+}
+
+/// Truncate tool output to at most `max_bytes` (default 32 KB, or scaled via
+/// [`SpillStore::with_token_budget`]) or 1000 lines, whichever comes first.
 /// Appends a marker when truncation occurs.
 fn truncate_output_with_spill(output: String, spill: Option<&SpillStore>) -> String {
-    let keep_end = output_keep_end(&output);
+    let max_bytes = spill.map_or(MAX_OUTPUT_BYTES, |s| s.max_inline_bytes);
+    let keep_end = output_keep_end(&output, max_bytes);
     if keep_end == output.len() {
         return output;
     }
+    let limit_label = format_byte_limit(max_bytes);
     let mut truncated = output[..keep_end].to_string();
     truncated.truncate(truncated.trim_end_matches('\n').len());
     match spill.and_then(|s| s.spill(&output)) {
         Some(loc) => truncated.push_str(&format!(
-            "\n... [output truncated: limit is 32KB or 1000 lines; \
+            "\n... [output truncated: limit is {limit_label} or 1000 lines; \
              full output ({} bytes, {} lines) saved to {} — read it with \
              read_file (offset/limit) to page through]",
             output.len(),
             output.lines().count(),
             loc.display(),
         )),
-        None => truncated.push_str(
-            "\n... [output truncated: limit is 32KB or 1000 lines, use offset/limit or a narrower query]",
-        ),
+        None => truncated.push_str(&format!(
+            "\n... [output truncated: limit is {limit_label} or 1000 lines, use offset/limit or a narrower query]"
+        )),
     }
     truncated
 }
 
-fn truncate_read_file_output(output: String, path: &str, offset: usize) -> String {
-    let keep_end = output_keep_end(&output);
+fn truncate_read_file_output(
+    output: String,
+    path: &str,
+    offset: usize,
+    max_bytes: usize,
+) -> String {
+    let keep_end = output_keep_end(&output, max_bytes);
     if keep_end == output.len() {
         return output;
     }
+    let limit_label = format_byte_limit(max_bytes);
     let consumed_lines = output[..keep_end].lines().count();
     let next_offset = offset + consumed_lines;
     let mut truncated = output[..keep_end].to_string();
     truncated.truncate(truncated.trim_end_matches('\n').len());
     truncated.push_str(&format!(
-        "\n... [output truncated: limit is 32KB or 1000 lines; \
+        "\n... [output truncated: limit is {limit_label} or 1000 lines; \
          resume from the original file {path} with read_file (offset={next_offset}, limit=1000)]"
     ));
     truncated
@@ -146,12 +185,14 @@ fn truncate_read_file_output(output: String, path: &str, offset: usize) -> Strin
 /// Registry of available tools for the agent.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    reported_findings: Option<Arc<std::sync::Mutex<Vec<crate::types::Finding>>>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            reported_findings: None,
         }
     }
 
@@ -159,6 +200,34 @@ impl ToolRegistry {
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
         let name = tool.name().to_string();
         self.tools.insert(name, Arc::new(tool));
+    }
+
+    /// Register the built-in `report_finding` tool so the agent can submit
+    /// validated findings incrementally during the review loop.
+    pub fn register_report_finding(
+        &mut self,
+        workspace_root: PathBuf,
+        task_id: String,
+        allowed_rule_ids: Vec<String>,
+        ledger_enabled: bool,
+    ) {
+        let store = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.reported_findings = Some(store.clone());
+        self.register(ReportFindingTool::new(
+            workspace_root,
+            task_id,
+            allowed_rule_ids,
+            ledger_enabled,
+            store,
+        ));
+    }
+
+    /// Snapshot findings incrementally submitted via `report_finding`.
+    pub fn reported_findings(&self) -> Vec<crate::types::Finding> {
+        self.reported_findings
+            .as_ref()
+            .and_then(|m| m.lock().ok().map(|v| v.clone()))
+            .unwrap_or_default()
     }
 
     /// Get a tool by name.
@@ -192,6 +261,7 @@ impl Default for ToolRegistry {
 /// Reads a file relative to the workspace root. Path traversal is rejected.
 pub struct ReadFileTool {
     workspace_root: PathBuf,
+    max_inline_bytes: usize,
 }
 
 /// Resolve a path relative to the workspace root, enforcing sandbox restrictions.
@@ -232,11 +302,16 @@ impl ReadFileTool {
         let canonical_root = workspace_root.canonicalize().unwrap_or(workspace_root);
         Self {
             workspace_root: canonical_root,
+            max_inline_bytes: MAX_OUTPUT_BYTES,
         }
     }
 
-    /// Kept for caller compatibility; truncated reads resume from the original file.
-    pub fn with_spill_maybe(self, _store: Option<Arc<SpillStore>>) -> Self {
+    /// Inherit the dynamic inline byte cap from the spill store when present.
+    /// Truncated reads still resume directly from the original file.
+    pub fn with_spill_maybe(mut self, store: Option<Arc<SpillStore>>) -> Self {
+        if let Some(s) = store {
+            self.max_inline_bytes = s.max_inline_bytes();
+        }
         self
     }
 
@@ -320,6 +395,7 @@ impl Tool for ReadFileTool {
             result_lines.join("\n"),
             path_str,
             offset,
+            self.max_inline_bytes,
         ))
     }
 }
@@ -1261,6 +1337,158 @@ impl Tool for SkillTool {
         Ok(format!(
             "<skill name=\"{}\">\n{}\n</skill>",
             skill.name, skill.body
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReportFindingTool (incremental finding submission)
+// ---------------------------------------------------------------------------
+
+/// Allows the agent to record validated findings incrementally as it reviews
+/// files, persisting each finding to the on-disk ledger and an in-memory store
+/// so findings survive context truncation and iteration limits.
+pub struct ReportFindingTool {
+    workspace_root: PathBuf,
+    task_id: String,
+    allowed_rule_ids: Vec<String>,
+    ledger_enabled: bool,
+    reported: Arc<std::sync::Mutex<Vec<crate::types::Finding>>>,
+}
+
+impl ReportFindingTool {
+    pub fn new(
+        workspace_root: PathBuf,
+        task_id: String,
+        allowed_rule_ids: Vec<String>,
+        ledger_enabled: bool,
+        reported: Arc<std::sync::Mutex<Vec<crate::types::Finding>>>,
+    ) -> Self {
+        Self {
+            workspace_root,
+            task_id,
+            allowed_rule_ids,
+            ledger_enabled,
+            reported,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ReportFindingTool {
+    fn name(&self) -> &str {
+        "report_finding"
+    }
+
+    fn description(&self) -> &str {
+        "Record a verified code-review finding immediately so it is persisted across context truncation. \
+         Validates the finding schema on the spot and warns if rule_id does not match a configured gating rule."
+    }
+
+    fn parameters(&self) -> Value {
+        let rule_id_schema = if self.allowed_rule_ids.is_empty() {
+            serde_json::json!({
+                "type": "string",
+                "description": "Stable kebab-case rule identifier"
+            })
+        } else {
+            let mut unique = self.allowed_rule_ids.clone();
+            unique.sort();
+            unique.dedup();
+            serde_json::json!({
+                "type": "string",
+                "description": format!(
+                    "Rule identifier. Prefer an exact configured gating rule_id: {}",
+                    unique.join(", ")
+                )
+            })
+        };
+
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "rule_id": rule_id_schema,
+                "severity": {
+                    "type": "string",
+                    "enum": ["hint", "info", "warning", "error"],
+                    "description": "Finding severity"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Concise description of the concrete issue"
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "Relevant code snippet or factual evidence supporting this finding"
+                },
+                "location": {
+                    "type": "object",
+                    "description": "Optional source code location",
+                    "properties": {
+                        "file": { "type": "string" },
+                        "line_start": { "type": "integer", "minimum": 1 },
+                        "line_end": { "type": "integer", "minimum": 1 },
+                        "column_start": { "type": "integer", "minimum": 0 },
+                        "column_end": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["file", "line_start", "line_end"]
+                }
+            },
+            "required": ["rule_id", "severity", "message"]
+        })
+    }
+
+    async fn execute(&self, mut args: Value) -> Result<String, ToolError> {
+        // Fill omitted column_start/column_end defaults in location objects.
+        if let Some(loc) = args.get_mut("location").and_then(|v| v.as_object_mut()) {
+            loc.entry("column_start").or_insert_with(|| Value::from(1));
+            loc.entry("column_end").or_insert_with(|| Value::from(1));
+            if !loc.contains_key("line_end") {
+                if let Some(start) = loc.get("line_start").cloned() {
+                    loc.insert("line_end".to_string(), start);
+                }
+            }
+        }
+        crate::agent::normalize_finding_value(&mut args);
+
+        let finding: crate::types::Finding = serde_json::from_value(args).map_err(|e| {
+            ToolError::ExecutionFailed(format!(
+                "Invalid finding payload ({e}). Required fields: rule_id (string), \
+                 severity (hint|info|warning|error), message (string); optional: evidence, location."
+            ))
+        })?;
+
+        if let Ok(mut guard) = self.reported.lock() {
+            guard.push(finding.clone());
+        }
+        if self.ledger_enabled {
+            let path = crate::agent::ledger_path(&self.workspace_root, &self.task_id);
+            let _ = crate::agent::append_findings_to_ledger(&path, std::slice::from_ref(&finding));
+        }
+
+        if !self.allowed_rule_ids.is_empty()
+            && !self
+                .allowed_rule_ids
+                .iter()
+                .any(|allowed| allowed == &finding.rule_id)
+        {
+            let mut unique = self.allowed_rule_ids.clone();
+            unique.sort();
+            unique.dedup();
+            return Ok(format!(
+                "Finding recorded (rule_id='{}', severity={:?}). Note: '{}' does not match any \
+                 configured gating rule ({}). If this issue belongs to one of those rules, report \
+                 it with the exact configured rule_id.",
+                finding.rule_id,
+                finding.severity,
+                finding.rule_id,
+                unique.join(", ")
+            ));
+        }
+
+        Ok(format!(
+            "Finding recorded (rule_id='{}', severity={:?}).",
+            finding.rule_id, finding.severity
         ))
     }
 }
@@ -2882,5 +3110,70 @@ mod tests {
             "Expected git version output, got: {}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn test_report_finding_tool_validates_warns_unknown_rule_and_persists() {
+        let (_tmp, root) = setup_workspace();
+        let mut reg = ToolRegistry::new();
+        reg.register_report_finding(
+            root.clone(),
+            "task-rf".into(),
+            vec!["hardcoded-secret".into()],
+            true,
+        );
+        let tool = reg.get("report_finding").unwrap();
+
+        let err = tool
+            .execute(serde_json::json!({"rule_id": "hardcoded-secret"}))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("Invalid finding payload"));
+
+        let warn_out = tool
+            .execute(serde_json::json!({
+                "rule_id": "hardcoded-credential",
+                "severity": "critical",
+                "message": "Found leaked token",
+                "evidence": "TOKEN=abc",
+                "location": {"file": "src/a.rs", "line_start": 10}
+            }))
+            .await
+            .unwrap();
+        assert!(warn_out.contains("does not match any configured gating rule"));
+        assert!(warn_out.contains("hardcoded-secret"));
+
+        let ok_out = tool
+            .execute(serde_json::json!({
+                "rule_id": "hardcoded-secret",
+                "severity": "error",
+                "message": "Real secret"
+            }))
+            .await
+            .unwrap();
+        assert!(!ok_out.contains("does not match"));
+
+        let reported = reg.reported_findings();
+        assert_eq!(reported.len(), 2);
+        assert_eq!(reported[0].severity, crate::types::Severity::Error);
+        assert_eq!(reported[0].location.as_ref().unwrap().line_end, 10);
+    }
+
+    #[test]
+    fn test_spill_store_scales_inline_limit_with_token_budget() {
+        let (_tmp, root) = setup_workspace();
+        let small = SpillStore::new(root.clone(), "small").with_token_budget(4_000);
+        assert_eq!(small.max_inline_bytes(), 3_000);
+
+        let tiny = SpillStore::new(root.clone(), "tiny").with_token_budget(500);
+        assert_eq!(tiny.max_inline_bytes(), 2 * 1024);
+
+        let large = SpillStore::new(root.clone(), "large").with_token_budget(100_000);
+        assert_eq!(large.max_inline_bytes(), MAX_OUTPUT_BYTES);
+
+        let payload = "a".repeat(4_000);
+        let truncated = normalize_separators(&small.truncate_or_spill(payload));
+        assert!(truncated.contains("saved to .clausura/archives/tool-output-small-1.txt"));
+        assert!(truncated.contains("limit is 3000 bytes"));
     }
 }

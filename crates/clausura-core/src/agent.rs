@@ -145,12 +145,8 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
     let mut break_reason: Option<IncompleteReason> = None;
     let mut running_tokens: u64 = 0;
 
-    let tool_descriptions = config.tools.list_definitions();
-    let tools_json = serde_json::to_string_pretty(&tool_descriptions).unwrap_or_default();
-    let system_prompt = format!(
-        "{}\n\nAvailable tools:\n{}\n\nRespond in JSON format with a `findings` array.",
-        config.contract.prompt_template, tools_json,
-    );
+    let has_report_finding = config.tools.get("report_finding").is_some();
+    let system_prompt = build_system_prompt(config.contract, has_report_finding);
 
     messages.insert(0, Message::new(Role::System, system_prompt));
 
@@ -162,11 +158,17 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
         });
     }
 
-    let cm = ContextManager::new(
+    let mut cm = ContextManager::new(
         config.provider,
         config.contract.token_budget,
         config.workspace_root.clone(),
     );
+    let tool_defs_json =
+        serde_json::to_string(&config.tools.list_definitions()).unwrap_or_default();
+    let tool_defs_tokens = config.provider.count_tokens(&tool_defs_json);
+    if tool_defs_tokens < config.contract.token_budget / 2 {
+        cm = cm.with_tool_defs_overhead(tool_defs_tokens);
+    }
 
     // Auto-compact state: summarize dropped messages instead of bare
     // truncation, bounded by a per-run call cap to prevent compaction loops.
@@ -344,9 +346,10 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
                     }
                 };
 
-                // Merge findings persisted earlier in the run (which may have
-                // been truncated out of context since) back into the final
-                // set, so the final answer is never missing early iterations.
+                // Merge findings submitted via `report_finding` and persisted
+                // earlier in the ledger (which may have been truncated out of
+                // context since) back into the final set.
+                let findings = merge_with_ledger(findings, config.tools.reported_findings());
                 let findings = if config.contract.findings_ledger {
                     let ledger = read_ledger_findings(&ledger_path(
                         &config.workspace_root,
@@ -413,58 +416,79 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
                                 });
                             }
                         }
-                        match config.tools.get(&tc.name) {
-                            Some(tool) => {
-                                let result = tool.execute(tc.arguments.clone()).await;
-                                match result {
-                                    Ok(output) => {
-                                        if let Some(log) = config.event_log {
-                                            log.append(&RunEvent::ToolResult {
-                                                call_id: tc.id.clone(),
-                                                name: tc.name.clone(),
-                                                output: output.clone(),
-                                                error: None,
-                                            });
-                                        }
-                                        messages.push(Message::with_tool_call(
-                                            Role::Tool,
-                                            output,
-                                            tc.id.clone(),
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        if let Some(log) = config.event_log {
-                                            log.append(&RunEvent::ToolResult {
-                                                call_id: tc.id.clone(),
-                                                name: tc.name.clone(),
-                                                output: format!("Error: {}", e),
-                                                error: Some(format!("{}", e)),
-                                            });
-                                        }
-                                        messages.push(Message::with_tool_call(
-                                            Role::Tool,
-                                            format!("Error: {}", e),
-                                            tc.id.clone(),
-                                        ));
-                                    }
-                                }
-                            }
-                            None => {
-                                if let Some(log) = config.event_log {
-                                    log.append(&RunEvent::ToolResult {
-                                        call_id: tc.id.clone(),
-                                        name: tc.name.clone(),
-                                        output: format!("Error: Tool '{}' not found", tc.name),
-                                        error: Some(format!("Tool '{}' not found", tc.name)),
-                                    });
-                                }
-                                messages.push(Message::with_tool_call(
-                                    Role::Tool,
-                                    format!("Error: Tool '{}' not found", tc.name),
-                                    tc.id.clone(),
-                                ));
+                    }
+
+                    // Execute batches of multiple read-only tools concurrently
+                    // while preserving result ordering; keep side-effecting or
+                    // stateful tools (shell_exec, report_finding, MCP) serial.
+                    let outcomes: Vec<(String, Option<String>)> = if tool_calls.len() > 1
+                        && tool_calls.iter().all(|tc| is_readonly_tool(&tc.name))
+                    {
+                        let mut join_set = tokio::task::JoinSet::new();
+                        for (idx, tc) in tool_calls.iter().enumerate() {
+                            let tool_opt = config.tools.get(&tc.name);
+                            let name = tc.name.clone();
+                            let args = tc.arguments.clone();
+                            join_set.spawn(async move {
+                                let res = match tool_opt {
+                                    Some(tool) => match tool.execute(args).await {
+                                        Ok(output) => (output, None),
+                                        Err(e) => (format!("Error: {}", e), Some(format!("{}", e))),
+                                    },
+                                    None => (
+                                        format!("Error: Tool '{}' not found", name),
+                                        Some(format!("Tool '{}' not found", name)),
+                                    ),
+                                };
+                                (idx, res)
+                            });
+                        }
+                        let mut ordered: Vec<Option<(String, Option<String>)>> =
+                            vec![None; tool_calls.len()];
+                        while let Some(joined) = join_set.join_next().await {
+                            if let Ok((idx, res)) = joined {
+                                ordered[idx] = Some(res);
                             }
                         }
+                        ordered
+                            .into_iter()
+                            .map(|opt| {
+                                opt.unwrap_or_else(|| {
+                                    (
+                                        "Error: Tool task panicked".to_string(),
+                                        Some("Tool task panicked".to_string()),
+                                    )
+                                })
+                            })
+                            .collect()
+                    } else {
+                        let mut serial = Vec::with_capacity(tool_calls.len());
+                        for tc in &tool_calls {
+                            let res = match config.tools.get(&tc.name) {
+                                Some(tool) => match tool.execute(tc.arguments.clone()).await {
+                                    Ok(output) => (output, None),
+                                    Err(e) => (format!("Error: {}", e), Some(format!("{}", e))),
+                                },
+                                None => (
+                                    format!("Error: Tool '{}' not found", tc.name),
+                                    Some(format!("Tool '{}' not found", tc.name)),
+                                ),
+                            };
+                            serial.push(res);
+                        }
+                        serial
+                    };
+
+                    for (tc, (output, error)) in tool_calls.iter().zip(outcomes) {
+                        if let Some(log) = config.event_log {
+                            log.append(&RunEvent::ToolResult {
+                                call_id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                output: output.clone(),
+                                error,
+                            });
+                        }
+                        messages.push(Message::with_tool_call(Role::Tool, output, tc.id.clone()));
                     }
                 } else {
                     break;
@@ -563,7 +587,9 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
         }
     }
 
-    // Best-effort merge of ledger findings for the incomplete path too.
+    // Best-effort merge of incrementally reported and ledger findings for the
+    // incomplete path too.
+    let findings = merge_with_ledger(findings, config.tools.reported_findings());
     let findings = if config.contract.findings_ledger {
         let ledger =
             read_ledger_findings(&ledger_path(&config.workspace_root, &config.contract.id));
@@ -588,6 +614,69 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
         truncated,
         incomplete_reason: break_reason,
     })
+}
+
+/// Build the system prompt for the agent loop, injecting configured gating
+/// rule IDs and the exact findings JSON schema so models do not drift on
+/// `rule_id` names or severity labels. Tool schemas are passed natively via
+/// the provider's `tools` API parameter rather than duplicated in text.
+fn build_system_prompt(contract: &TaskContract, has_report_finding: bool) -> String {
+    use std::fmt::Write;
+    let mut prompt = contract.prompt_template.clone();
+
+    if !contract.gating_rules.is_empty() {
+        prompt.push_str("\n\nConfigured gating rules (use these EXACT `rule_id` values for matching issues — do not invent synonyms):\n");
+        let mut seen = std::collections::HashSet::new();
+        for rule in &contract.gating_rules {
+            if seen.insert(rule.rule_id.as_str()) {
+                let min_sev = match rule.min_severity {
+                    crate::types::Severity::Hint => "hint",
+                    crate::types::Severity::Info => "info",
+                    crate::types::Severity::Warning => "warning",
+                    crate::types::Severity::Error => "error",
+                };
+                if rule.description.is_empty() {
+                    let _ = writeln!(prompt, "- `{}` (min_severity: {})", rule.rule_id, min_sev);
+                } else {
+                    let _ = writeln!(
+                        prompt,
+                        "- `{}` (min_severity: {}): {}",
+                        rule.rule_id, min_sev, rule.description
+                    );
+                }
+            }
+        }
+    }
+
+    prompt.push_str(
+        "\n\nOutput contract:\n\
+         Respond with a JSON object of the form:\n\
+         {\"findings\": [{\"rule_id\": \"...\", \"severity\": \"hint|info|warning|error\", \
+         \"message\": \"...\", \"evidence\": \"...\", \"location\": {\"file\": \"...\", \
+         \"line_start\": 1, \"line_end\": 1, \"column_start\": 1, \"column_end\": 1}}]}\n\
+         Rules:\n\
+         - `severity` MUST be one of: `hint`, `info`, `warning`, `error`.\n\
+         - `location` is optional; omit it when there is no specific file location.\n\
+         - Include concrete `evidence` (code snippet or observed fact) for every finding.",
+    );
+
+    if has_report_finding {
+        prompt.push_str(
+            "\n- You may call `report_finding` as soon as you verify an issue to persist it \
+             incrementally (survives context truncation). Still conclude with the final JSON \
+             object (duplicates are automatically merged).",
+        );
+    }
+
+    prompt
+}
+
+/// Built-in read-only tools safe to execute concurrently within one batch.
+fn is_readonly_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "list_files" | "grep" | "git_diff" | "read_skill"
+    )
 }
 
 /// Dispatch one LLM request with tool definitions, recording the full
@@ -646,6 +735,20 @@ async fn truncate_and_hint(
     event_log: Option<&EventLog>,
     force: bool,
 ) -> bool {
+    // First pass: prune oversized older tool outputs in place (preserving the
+    // most recent tool-result turn intact). This recovers context room without
+    // discarding earlier instructions or triggering premature ContextLimit.
+    let target_ratio = if force { 0.5 } else { 0.75 };
+    let target_tokens = (token_budget as f64 * target_ratio) as u64;
+    let pruned = cm.prune_old_tool_outputs(messages, target_tokens);
+    if pruned > 0 && !force && !cm.should_truncate(messages) {
+        tracing::info!(
+            pruned_tool_outputs = pruned,
+            "pruned older tool outputs in place to stay within token budget"
+        );
+        return true;
+    }
+
     let snapshot = messages.clone();
     let (was_truncated, count) = if force {
         // Reactive: reduce to 50% of the budget, not 75% — the provider's
@@ -1018,7 +1121,7 @@ fn truncate_summary_to_budget(provider: &dyn Provider, summary: &str, cap_tokens
 
 /// Path to the findings ledger for a task: one Finding per JSON line.
 /// Lives next to the context archives so cleanup can sweep both.
-fn ledger_path(workspace_root: &Path, task_id: &str) -> PathBuf {
+pub(crate) fn ledger_path(workspace_root: &Path, task_id: &str) -> PathBuf {
     workspace_root
         .join(".clausura")
         .join("archives")
@@ -1043,7 +1146,7 @@ pub(crate) fn archive_previous_ledger(workspace_root: &Path, task_id: &str) -> s
 
 /// Append findings to the ledger, creating file/dirs as needed.
 /// Best-effort by design: the ledger is a safety net, not a dependency.
-fn append_findings_to_ledger(path: &Path, findings: &[Finding]) -> std::io::Result<()> {
+pub(crate) fn append_findings_to_ledger(path: &Path, findings: &[Finding]) -> std::io::Result<()> {
     if findings.is_empty() {
         return Ok(());
     }
@@ -1077,34 +1180,80 @@ fn read_ledger_findings(path: &Path) -> Vec<Finding> {
         .collect()
 }
 
-/// Merge ledger findings into the final findings.
+/// Deduplicate findings deterministically.
 ///
-/// The final response wins on conflicts; ledger-only findings (e.g. from
-/// iterations that were truncated out of context) are appended. Dedup key:
-/// rule_id + location + message. Deterministic — no LLM involved.
-fn merge_with_ledger(final_findings: Vec<Finding>, ledger: Vec<Finding>) -> Vec<Finding> {
-    let mut seen = std::collections::HashSet::new();
-    let mut merged = Vec::with_capacity(final_findings.len() + ledger.len());
-    for f in final_findings {
-        if seen.insert(finding_key(&f)) {
-            merged.push(f);
+/// Two findings match when they share the same `rule_id` and:
+/// - both have a `location` pointing to the same normalized file path with
+///   overlapping or adjacent line ranges (`a.line_start <= b.line_end + 1 &&
+///   b.line_start <= a.line_end + 1`), OR
+/// - neither has a `location` and their whitespace/case-normalized `message`
+///   matches.
+///
+/// The first occurrence wins (so final-response findings take precedence over
+/// earlier ledger entries), while missing `evidence` is backfilled from the
+/// duplicate when available.
+pub(crate) fn dedup_findings(findings: Vec<Finding>) -> Vec<Finding> {
+    let mut merged: Vec<Finding> = Vec::with_capacity(findings.len());
+    for candidate in findings {
+        if let Some(existing) = merged.iter_mut().find(|e| findings_match(e, &candidate)) {
+            if existing.evidence.trim().is_empty() && !candidate.evidence.trim().is_empty() {
+                existing.evidence = candidate.evidence;
+            }
+            if candidate.severity > existing.severity {
+                existing.severity = candidate.severity;
+            }
+            continue;
         }
-    }
-    for f in ledger {
-        if seen.insert(finding_key(&f)) {
-            merged.push(f);
-        }
+        merged.push(candidate);
     }
     merged
 }
 
-fn finding_key(f: &Finding) -> String {
-    format!(
-        "{}|{}|{}",
-        f.rule_id,
-        serde_json::to_string(&f.location).unwrap_or_default(),
-        f.message
-    )
+fn normalize_file_path(path: &str) -> &str {
+    path.trim().trim_start_matches("./")
+}
+
+fn normalize_message(msg: &str) -> String {
+    msg.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn findings_match(a: &Finding, b: &Finding) -> bool {
+    if a.rule_id != b.rule_id {
+        return false;
+    }
+    match (&a.location, &b.location) {
+        (Some(la), Some(lb)) => {
+            if normalize_file_path(&la.file) != normalize_file_path(&lb.file) {
+                return false;
+            }
+            let (a_start, a_end) = (
+                la.line_start.min(la.line_end),
+                la.line_start.max(la.line_end),
+            );
+            let (b_start, b_end) = (
+                lb.line_start.min(lb.line_end),
+                lb.line_start.max(lb.line_end),
+            );
+            if a_start == 0 || b_start == 0 {
+                return normalize_message(&a.message) == normalize_message(&b.message);
+            }
+            a_start <= b_end.saturating_add(1) && b_start <= a_end.saturating_add(1)
+        }
+        (None, None) => normalize_message(&a.message) == normalize_message(&b.message),
+        _ => false,
+    }
+}
+
+/// Merge ledger findings into the final findings.
+///
+/// The final response wins on conflicts; ledger-only findings (e.g. from
+/// iterations that were truncated out of context) are appended.
+fn merge_with_ledger(mut final_findings: Vec<Finding>, ledger: Vec<Finding>) -> Vec<Finding> {
+    final_findings.extend(ledger);
+    dedup_findings(final_findings)
 }
 
 /// Cap diagnostic text embedded in errors and events at 2 KB so CI logs stay
@@ -1200,20 +1349,7 @@ fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
     let mut parsed = Vec::with_capacity(total);
     let mut errors = Vec::new();
     for (i, el) in elements.iter_mut().enumerate() {
-        // Fix UUID before deserialization: LLMs sometimes omit or malform
-        // the id field. Since it is an internal-only identifier (not forwarded
-        // to SARIF), we can safely auto-generate it server-side.
-        fix_finding_uuid(el);
-
-        // `description` is a widespread alias for `message` in agent output
-        // schemas (several models emit it natively). Promote it instead of
-        // failing the whole batch and burning a corrective recovery call.
-        fix_finding_message(el);
-
-        // Several models emit `location` as a "file:line" string instead of
-        // the object form. Normalize it so the finding keeps its location
-        // instead of failing schema validation.
-        fix_finding_location(el);
+        normalize_finding_value(el);
 
         match serde_json::from_value::<Finding>(el.clone()) {
             Ok(f) => parsed.push(f),
@@ -1240,6 +1376,41 @@ fn extract_findings(content: &str) -> Result<Vec<Finding>, String> {
     }
 
     Ok(parsed)
+}
+
+/// Normalize common LLM output quirks on a finding JSON object before strict
+/// deserialization into [`Finding`]: auto-fill `id`, promote message aliases,
+/// normalize `"file:line"` locations, and map common severity aliases
+/// (`critical`/`high` → `error`, `medium`/`warn` → `warning`, `low`/`note` →
+/// `info`, `style`/`suggestion` → `hint`).
+pub(crate) fn normalize_finding_value(el: &mut serde_json::Value) {
+    fix_finding_uuid(el);
+    fix_finding_message(el);
+    fix_finding_location(el);
+    fix_finding_severity(el);
+}
+
+/// Normalize well-known severity synonyms emitted by LLMs (`high`, `critical`,
+/// `medium`, `low`, etc.) into Clausura's 4-level severity enum. Unrecognized
+/// values are left untouched so strict schema validation still rejects them.
+fn fix_finding_severity(el: &mut serde_json::Value) {
+    let Some(obj) = el.as_object_mut() else {
+        return;
+    };
+    let Some(raw) = obj.get("severity").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let normalized = match raw.trim().to_lowercase().as_str() {
+        "error" | "err" | "critical" | "blocker" | "severe" | "high" | "fatal" => "error",
+        "warning" | "warn" | "medium" | "moderate" | "major" => "warning",
+        "info" | "information" | "informational" | "low" | "minor" | "note" => "info",
+        "hint" | "style" | "suggestion" | "trivial" => "hint",
+        _ => return,
+    };
+    obj.insert(
+        "severity".to_string(),
+        serde_json::Value::String(normalized.to_string()),
+    );
 }
 
 /// Ensure a finding element has a valid UUID v4 in its `id` field.
@@ -1436,6 +1607,9 @@ mod tests {
             tool_allowlist: vec!["git".into()],
             token_budget: 100000,
             max_total_tokens: None,
+            max_output_tokens: None,
+            temperature: None,
+            prompt_caching: true,
             auto_compact: false,
             max_compactions: 3,
             findings_ledger: true,
@@ -3722,5 +3896,195 @@ mod tests {
             result.findings.is_empty(),
             "fully schema-invalid findings must not be silently reported as findings"
         );
+    }
+
+    #[test]
+    fn test_extract_findings_normalizes_severity_aliases() {
+        let json = r#"{"findings": [
+            {"rule_id": "sql-injection", "severity": "CRITICAL", "message": "sql"},
+            {"rule_id": "xss", "severity": "High", "message": "xss"},
+            {"rule_id": "lint", "severity": "medium", "message": "med"},
+            {"rule_id": "note", "severity": "low", "message": "low"},
+            {"rule_id": "fmt", "severity": "style", "message": "style"}
+        ]}"#;
+        let findings = extract_findings(json).unwrap();
+        assert_eq!(findings.len(), 5);
+        assert_eq!(findings[0].severity, crate::types::Severity::Error);
+        assert_eq!(findings[1].severity, crate::types::Severity::Error);
+        assert_eq!(findings[2].severity, crate::types::Severity::Warning);
+        assert_eq!(findings[3].severity, crate::types::Severity::Info);
+        assert_eq!(findings[4].severity, crate::types::Severity::Hint);
+
+        let unknown = r#"{"findings": [{"rule_id": "x", "severity": "banana", "message": "bad"}]}"#;
+        assert!(extract_findings(unknown).is_err());
+    }
+
+    #[test]
+    fn test_build_system_prompt_injects_gating_rules_and_schema() {
+        let mut contract = test_contract();
+        contract.gating_rules = vec![crate::types::GateRule {
+            rule_id: "hardcoded-secret".into(),
+            description: "No hardcoded secrets".into(),
+            min_severity: crate::types::Severity::Error,
+            max_findings: 0,
+            action: crate::types::GateAction::Fail,
+        }];
+        let prompt = build_system_prompt(&contract, true);
+        assert!(prompt.contains("`hardcoded-secret`"));
+        assert!(prompt.contains("No hardcoded secrets"));
+        assert!(prompt.contains("hint|info|warning|error"));
+        assert!(prompt.contains("report_finding"));
+        assert!(
+            !prompt.contains("Available tools:"),
+            "tool definitions must not be duplicated into system prompt text"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_report_finding_tool_persists_findings() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let mut contract = test_contract();
+        contract.gating_rules = vec![crate::types::GateRule {
+            rule_id: "hardcoded-secret".into(),
+            description: "Block secrets".into(),
+            min_severity: crate::types::Severity::Error,
+            max_findings: 0,
+            action: crate::types::GateAction::Fail,
+        }];
+        let mut tools = default_tools(root.clone(), &[], 120, &[], None);
+        tools.register_report_finding(
+            root.clone(),
+            contract.id.clone(),
+            vec!["hardcoded-secret".into()],
+            contract.findings_ledger,
+        );
+
+        let mut mock = MockProvider::new("gpt-4o");
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, "Found a hardcoded secret."),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 15,
+                total_tokens: 35,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_rf".into(),
+                name: "report_finding".into(),
+                arguments: serde_json::json!({
+                    "rule_id": "hardcoded-secret",
+                    "severity": "high",
+                    "message": "Hardcoded API key",
+                    "evidence": "const KEY = 'sk-live-123'",
+                    "location": "src/config.ts:42"
+                }),
+            }]),
+        });
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, r#"{"findings": []}"#),
+            usage: Usage {
+                input_tokens: 30,
+                output_tokens: 10,
+                total_tokens: 40,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let result = run_agent_loop(AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Review")],
+            workspace_root: root,
+            snapshot_mgr: None,
+            event_log: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(!result.truncated);
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].rule_id, "hardcoded-secret");
+        assert_eq!(result.findings[0].severity, crate::types::Severity::Error);
+        assert_eq!(
+            result.findings[0].location.as_ref().unwrap().file,
+            "src/config.ts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_parallel_readonly_tools_preserve_order() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "alpha content\n").unwrap();
+        std::fs::write(root.join("b.txt"), "beta content\n").unwrap();
+        std::fs::write(root.join("c.txt"), "gamma content\n").unwrap();
+
+        let tools = default_tools(root.clone(), &[], 120, &[], None);
+        let contract = test_contract();
+        let mut mock = MockProvider::new("gpt-4o");
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, "Reading three files in parallel"),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 10,
+                total_tokens: 20,
+            },
+            finish_reason: FinishReason::ToolCalls,
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: "c_a".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "a.txt"}),
+                },
+                ToolCall {
+                    id: "c_b".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "b.txt"}),
+                },
+                ToolCall {
+                    id: "c_c".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "c.txt"}),
+                },
+            ]),
+        });
+        mock.add_response(ChatResponse {
+            message: Message::new(Role::Assistant, r#"{"findings": []}"#),
+            usage: Usage {
+                input_tokens: 20,
+                output_tokens: 5,
+                total_tokens: 25,
+            },
+            finish_reason: FinishReason::Stop,
+            tool_calls: None,
+        });
+
+        let result = run_agent_loop(AgentConfig {
+            contract: &contract,
+            provider: &mock,
+            tools: &tools,
+            initial_messages: vec![Message::new(Role::User, "Read files")],
+            workspace_root: root,
+            snapshot_mgr: None,
+            event_log: None,
+        })
+        .await
+        .unwrap();
+
+        let tool_msgs: Vec<&Message> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 3);
+        assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("c_a"));
+        assert!(tool_msgs[0].content.contains("alpha content"));
+        assert_eq!(tool_msgs[1].tool_call_id.as_deref(), Some("c_b"));
+        assert!(tool_msgs[1].content.contains("beta content"));
+        assert_eq!(tool_msgs[2].tool_call_id.as_deref(), Some("c_c"));
+        assert!(tool_msgs[2].content.contains("gamma content"));
     }
 }

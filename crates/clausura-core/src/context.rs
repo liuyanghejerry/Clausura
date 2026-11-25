@@ -9,6 +9,7 @@ pub struct ContextManager<'a> {
     provider: &'a dyn Provider,
     token_budget: u64,
     workspace_root: PathBuf,
+    tool_defs_overhead: u64,
 }
 
 /// Create the archive directory at `{workspace_root}/.clausura/archives/`.
@@ -25,7 +26,15 @@ impl<'a> ContextManager<'a> {
             provider,
             token_budget,
             workspace_root,
+            tool_defs_overhead: 0,
         }
+    }
+
+    /// Account for static API-level tool-definition schema tokens in budget
+    /// checks so `should_truncate` reflects the real prompt payload size.
+    pub fn with_tool_defs_overhead(mut self, tokens: u64) -> Self {
+        self.tool_defs_overhead = tokens;
+        self
     }
 
     /// Create the archive directory at `{workspace_root}/.clausura/archives/`.
@@ -83,13 +92,87 @@ impl<'a> ContextManager<'a> {
         Ok(relative_path)
     }
 
-    /// Count total tokens in messages.
+    /// Count total tokens in messages, including tool call names/arguments and
+    /// any configured static tool-definition overhead.
     pub fn count_tokens(&self, messages: &[Message]) -> u64 {
-        messages
+        let msg_tokens: u64 = messages
             .iter()
-            .map(|m| self.provider.count_tokens(&m.content))
-            .sum::<u64>()
-            + (messages.len() as u64) // overhead per message
+            .map(|m| {
+                let mut total = if m.content.is_empty() {
+                    0
+                } else {
+                    self.provider.count_tokens(&m.content)
+                };
+                if let Some(tcid) = &m.tool_call_id {
+                    total += self.provider.count_tokens(tcid);
+                }
+                if let Some(calls) = &m.tool_calls {
+                    for tc in calls {
+                        total += self.provider.count_tokens(&tc.name);
+                        let args_str = tc.arguments.to_string();
+                        total += self.provider.count_tokens(&args_str);
+                    }
+                }
+                total + 1 // per-message overhead
+            })
+            .sum();
+        self.tool_defs_overhead + msg_tokens
+    }
+
+    /// Prune oversized older `Role::Tool` outputs in place (leaving the latest
+    /// contiguous batch of tool results intact) until total tokens fit within
+    /// `target_tokens`. Preserves a short head preview and any spill/resume
+    /// locator line so the agent can re-read if needed.
+    ///
+    /// Returns the number of tool messages pruned.
+    pub fn prune_old_tool_outputs(&self, messages: &mut [Message], target_tokens: u64) -> usize {
+        if self.count_tokens(messages) <= target_tokens {
+            return 0;
+        }
+
+        // Find the start of the most recent tool-result turn so we never prune
+        // what the agent literally just fetched.
+        let mut protected_from = messages.len();
+        if let Some(last_tool) = messages.iter().rposition(|m| m.role == Role::Tool) {
+            let mut batch_start = last_tool;
+            while batch_start > 0 && messages[batch_start - 1].role == Role::Tool {
+                batch_start -= 1;
+            }
+            protected_from = batch_start;
+        }
+
+        const MIN_PRUNE_CHARS: usize = 400;
+        const PREVIEW_CHARS: usize = 160;
+        const PRUNED_MARKER: &str = "[earlier tool output pruned to stay within token budget]";
+
+        let mut pruned = 0usize;
+        for idx in 1..protected_from {
+            if self.count_tokens(messages) <= target_tokens {
+                break;
+            }
+            if messages[idx].role != Role::Tool {
+                continue;
+            }
+            let content = &messages[idx].content;
+            if content.contains(PRUNED_MARKER) || content.chars().count() < MIN_PRUNE_CHARS {
+                continue;
+            }
+
+            let preview: String = content.chars().take(PREVIEW_CHARS).collect();
+            let locator_line = content
+                .lines()
+                .rev()
+                .find(|l| l.contains("saved to ") || l.contains("resume from "))
+                .map(|l| format!("\n{l}"))
+                .unwrap_or_default();
+
+            messages[idx].content = format!(
+                "{preview}...\n{PRUNED_MARKER} ({} bytes originally){locator_line}",
+                content.len()
+            );
+            pruned += 1;
+        }
+        pruned
     }
 
     /// Estimate remaining token budget.
@@ -390,6 +473,66 @@ mod tests {
         let _ = std::fs::set_permissions(
             &readonly_for_cleanup,
             std::fs::Permissions::from_mode(0o755),
+        );
+    }
+
+    #[test]
+    fn test_count_tokens_includes_tool_calls_and_overhead() {
+        let mock = MockProvider::new("test");
+        let root = TempDir::new().unwrap();
+        let cm_plain = ContextManager::new(&mock, 10_000, root.path().to_path_buf());
+        let cm_with_defs = ContextManager::new(&mock, 10_000, root.path().to_path_buf())
+            .with_tool_defs_overhead(200);
+
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            tool_calls: Some(vec![crate::types::ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "src/very/long/path/example.rs", "offset": 0, "limit": 500}),
+            }]),
+        }];
+
+        let plain_tokens = cm_plain.count_tokens(&msgs);
+        assert!(
+            plain_tokens > 10,
+            "tool_calls name and arguments must contribute tokens, got {plain_tokens}"
+        );
+        assert_eq!(cm_with_defs.count_tokens(&msgs), plain_tokens + 200);
+    }
+
+    #[test]
+    fn test_prune_old_tool_outputs_preserves_latest_batch_and_locator() {
+        let mock = MockProvider::new("test");
+        let root = TempDir::new().unwrap();
+        let cm = ContextManager::new(&mock, 500, root.path().to_path_buf());
+
+        let old_big = format!(
+            "{}\n... [output truncated: saved to .clausura/archives/tool-output-t-1.txt — read it with read_file]",
+            "line of diff content\n".repeat(120)
+        );
+        let recent_big = "recent diff line\n".repeat(40);
+
+        let mut msgs = vec![
+            Message::new(Role::System, "sys"),
+            Message::new(Role::User, "review"),
+            Message::new(Role::Assistant, "step 1"),
+            Message::with_tool_call(Role::Tool, old_big.clone(), "c1".into()),
+            Message::new(Role::Assistant, "step 2"),
+            Message::with_tool_call(Role::Tool, recent_big.clone(), "c2".into()),
+        ];
+
+        let pruned = cm.prune_old_tool_outputs(&mut msgs, 350);
+        assert_eq!(pruned, 1);
+        assert!(msgs[3].content.contains("earlier tool output pruned"));
+        assert!(msgs[3]
+            .content
+            .contains(".clausura/archives/tool-output-t-1.txt"));
+        assert_eq!(
+            msgs[5].content, recent_big,
+            "most recent tool-result batch must remain untouched"
         );
     }
 }

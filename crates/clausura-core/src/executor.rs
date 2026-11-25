@@ -2,7 +2,7 @@ use crate::agent::{run_agent_loop, AgentConfig};
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
 use crate::eventlog::{EventLog, RunEvent};
-use crate::provider::create_provider;
+use crate::provider::{create_provider_with_options, ProviderOptions};
 use crate::rules::RuleEngine;
 use crate::sarif::SarifFormatter;
 use crate::snapshot::SnapshotManager;
@@ -146,17 +146,76 @@ fn rate_limit_backoff(retries: u32) -> std::time::Duration {
     std::time::Duration::from_secs(30u64 << retries.min(4))
 }
 
-/// Status of one shard's execution, recorded for the run summary.
-#[derive(serde::Serialize, Debug, Clone)]
+/// Status of one shard's execution, recorded for the run summary and resume checkpoints.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct ShardRecord {
     shard: usize,
     files: Vec<String>,
-    status: &'static str,
+    status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     findings: usize,
     tokens: u64,
     attempts: u32,
+}
+
+/// Persisted checkpoint record for a completed shard, enabling `--resume`
+/// across sharded runs without re-billing finished shards.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ShardCheckpointEntry {
+    shard_key: String,
+    record: ShardRecord,
+    findings: Vec<Finding>,
+    usage: Usage,
+}
+
+fn shard_key(shard: &crate::shard::Shard) -> String {
+    format!("{}#{}", shard.paths().join(","), shard.total_bytes())
+}
+
+fn shard_checkpoint_path(workspace: &Path, task_id: &str) -> std::path::PathBuf {
+    workspace
+        .join(".clausura")
+        .join("archives")
+        .join(format!("shard-checkpoint-{task_id}.jsonl"))
+}
+
+fn load_shard_checkpoints(
+    workspace: &Path,
+    task_id: &str,
+) -> std::collections::HashMap<String, ShardCheckpointEntry> {
+    let path = shard_checkpoint_path(workspace, task_id);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return std::collections::HashMap::new();
+    };
+    let mut map = std::collections::HashMap::new();
+    for line in content.lines() {
+        if let Ok(entry) = serde_json::from_str::<ShardCheckpointEntry>(line) {
+            map.insert(entry.shard_key.clone(), entry);
+        }
+    }
+    map
+}
+
+fn append_shard_checkpoint(workspace: &Path, task_id: &str, entry: &ShardCheckpointEntry) {
+    let path = shard_checkpoint_path(workspace, task_id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(line) = serde_json::to_string(entry) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+fn clear_shard_checkpoint(workspace: &Path, task_id: &str) {
+    let _ = std::fs::remove_file(shard_checkpoint_path(workspace, task_id));
 }
 
 /// Run `git <args...>` in the workspace and return stdout.
@@ -220,40 +279,21 @@ async fn collect_shard_plan(
         ));
     }
 
-    let mut name_args: Vec<String> = vec![
+    let unified = format!("--unified={}", sharding.context_lines);
+    let mut diff_args: Vec<String> = vec![
         "diff".into(),
-        "--name-only".into(),
-        merge_base.clone(),
+        "--no-ext-diff".into(),
+        unified,
+        merge_base,
         "HEAD".into(),
     ];
     if !sharding.paths.is_empty() {
-        name_args.push("--".into());
-        name_args.extend(sharding.paths.iter().cloned());
+        diff_args.push("--".into());
+        diff_args.extend(sharding.paths.iter().cloned());
     }
-    let name_refs: Vec<&str> = name_args.iter().map(|s| s.as_str()).collect();
-    let names = run_git_output(workspace, &name_refs).await?;
-    let files: Vec<String> = names
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| {
-            !l.is_empty()
-                // Clausura's own config/skills are audit inputs, not audit targets.
-                && l != ".clausura.yaml"
-                && l != ".clausura.yml"
-                && !l.starts_with(".clausura/")
-        })
-        .collect();
-
-    let unified = format!("--unified={}", sharding.context_lines);
-    let mut file_diffs = Vec::with_capacity(files.len());
-    for file in &files {
-        let diff = run_git_output(
-            workspace,
-            &["diff", &unified, &merge_base, "HEAD", "--", file],
-        )
-        .await?;
-        file_diffs.push(crate::shard::FileDiff::new(file.clone(), diff));
-    }
+    let diff_refs: Vec<&str> = diff_args.iter().map(|s| s.as_str()).collect();
+    let full_diff = run_git_output(workspace, &diff_refs).await?;
+    let file_diffs = crate::shard::split_unified_diff_by_file(&full_diff);
 
     let extra_patterns: Vec<(String, String)> =
         sharding.risk_patterns.clone().into_iter().collect();
@@ -281,23 +321,9 @@ pub async fn plan_sharding_preview(
     Ok((file_diffs.len(), total_bytes, shards.len()))
 }
 
-/// Deduplicate findings across shards (same rule/location/message keeps
-/// only the first occurrence).
+/// Deduplicate findings across shards (overlap/adjacent-line aware).
 fn dedup_findings(findings: Vec<Finding>) -> Vec<Finding> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(findings.len());
-    for f in findings {
-        let key = format!(
-            "{}|{}|{}",
-            f.rule_id,
-            serde_json::to_string(&f.location).unwrap_or_default(),
-            f.message
-        );
-        if seen.insert(key) {
-            out.push(f);
-        }
-    }
-    out
+    crate::agent::dedup_findings(findings)
 }
 
 /// The sharded audit path: per-file diffs grouped into bounded shards, one
@@ -339,28 +365,58 @@ async fn execute_sharded_task(
         tracing::info!("no changed files in range — nothing to audit");
     }
 
-    let provider = match create_provider(
-        &config.task.vendor,
-        &config.task.model,
-        &config.api_key.clone().unwrap_or_default(),
-        config.task.timeout_secs,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            return ExecutionReport {
-                task_id,
-                exit_code: 2,
-                findings: vec![],
-                token_usage: Usage::default(),
-                duration_ms: start.elapsed().as_millis() as u64,
-                snapshot_id: None,
-                errors: vec![format!("Provider init error: {}", e)],
-                violations: vec![],
-                status: RunStatus::Error,
-                incomplete_reason: None,
-                verification: None,
-            };
-        }
+    let provider_opts = ProviderOptions {
+        max_output_tokens: config.task.max_output_tokens,
+        temperature: config.task.temperature,
+        prompt_caching: config.task.prompt_caching,
+    };
+    let provider: Arc<Box<dyn crate::provider::Provider>> = Arc::new(
+        match create_provider_with_options(
+            &config.task.vendor,
+            &config.task.model,
+            &config.api_key.clone().unwrap_or_default(),
+            config.task.timeout_secs,
+            &provider_opts,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return ExecutionReport {
+                    task_id,
+                    exit_code: 2,
+                    findings: vec![],
+                    token_usage: Usage::default(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    snapshot_id: None,
+                    errors: vec![format!("Provider init error: {}", e)],
+                    violations: vec![],
+                    status: RunStatus::Error,
+                    incomplete_reason: None,
+                    verification: None,
+                };
+            }
+        },
+    );
+
+    let mcp_manager = Arc::new(
+        crate::mcp::McpClientManager::start_in_workspace(
+            &config.task.mcp_servers,
+            config.task.shell_timeout_secs,
+            Some(&workspace),
+        )
+        .await,
+    );
+
+    let all_pr_files: Arc<Vec<String>> =
+        Arc::new(file_diffs.iter().map(|fd| fd.path.clone()).collect());
+    let risk_hits = Arc::new(risk_hits);
+
+    // Shard-level resume checkpoints: fresh runs clear any stale checkpoint;
+    // `--resume` skips already-completed shards and reuses their findings.
+    let completed_checkpoints = if config.resume {
+        load_shard_checkpoints(&workspace, &task_id)
+    } else {
+        clear_shard_checkpoint(&workspace, &task_id);
+        std::collections::HashMap::new()
     };
 
     let mut queue: VecDeque<(crate::shard::Shard, u32, usize, u32)> = VecDeque::new();
@@ -375,74 +431,170 @@ async fn execute_sharded_task(
     let mut incomplete_shards = 0usize;
     let mut strict_incomplete = false;
 
-    while let Some((shard, splits_used, shard_no, rate_retries)) = queue.pop_front() {
-        let shard_task_id = format!("{}-shard-{}", task_id, shard_no);
-        let mut contract = config.task.clone();
-        contract.id = shard_task_id.clone();
-        contract.name = format!("{} (shard {})", config.task.name, shard_no);
-        if let Some(tb) = sharding.per_shard.token_budget {
-            contract.token_budget = tb;
-        }
-        if let Some(mt) = sharding.per_shard.max_total_tokens {
-            contract.max_total_tokens = Some(mt);
-        }
-        if let Some(mi) = sharding.per_shard.max_iterations {
-            contract.max_iterations = mi;
-        }
-        if let Some(ts) = sharding.per_shard.timeout_secs {
-            contract.timeout_secs = ts;
-        }
-        contract.prompt_template = shard_prompt(&config.task.prompt_template);
+    let max_concurrency = sharding.concurrency.max(1);
+    let rate_limit_until: Arc<tokio::sync::Mutex<Option<Instant>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let mut dispatch_seq: usize = 0;
 
-        if let Err(e) = crate::agent::archive_previous_ledger(&workspace, &shard_task_id) {
-            return execution_error(
-                config,
-                start,
-                format!("Ledger initialization failed: {e}"),
-                None,
-            );
+    type ShardTaskOutput = (
+        crate::shard::Shard,
+        u32,
+        usize,
+        u32,
+        String,
+        Result<crate::agent::AgentResult, ProviderError>,
+    );
+    let mut in_flight: tokio::task::JoinSet<ShardTaskOutput> = tokio::task::JoinSet::new();
+
+    while !queue.is_empty() || !in_flight.is_empty() {
+        while !strict_incomplete && in_flight.len() < max_concurrency {
+            let Some((shard, splits_used, shard_no, rate_retries)) = queue.pop_front() else {
+                break;
+            };
+
+            let key = shard_key(&shard);
+            if let Some(cp) = completed_checkpoints.get(&key) {
+                tracing::info!(
+                    shard = shard_no,
+                    files = ?cp.record.files,
+                    "resuming sharded run: reusing completed shard from checkpoint"
+                );
+                total_usage.input_tokens += cp.usage.input_tokens;
+                total_usage.output_tokens += cp.usage.output_tokens;
+                total_usage.total_tokens += cp.usage.total_tokens;
+                all_findings.extend(cp.findings.clone());
+                let mut rec = cp.record.clone();
+                rec.shard = shard_no;
+                shard_records.push(rec);
+                continue;
+            }
+
+            dispatch_seq += 1;
+            let shard_task_id = format!("{}-shard-{}-{}", task_id, shard_no, dispatch_seq);
+            let mut contract = config.task.clone();
+            contract.id = shard_task_id.clone();
+            contract.name = format!("{} (shard {})", config.task.name, shard_no);
+            if let Some(tb) = sharding.per_shard.token_budget {
+                contract.token_budget = tb;
+            }
+            if let Some(mt) = sharding.per_shard.max_total_tokens {
+                contract.max_total_tokens = Some(mt);
+            }
+            if let Some(mi) = sharding.per_shard.max_iterations {
+                contract.max_iterations = mi;
+            }
+            if let Some(ts) = sharding.per_shard.timeout_secs {
+                contract.timeout_secs = ts;
+            }
+            contract.prompt_template = shard_prompt(&config.task.prompt_template);
+
+            if let Err(e) = crate::agent::archive_previous_ledger(&workspace, &shard_task_id) {
+                return execution_error(
+                    config,
+                    start,
+                    format!("Ledger initialization failed: {e}"),
+                    None,
+                );
+            }
+
+            let provider = provider.clone();
+            let mcp_manager = mcp_manager.clone();
+            let workspace = workspace.clone();
+            let risk_hits = risk_hits.clone();
+            let all_pr_files = all_pr_files.clone();
+            let rate_limit_until = rate_limit_until.clone();
+
+            in_flight.spawn(async move {
+                // Honor any shared rate-limit backoff window before starting.
+                let wait = {
+                    let guard = rate_limit_until.lock().await;
+                    guard.and_then(|until| until.checked_duration_since(Instant::now()))
+                };
+                if let Some(dur) = wait {
+                    tokio::time::sleep(dur).await;
+                }
+
+                let manifest =
+                    crate::shard::build_manifest_with_overview(&shard, &risk_hits, &all_pr_files);
+                let diffs = shard
+                    .files
+                    .iter()
+                    .map(|f| f.diff.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let initial_messages = vec![Message::new(
+                    Role::User,
+                    format!("{manifest}\n\n=== DIFFS ===\n{diffs}"),
+                )];
+
+                let event_log = Arc::new(EventLog::new(&workspace, &shard_task_id));
+                let spill_store = Arc::new(
+                    crate::tools::SpillStore::new(workspace.clone(), &shard_task_id)
+                        .with_token_budget(contract.token_budget)
+                        .with_event_log(event_log.clone()),
+                );
+                let mut tools = default_tools(
+                    workspace.clone(),
+                    &contract.tool_allowlist,
+                    contract.shell_timeout_secs,
+                    &contract.shell_env_passthrough,
+                    Some(spill_store.clone()),
+                );
+                if !contract.skills.is_empty() {
+                    tools.register(crate::tools::SkillTool::new(contract.skills.clone()));
+                }
+                if let Some(ref mgr) = *mcp_manager {
+                    mgr.register_all_with_spill(&mut tools, Some(spill_store));
+                }
+                let configured_rule_ids: Vec<String> = contract
+                    .gating_rules
+                    .iter()
+                    .map(|r| r.rule_id.clone())
+                    .collect();
+                tools.register_report_finding(
+                    workspace.clone(),
+                    shard_task_id.clone(),
+                    configured_rule_ids,
+                    contract.findings_ledger,
+                );
+
+                let agent_config = AgentConfig {
+                    contract: &contract,
+                    provider: provider.as_ref().as_ref(),
+                    tools: &tools,
+                    initial_messages,
+                    workspace_root: workspace,
+                    snapshot_mgr: None,
+                    event_log: Some(&event_log),
+                };
+
+                let res = run_agent_loop(agent_config).await;
+                (
+                    shard,
+                    splits_used,
+                    shard_no,
+                    rate_retries,
+                    shard_task_id,
+                    res,
+                )
+            });
         }
 
-        let manifest = crate::shard::build_manifest(&shard, &risk_hits);
-        let diffs = shard
-            .files
-            .iter()
-            .map(|f| f.diff.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let initial_messages = vec![Message::new(
-            Role::User,
-            format!("{manifest}\n\n=== DIFFS ===\n{diffs}"),
-        )];
+        let Some(joined) = in_flight.join_next().await else {
+            break;
+        };
 
-        let event_log = Arc::new(EventLog::new(&workspace, &shard_task_id));
-        let spill_store = Arc::new(
-            crate::tools::SpillStore::new(workspace.clone(), &shard_task_id)
-                .with_event_log(event_log.clone()),
-        );
-        let mut tools = default_tools(
-            workspace.clone(),
-            &contract.tool_allowlist,
-            contract.shell_timeout_secs,
-            &contract.shell_env_passthrough,
-            Some(spill_store),
-        );
-        if !config.task.skills.is_empty() {
-            tools.register(crate::tools::SkillTool::new(config.task.skills.clone()));
-        }
-
-        let agent_config = AgentConfig {
-            contract: &contract,
-            provider: provider.as_ref(),
-            tools: &tools,
-            initial_messages,
-            workspace_root: workspace.clone(),
-            snapshot_mgr: None,
-            event_log: Some(&event_log),
+        let (shard, splits_used, shard_no, rate_retries, shard_task_id, agent_result) = match joined
+        {
+            Ok(tuple) => tuple,
+            Err(join_err) => {
+                errors.push(format!("shard worker panicked: {join_err}"));
+                incomplete_shards += 1;
+                continue;
+            }
         };
 
         let attempt = splits_used + 1;
-        let agent_result = run_agent_loop(agent_config).await;
         // Normalize a provider timeout into an incomplete result so the
         // bisect policy applies to it too (smaller shards finish faster).
         let agent_result = match agent_result {
@@ -458,10 +610,8 @@ async fn execute_sharded_task(
                     incomplete_reason: Some(IncompleteReason::Timeout),
                 }
             }
-            // Rate limiting is transient capacity, not a broken shard: back
-            // off and re-run the SAME shard (bisecting would only re-bill
-            // the same tokens against the same quota). Bounded so a hard
-            // quota wall still terminates the run.
+            // Rate limiting is transient capacity, not a broken shard: update
+            // shared backoff window and re-queue the SAME shard.
             Err(ProviderError::RateLimited(msg)) if rate_retries < MAX_SHARD_RATE_RETRIES => {
                 let backoff = rate_limit_backoff(rate_retries);
                 tracing::warn!(
@@ -477,7 +627,13 @@ async fn execute_sharded_task(
                     rate_retries + 1,
                     MAX_SHARD_RATE_RETRIES
                 );
-                tokio::time::sleep(backoff).await;
+                {
+                    let mut guard = rate_limit_until.lock().await;
+                    let target = Instant::now() + backoff;
+                    if guard.is_none_or(|cur| target > cur) {
+                        *guard = Some(target);
+                    }
+                }
                 queue.push_back((shard, splits_used, shard_no, rate_retries + 1));
                 continue;
             }
@@ -488,7 +644,7 @@ async fn execute_sharded_task(
                 shard_records.push(ShardRecord {
                     shard: shard_no,
                     files: shard.paths().into_iter().map(str::to_string).collect(),
-                    status: "failed",
+                    status: "failed".to_string(),
                     reason: Some("rate_limited".to_string()),
                     findings: 0,
                     tokens: 0,
@@ -502,7 +658,7 @@ async fn execute_sharded_task(
                 shard_records.push(ShardRecord {
                     shard: shard_no,
                     files: shard.paths().into_iter().map(str::to_string).collect(),
-                    status: "failed",
+                    status: "failed".to_string(),
                     reason: Some("agent_error".to_string()),
                     findings: 0,
                     tokens: 0,
@@ -516,20 +672,32 @@ async fn execute_sharded_task(
         total_usage.input_tokens += agent_result.usage.input_tokens;
         total_usage.output_tokens += agent_result.usage.output_tokens;
         total_usage.total_tokens += agent_result.usage.total_tokens;
-        let shard_findings = agent_result.findings.len();
-        all_findings.extend(agent_result.findings);
+        let shard_findings_list = agent_result.findings;
+        let shard_findings = shard_findings_list.len();
+        all_findings.extend(shard_findings_list.clone());
 
         match agent_result.incomplete_reason {
             None => {
-                shard_records.push(ShardRecord {
+                let record = ShardRecord {
                     shard: shard_no,
                     files: shard.paths().into_iter().map(str::to_string).collect(),
-                    status: "complete",
+                    status: "complete".to_string(),
                     reason: None,
                     findings: shard_findings,
                     tokens: agent_result.usage.total_tokens,
                     attempts: attempt,
-                });
+                };
+                append_shard_checkpoint(
+                    &workspace,
+                    &task_id,
+                    &ShardCheckpointEntry {
+                        shard_key: shard_key(&shard),
+                        record: record.clone(),
+                        findings: shard_findings_list,
+                        usage: agent_result.usage.clone(),
+                    },
+                );
+                shard_records.push(record);
                 if !options.preserve_archives {
                     cleanup_archives(&workspace, &shard_task_id);
                 }
@@ -572,12 +740,14 @@ async fn execute_sharded_task(
                     shard_records.push(ShardRecord {
                         shard: shard_no,
                         files: shard.paths().into_iter().map(str::to_string).collect(),
-                        status: "incomplete",
+                        status: "incomplete".to_string(),
                         reason: Some(reason.as_str().to_string()),
                         findings: shard_findings,
                         tokens: agent_result.usage.total_tokens,
                         attempts: attempt,
                     });
+                    in_flight.abort_all();
+                    queue.clear();
                     break;
                 }
 
@@ -591,7 +761,7 @@ async fn execute_sharded_task(
                 shard_records.push(ShardRecord {
                     shard: shard_no,
                     files: shard.paths().into_iter().map(str::to_string).collect(),
-                    status: "incomplete",
+                    status: "incomplete".to_string(),
                     reason: Some(reason.as_str().to_string()),
                     findings: shard_findings,
                     tokens: agent_result.usage.total_tokens,
@@ -600,6 +770,8 @@ async fn execute_sharded_task(
             }
         }
     }
+
+    shard_records.sort_by_key(|r| r.shard);
 
     let all_findings = dedup_findings(all_findings);
     let (all_findings, verification) =
@@ -624,6 +796,10 @@ async fn execute_sharded_task(
     } else {
         0
     };
+
+    if exit_code == 0 && !options.preserve_archives {
+        clear_shard_checkpoint(&workspace, &task_id);
+    }
 
     if let Err(e) = SarifFormatter::write_to_file_with_status(
         &all_findings,
@@ -738,11 +914,17 @@ async fn execute_single_task(config: &Config, options: ExecutionOptions) -> Exec
         }
     }
 
-    let provider = match create_provider(
+    let provider_opts = ProviderOptions {
+        max_output_tokens: config.task.max_output_tokens,
+        temperature: config.task.temperature,
+        prompt_caching: config.task.prompt_caching,
+    };
+    let provider = match create_provider_with_options(
         &config.task.vendor,
         &config.task.model,
         &config.api_key.clone().unwrap_or_default(),
         config.task.timeout_secs,
+        &provider_opts,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -769,6 +951,7 @@ async fn execute_single_task(config: &Config, options: ExecutionOptions) -> Exec
 
     let spill_store = Arc::new(
         crate::tools::SpillStore::new(config.workspace.clone(), &task_id)
+            .with_token_budget(config.task.token_budget)
             .with_event_log(event_log.clone()),
     );
 
@@ -784,7 +967,7 @@ async fn execute_single_task(config: &Config, options: ExecutionOptions) -> Exec
         tools.register(
             crate::tools::GitDiffTool::new(config.workspace.clone())
                 .with_review_range(range.clone())
-                .with_spill_maybe(Some(spill_store)),
+                .with_spill_maybe(Some(spill_store.clone())),
         );
     }
 
@@ -792,17 +975,30 @@ async fn execute_single_task(config: &Config, options: ExecutionOptions) -> Exec
     if !config.task.skills.is_empty() {
         tools.register(crate::tools::SkillTool::new(config.task.skills.clone()));
     }
+    let configured_rule_ids: Vec<String> = config
+        .task
+        .gating_rules
+        .iter()
+        .map(|r| r.rule_id.clone())
+        .collect();
+    tools.register_report_finding(
+        config.workspace.clone(),
+        task_id.clone(),
+        configured_rule_ids,
+        config.task.findings_ledger,
+    );
 
     // Start MCP servers and register their tools.
     // Kept alive in `_mcp_manager` for the duration of this task;
     // dropped processes are killed via kill_on_drop(true).
-    let _mcp_manager = crate::mcp::McpClientManager::start(
+    let _mcp_manager = crate::mcp::McpClientManager::start_in_workspace(
         &config.task.mcp_servers,
         config.task.shell_timeout_secs,
+        Some(&config.workspace),
     )
     .await;
     if let Some(ref mgr) = _mcp_manager {
-        mgr.register_all(&mut tools);
+        mgr.register_all_with_spill(&mut tools, Some(spill_store));
     }
 
     // ── LSP tool hint injection ────────────────────────────────────────────
@@ -842,6 +1038,16 @@ async fn execute_single_task(config: &Config, options: ExecutionOptions) -> Exec
     let snapshot_mgr = SnapshotManager::new(checkpoint_store)
         .with_execution_thread_id(checkpoint_thread_id(&task_id, &config.workspace));
 
+    let default_initial_user_msg = || {
+        let mut text =
+            String::from("Begin the review following the system instructions and output contract.");
+        if !config.task.description.trim().is_empty() {
+            text.push_str("\nTask description: ");
+            text.push_str(config.task.description.trim());
+        }
+        Message::new(Role::User, text)
+    };
+
     let mut initial_messages = if config.resume {
         match snapshot_mgr.restore_snapshot(&task_id, true) {
             Ok(Some(snapshot)) => snapshot.messages,
@@ -855,19 +1061,15 @@ async fn execute_single_task(config: &Config, options: ExecutionOptions) -> Exec
                     ));
                     messages
                 });
-                from_event_log.unwrap_or_else(|| {
-                    vec![Message::new(
-                        Role::User,
-                        config.task.prompt_template.clone(),
-                    )]
-                })
+                from_event_log.unwrap_or_else(|| vec![default_initial_user_msg()])
             }
         }
+    } else if config.review_range.is_some() {
+        // The review_range prompt appended below serves as the initial User
+        // turn, avoiding duplicate instructions alongside the system prompt.
+        Vec::new()
     } else {
-        vec![Message::new(
-            Role::User,
-            config.task.prompt_template.clone(),
-        )]
+        vec![default_initial_user_msg()]
     };
 
     if config.resume {
@@ -953,10 +1155,12 @@ async fn execute_single_task(config: &Config, options: ExecutionOptions) -> Exec
         });
     }
 
-    // Merge preflight findings (deterministic) with agent findings.
-    let all_findings = [preflight_findings, agent_result.findings].concat();
-    let (all_findings, verification) =
-        crate::jev::verify_findings(&config.task.verify, all_findings).await;
+    // Merge preflight findings (deterministic) with verified agent findings.
+    // Deterministic preflight diagnostics (e.g. LSP compile errors) must never
+    // be filtered out by the probabilistic verifier.
+    let (verified_agent_findings, verification) =
+        crate::jev::verify_findings(&config.task.verify, agent_result.findings).await;
+    let all_findings = [preflight_findings, verified_agent_findings].concat();
 
     let gate_result = RuleEngine::evaluate(&all_findings, &config.task.gating_rules);
 
@@ -1690,6 +1894,7 @@ mod tests {
             per_shard: crate::types::ShardBudget::default(),
             on_shard_incomplete: crate::types::ShardIncompletePolicy::Bisect,
             risk_patterns: Default::default(),
+            concurrency: 1,
         }
     }
 
@@ -1755,22 +1960,66 @@ mod tests {
 
     #[test]
     fn test_dedup_findings_across_shards() {
-        let mk = |msg: &str| Finding {
+        let mk = |msg: &str, line: u32, evidence: &str| Finding {
             id: uuid::Uuid::new_v4(),
             rule_id: "xss".into(),
             severity: Severity::Error,
             message: msg.into(),
             location: Some(crate::types::Location {
                 file: "a.ts".into(),
-                line_start: 1,
-                line_end: 1,
+                line_start: line,
+                line_end: line,
                 column_start: 1,
                 column_end: 1,
             }),
-            evidence: "e".into(),
+            evidence: evidence.into(),
         };
-        let deduped = dedup_findings(vec![mk("dup"), mk("dup"), mk("unique")]);
+        // Exact duplicate and adjacent-line rephrasing collapse into one;
+        // missing evidence is backfilled from the duplicate; distant line stays separate.
+        let deduped = dedup_findings(vec![
+            mk("innerHTML XSS", 10, ""),
+            mk("DOM XSS via innerHTML", 11, "el.innerHTML = userInput"),
+            mk("another XSS", 50, "doc.write(x)"),
+        ]);
         assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].evidence, "el.innerHTML = userInput");
+        assert_eq!(deduped[1].location.as_ref().unwrap().line_start, 50);
+    }
+
+    #[test]
+    fn test_shard_checkpoint_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let entry = ShardCheckpointEntry {
+            shard_key: "src/a.ts#120".into(),
+            record: ShardRecord {
+                shard: 1,
+                files: vec!["src/a.ts".into()],
+                status: "complete".into(),
+                reason: None,
+                findings: 1,
+                tokens: 500,
+                attempts: 1,
+            },
+            findings: vec![Finding {
+                id: uuid::Uuid::new_v4(),
+                rule_id: "sql-injection".into(),
+                severity: Severity::Error,
+                message: "SQLi".into(),
+                location: None,
+                evidence: "SELECT ...".into(),
+            }],
+            usage: Usage {
+                input_tokens: 400,
+                output_tokens: 100,
+                total_tokens: 500,
+            },
+        };
+        append_shard_checkpoint(tmp.path(), "task-1", &entry);
+        let loaded = load_shard_checkpoints(tmp.path(), "task-1");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["src/a.ts#120"].findings.len(), 1);
+        clear_shard_checkpoint(tmp.path(), "task-1");
+        assert!(load_shard_checkpoints(tmp.path(), "task-1").is_empty());
     }
 
     #[test]
@@ -1780,7 +2029,7 @@ mod tests {
         let records = vec![ShardRecord {
             shard: 1,
             files: vec!["a.ts".into(), "b.ts".into()],
-            status: "complete",
+            status: "complete".into(),
             reason: None,
             findings: 2,
             tokens: 1000,

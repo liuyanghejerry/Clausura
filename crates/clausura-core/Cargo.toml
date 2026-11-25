@@ -18,7 +18,6 @@ async-trait = "0.1"
 serde_yaml = "0.9"
 dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tiktoken-rs = "0.5"
 rand = "0.8"
 rusqlite = { version = "0.42", features = ["bundled"] }
 rmp-serde = "1"

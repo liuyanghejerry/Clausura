@@ -1,14 +1,21 @@
 use crate::types::{CheckpointError, Message, SnapshotMeta};
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 /// SQLite-backed checkpoint store for agent state persistence.
 pub struct CheckpointStore {
-    conn: Connection,
+    conn: Mutex<Connection>,
     db_path: PathBuf,
 }
 
 impl CheckpointStore {
+    fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>, CheckpointError> {
+        self.conn
+            .lock()
+            .map_err(|_| CheckpointError::DbError("Checkpoint DB lock poisoned".into()))
+    }
+
     /// Open or create the database at `~/.clausura/checkpoints.db`
     pub fn new() -> Result<Self, CheckpointError> {
         let clausura_dir = dirs::home_dir()
@@ -44,7 +51,10 @@ impl CheckpointStore {
         )
         .map_err(|e| CheckpointError::DbError(format!("Failed schema: {}", e)))?;
 
-        Ok(Self { conn, db_path })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            db_path,
+        })
     }
 
     /// Save messages as a new checkpoint for the given thread.
@@ -58,18 +68,18 @@ impl CheckpointStore {
         let state = rmp_serde::to_vec(messages)
             .map_err(|e| CheckpointError::SerializationError(e.to_string()))?;
 
-        self.conn
-            .execute(
-                "INSERT INTO checkpoints (thread_id, checkpoint_id, state, version, truncated)
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO checkpoints (thread_id, checkpoint_id, state, version, truncated)
                  VALUES (?1, ?2, ?3, 1, ?4)",
-                params![
-                    thread_id,
-                    checkpoint_id.to_string(),
-                    state,
-                    truncated as i32
-                ],
-            )
-            .map_err(|e| CheckpointError::DbError(format!("Insert failed: {}", e)))?;
+            params![
+                thread_id,
+                checkpoint_id.to_string(),
+                state,
+                truncated as i32
+            ],
+        )
+        .map_err(|e| CheckpointError::DbError(format!("Insert failed: {}", e)))?;
 
         Ok(checkpoint_id)
     }
@@ -80,8 +90,8 @@ impl CheckpointStore {
         &self,
         thread_id: &str,
     ) -> Result<Option<(uuid::Uuid, Vec<Message>, bool, u32)>, CheckpointError> {
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT checkpoint_id, state, truncated, version FROM checkpoints
                  WHERE thread_id = ?1
@@ -117,8 +127,8 @@ impl CheckpointStore {
         thread_id: &str,
         checkpoint_id: &uuid::Uuid,
     ) -> Result<Option<(Vec<Message>, bool, u32)>, CheckpointError> {
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT state, truncated, version FROM checkpoints
                  WHERE thread_id = ?1 AND checkpoint_id = ?2",
@@ -144,8 +154,8 @@ impl CheckpointStore {
 
     /// List checkpoints for a thread (most recent first).
     pub fn list(&self, thread_id: &str, limit: u32) -> Result<Vec<SnapshotMeta>, CheckpointError> {
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT checkpoint_id, created_at, version, truncated FROM checkpoints
                  WHERE thread_id = ?1
@@ -192,8 +202,8 @@ impl CheckpointStore {
 
     /// List all checkpoints across all threads (most recent first).
     pub fn list_all(&self, limit: u32) -> Result<Vec<SnapshotMeta>, CheckpointError> {
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT checkpoint_id, thread_id, created_at, version, truncated FROM checkpoints
                   ORDER BY created_at DESC, rowid DESC
@@ -239,23 +249,23 @@ impl CheckpointStore {
 
     /// Delete a specific checkpoint by ID.
     pub fn delete_checkpoint(&self, checkpoint_id: &uuid::Uuid) -> Result<(), CheckpointError> {
-        self.conn
-            .execute(
-                "DELETE FROM checkpoints WHERE checkpoint_id = ?1",
-                params![checkpoint_id.to_string()],
-            )
-            .map_err(|e| CheckpointError::DbError(e.to_string()))?;
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM checkpoints WHERE checkpoint_id = ?1",
+            params![checkpoint_id.to_string()],
+        )
+        .map_err(|e| CheckpointError::DbError(e.to_string()))?;
         Ok(())
     }
 
     /// Delete all checkpoints for a thread.
     pub fn delete_thread(&self, thread_id: &str) -> Result<(), CheckpointError> {
-        self.conn
-            .execute(
-                "DELETE FROM checkpoints WHERE thread_id = ?1",
-                params![thread_id],
-            )
-            .map_err(|e| CheckpointError::DbError(e.to_string()))?;
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM checkpoints WHERE thread_id = ?1",
+            params![thread_id],
+        )
+        .map_err(|e| CheckpointError::DbError(e.to_string()))?;
         Ok(())
     }
 

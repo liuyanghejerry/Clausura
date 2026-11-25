@@ -82,6 +82,12 @@ struct YamlTaskConfig {
     #[serde(default)]
     max_total_tokens: Option<u64>,
     #[serde(default)]
+    max_output_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default = "default_prompt_caching")]
+    prompt_caching: bool,
+    #[serde(default)]
     auto_compact: bool,
     #[serde(default = "default_max_compactions")]
     max_compactions: u32,
@@ -162,6 +168,12 @@ struct YamlShardingConfig {
     on_shard_incomplete: String,
     #[serde(default)]
     risk_patterns: std::collections::BTreeMap<String, String>,
+    #[serde(default = "yaml_default_shard_concurrency")]
+    concurrency: usize,
+}
+
+fn yaml_default_shard_concurrency() -> usize {
+    1
 }
 
 fn yaml_default_max_diff_bytes() -> usize {
@@ -239,6 +251,10 @@ fn default_findings_ledger() -> bool {
     true
 }
 
+fn default_prompt_caching() -> bool {
+    true
+}
+
 fn default_ambiguity() -> String {
     "fail_closed".to_string()
 }
@@ -313,6 +329,18 @@ fn validate_yaml(yaml: &YamlConfig) -> Result<(), ConfigError> {
             "task.max_total_tokens must be > 0 when set".into(),
         ));
     }
+    if yaml.task.max_output_tokens == Some(0) {
+        return Err(ConfigError::ValidationError(
+            "task.max_output_tokens must be > 0 when set".into(),
+        ));
+    }
+    if let Some(temp) = yaml.task.temperature {
+        if !(0.0..=2.0).contains(&temp) || !temp.is_finite() {
+            return Err(ConfigError::ValidationError(
+                "task.temperature must be between 0.0 and 2.0".into(),
+            ));
+        }
+    }
     if yaml.task.timeout_secs == 0 {
         return Err(ConfigError::ValidationError(
             "task.timeout_secs must be > 0".into(),
@@ -349,6 +377,11 @@ fn validate_yaml(yaml: &YamlConfig) -> Result<(), ConfigError> {
         if sh.max_files_per_shard == 0 {
             return Err(ConfigError::ValidationError(
                 "sharding.max_files_per_shard must be > 0".into(),
+            ));
+        }
+        if sh.concurrency == 0 {
+            return Err(ConfigError::ValidationError(
+                "sharding.concurrency must be > 0".into(),
             ));
         }
         if sh.context_lines > 100 {
@@ -438,6 +471,9 @@ impl Config {
                     tool_allowlist: vec![],
                     token_budget: default_token_budget(),
                     max_total_tokens: None,
+                    max_output_tokens: None,
+                    temperature: None,
+                    prompt_caching: default_prompt_caching(),
                     auto_compact: false,
                     max_compactions: default_max_compactions(),
                     findings_ledger: default_findings_ledger(),
@@ -499,6 +535,22 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .or(yaml_task.max_total_tokens);
+
+        let max_output_tokens = std::env::var("CLAUSURA_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .or(yaml_task.max_output_tokens);
+
+        let temperature = std::env::var("CLAUSURA_TEMPERATURE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|t| (0.0..=2.0).contains(t) && t.is_finite())
+            .or(yaml_task.temperature);
+
+        let prompt_caching = match std::env::var("CLAUSURA_PROMPT_CACHING") {
+            Ok(v) => matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+            Err(_) => yaml_task.prompt_caching,
+        };
 
         // Auto-compact: summarize dropped messages instead of bare truncation.
         let auto_compact = match std::env::var("CLAUSURA_AUTO_COMPACT") {
@@ -608,6 +660,9 @@ impl Config {
                 tool_allowlist: yaml_task.tool_allowlist,
                 token_budget,
                 max_total_tokens,
+                max_output_tokens,
+                temperature,
+                prompt_caching,
                 auto_compact,
                 max_compactions,
                 findings_ledger,
@@ -651,6 +706,11 @@ impl Config {
                 sharding: yaml_task.sharding.map(|s| {
                     let policy = parse_shard_policy(&s.on_shard_incomplete)
                         .unwrap_or(ShardIncompletePolicy::Bisect);
+                    let concurrency = std::env::var("CLAUSURA_SHARD_CONCURRENCY")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|&c| c > 0)
+                        .unwrap_or(s.concurrency);
                     ShardingConfig {
                         base: s.base,
                         paths: s.paths,
@@ -666,6 +726,7 @@ impl Config {
                         },
                         on_shard_incomplete: policy,
                         risk_patterns: s.risk_patterns,
+                        concurrency,
                     }
                 }),
                 verify,
