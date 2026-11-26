@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/handlers.rs"
+                },
+                "region": {
+                  "endLine": 27,
+                  "startLine": 27
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "User-controlled path segment is parsed with unwrap(). A request such as GET /users/abc panics the connection handler, and because the accept loop is single-threaded, that panic takes the service down."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/handlers.rs"
+                },
+                "region": {
+                  "endLine": 36,
+                  "startLine": 36
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "The raw HTTP request body is parsed with serde_json::from_str and unwrapped. A malformed POST /orders payload panics the service."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 68,
+                  "startLine": 68
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "insert_order unwraps strip_prefix and then parse on SKU-derived data, and indexes order.items[0] without a bounds check. A SKU without the \"SKU-\" prefix, a non-numeric suffix, or an empty items list panics instead of returning an error."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-core/src/models.rs"
+                },
+                "region": {
+                  "endLine": 29,
+                  "startLine": 29
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "first_id calls unwrap() on split(',').next(). str::split always yields at least one item, so this unwrap cannot actually panic, and the seeded comment overstates the risk. It is still an unwrap in a parsing path and is worth replacing. Below the error gating threshold."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 32,
+                  "startLine": 29
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "find_user builds its SQL with format! from the username argument and runs it through prepare(), so an attacker can inject SQL, for example with username x' OR '1'='1."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 52,
+                  "startLine": 49
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "find_users_by_domain concatenates the domain argument into a LIKE pattern with format!, which enables SQL injection."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 11,
+                  "startLine": 10
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "The default database connection string contains a plaintext username and password and is compiled into the source as the DATABASE_URL fallback."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 31,
+                  "startLine": 31
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "The Result returned by handle_connection is discarded with `let _ =` and never logged or handled, so per-connection I/O and parse errors disappear silently."
+          },
+          "ruleId": "swallowed-error"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 40,
+                  "startLine": 40
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover todo!() in production code. Calling rebuild_indexes panics."
+          },
+          "ruleId": "todo-marker"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 96,
+                  "startLine": 96
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover todo!() in production code. Calling reconcile_inventory panics."
+          },
+          "ruleId": "todo-marker"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

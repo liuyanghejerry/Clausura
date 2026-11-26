@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "invocations": [
+        {
+          "executionSuccessful": false,
+          "properties": {
+            "incompleteReason": "iteration_limit"
+          }
+        }
+      ],
+      "properties": {
+        "incomplete": true,
+        "status": "incomplete"
+      },
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 22,
+                  "startLine": 20
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL injection in find_user_by_name: the query is built with an f-string that interpolates the caller-supplied `name` directly into the statement, so an attacker-controlled value can alter the SQL. Use a parameterized query instead: conn.execute(\"SELECT id, name, email FROM users WHERE name = ?\", (name,))."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 35,
+                  "startLine": 33
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL injection in find_users_by_domain: the LIKE pattern is built with an f-string interpolating the untrusted `domain` argument into the SQL text. Use a parameterized query: conn.execute(\"SELECT id, name, email FROM users WHERE email LIKE ?\", (\"%\" + domain,))."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 25,
+                  "startLine": 24
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception:` in find_user_by_name swallows every error (including the OperationalError raised by the injected/malformed SQL) and silently returns None, so callers cannot distinguish \"user not found\" from \"database failure\". Catch a specific exception and log/re-raise it."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/importer.py"
+                },
+                "region": {
+                  "endLine": 22,
+                  "startLine": 21
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception: pass` inside import_legacy_csv silently discards all row-level errors, hiding malformed CSV data and making the import appear successful. Catch the specific error and log/count skipped rows."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 14,
+                  "startLine": 11
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception: pass` around db.initialize() silently ignores any DB initialization failure (missing file, permissions, corrupt schema) and still returns exit code 0, so a broken `init` command reports success. Catch the specific sqlite3 error, log it, and return a non-zero exit code."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 32,
+                  "startLine": 29
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception: pass` in migrate_session swallows every exception from session.pop (a KeyError, but also TypeError/AttributeError for non-dict input), hiding real migration bugs. Intent is only to drop the key if present — use `session.pop(\"legacy_field\", None)`."
+          },
+          "ruleId": "bare-except"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

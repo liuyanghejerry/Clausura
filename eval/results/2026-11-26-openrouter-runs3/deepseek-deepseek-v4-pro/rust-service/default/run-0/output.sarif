@@ -1,0 +1,248 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "invocations": [
+        {
+          "executionSuccessful": false,
+          "properties": {
+            "incompleteReason": "iteration_limit"
+          }
+        }
+      ],
+      "properties": {
+        "incomplete": true,
+        "status": "incomplete"
+      },
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 11,
+                  "startLine": 10
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded database credential (password: sup3r-s3cret-p4ssw0rd) in source code."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 33,
+                  "startLine": 30
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL injection: string-interpolated user input (`username`) concatenated directly into SQL query."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 52,
+                  "startLine": 49
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL injection: string-interpolated user input (`domain`) concatenated directly into SQL LIKE clause."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 69,
+                  "startLine": 69
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Two unwraps on fallible operations in one statement — strip_prefix returns Option, parse returns Result; panics on malformed SKU."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/handlers.rs"
+                },
+                "region": {
+                  "endLine": 29,
+                  "startLine": 29
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Unwrap on user-controlled URL path parsing — panics on malformed id (e.g., /users/abc)."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/handlers.rs"
+                },
+                "region": {
+                  "endLine": 38,
+                  "startLine": 38
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Unwrap on user-controlled JSON body parsing — panics on malformed payload."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-core/src/models.rs"
+                },
+                "region": {
+                  "endLine": 29,
+                  "startLine": 29
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Unwrap on Option returned by .next() — panics on empty input string."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 31,
+                  "startLine": 31
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Silently discarded Result from handle_connection — per-connection errors swallowed with no logging."
+          },
+          "ruleId": "swallowed-error"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 40,
+                  "startLine": 40
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover todo!() marker in production code — index rebuild logic pending."
+          },
+          "ruleId": "todo-marker"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 97,
+                  "startLine": 97
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover todo!() marker in production code — inventory reconciliation not implemented."
+          },
+          "ruleId": "todo-marker"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 72,
+                  "startLine": 72
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Two unwraps on fallible operations in one statement — strip_prefix returns Option, parse returns Result; panics on malformed SKU."
+          },
+          "ruleId": "panic-unwrap"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

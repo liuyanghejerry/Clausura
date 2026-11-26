@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "data/records.json"
+                },
+                "region": {
+                  "endLine": 9808,
+                  "startLine": 9808
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "硬编码 API 密钥被提交到数据文件 data/records.json 中（记录 rec-1400）。密钥值 \"sk-eval-seeded-secret-8f3a1c9d\" 以明文形式存储，应移除并改用环境变量或密钥管理服务。"
+          },
+          "ruleId": "hardcoded-secret"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

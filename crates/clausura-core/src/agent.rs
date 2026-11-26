@@ -61,7 +61,6 @@ const MAX_RECOVERY_RETRIES: usize = 2;
 async fn recover_findings_json(
     contract: &TaskContract,
     provider: &dyn Provider,
-    tools: &ToolRegistry,
     messages: &mut Vec<Message>,
     start: &Instant,
     running_tokens: &mut u64,
@@ -86,7 +85,7 @@ async fn recover_findings_json(
             });
         }
         messages.push(Message::new(Role::User, findings_retry_prompt(&last_err)));
-        let retry = match call_llm(provider, tools, messages, event_log).await {
+        let retry = match call_llm_no_tools(provider, messages, event_log).await {
             Ok(r) => r,
             Err(e) => {
                 last_err = format!("corrective call failed: {e}");
@@ -320,7 +319,6 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
                             recover_findings_json(
                                 config.contract,
                                 config.provider,
-                                config.tools,
                                 &mut messages,
                                 &start,
                                 &mut running_tokens,
@@ -494,9 +492,19 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
                     break;
                 }
 
-                // Inject any repeat-call reminders after all tool results of
-                // this batch, so tool-call/result pairing stays valid for the
-                // next request.
+                // Inject any repeat-call reminders (and a final-iteration
+                // wrap-up nudge when only 1 iteration remains) after all tool
+                // results of this batch, so tool-call/result pairing stays
+                // valid for the next request.
+                if max_iterations >= 3 && _iteration + 2 == max_iterations {
+                    repeat_reminders.push(
+                        "Final iteration notice: you have 1 iteration remaining before the \
+                         iteration limit. Do NOT call any more tools — conclude now by replying \
+                         with the complete JSON object {\"findings\": [...]} containing all \
+                         verified findings."
+                            .to_string(),
+                    );
+                }
                 if !repeat_reminders.is_empty() {
                     messages.push(Message::new(Role::User, repeat_reminders.join("\n\n")));
                 }
@@ -567,7 +575,6 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
         match recover_findings_json(
             config.contract,
             config.provider,
-            config.tools,
             &mut messages,
             &start,
             &mut running_tokens,
@@ -662,9 +669,10 @@ fn build_system_prompt(contract: &TaskContract, has_report_finding: bool) -> Str
 
     if has_report_finding {
         prompt.push_str(
-            "\n- You may call `report_finding` as soon as you verify an issue to persist it \
-             incrementally (survives context truncation). Still conclude with the final JSON \
-             object (duplicates are automatically merged).",
+            "\n- For long reviews where earlier context may be truncated, you may call \
+             `report_finding` to persist verified findings incrementally. Do not spend \
+             separate iterations calling `report_finding` one by one — batch multiple calls \
+             or return all findings directly in the final JSON object (duplicates are merged).",
         );
     }
 
@@ -687,14 +695,37 @@ async fn call_llm(
     messages: &[Message],
     event_log: Option<&EventLog>,
 ) -> Result<crate::types::ChatResponse, ProviderError> {
+    call_llm_with_defs(
+        provider,
+        tools.list_definitions().as_slice(),
+        messages,
+        event_log,
+    )
+    .await
+}
+
+/// Dispatch a tool-less LLM request (used for corrective findings JSON
+/// recovery so the model cannot spend its recovery turn calling more tools).
+async fn call_llm_no_tools(
+    provider: &dyn Provider,
+    messages: &[Message],
+    event_log: Option<&EventLog>,
+) -> Result<crate::types::ChatResponse, ProviderError> {
+    call_llm_with_defs(provider, &[], messages, event_log).await
+}
+
+async fn call_llm_with_defs(
+    provider: &dyn Provider,
+    tool_defs: &[crate::types::ToolDef],
+    messages: &[Message],
+    event_log: Option<&EventLog>,
+) -> Result<crate::types::ChatResponse, ProviderError> {
     if let Some(log) = event_log {
         log.append(&RunEvent::LlmRequest {
             messages: messages.to_vec(),
         });
     }
-    let response = provider
-        .chat_with_tools(messages, tools.list_definitions().as_slice())
-        .await?;
+    let response = provider.chat_with_tools(messages, tool_defs).await?;
     if let Some(log) = event_log {
         log.append(&RunEvent::LlmResponse {
             message: response.message.clone(),

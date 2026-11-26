@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/handlers.rs"
+                },
+                "region": {
+                  "endLine": 27,
+                  "startLine": 27
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "User-controlled URL path is parsed with unwrap(); a malformed id (e.g. `GET /users/abc`) panics the connection handler."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/handlers.rs"
+                },
+                "region": {
+                  "endLine": 36,
+                  "startLine": 36
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "User-controlled request body is deserialized with unwrap(); a malformed JSON payload panics the service."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 68,
+                  "startLine": 68
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Fallible parse of an order SKU on unwrap(): a SKU without the \"SKU-\" prefix or a non-numeric suffix panics instead of returning an error."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-core/src/models.rs"
+                },
+                "region": {
+                  "endLine": 29,
+                  "startLine": 29
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "unwrap() applied to a user-controlled string in first_id(); untrusted input should not be unwrapped. (Note: split(',').next() always yields Some, so it is currently infallible, but the pattern is fragile.)"
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 26,
+                  "startLine": 26
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "expect() on TcpListener::bind panics if port 8080 is unavailable; fail-fast at startup is idiomatic but remains a panicking expect."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 32,
+                  "startLine": 29
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL query built by string formatting with an interpolated username — SQL injection. Use a parameterized query (`WHERE username = ?1` with `query([username])`)."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 52,
+                  "startLine": 49
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL LIKE clause built by string formatting with an interpolated domain — SQL injection. Use a parameterized query with a bound LIKE parameter."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 12,
+                  "startLine": 11
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded database credential (username and password) shipped in source as the default connection string."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 31,
+                  "startLine": 31
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Per-connection handler Result is discarded with `let _ =`, with no logging or recovery — every connection error is silently lost."
+          },
+          "ruleId": "swallowed-error"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 24,
+                  "startLine": 18
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Store-open failure is downgraded to None and the service continues running degraded (serving requests with no database); the error is written to stderr but never propagated or acted on."
+          },
+          "ruleId": "swallowed-error"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 41,
+                  "startLine": 39
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover todo!() in production code — rebuild_indexes panics when invoked."
+          },
+          "ruleId": "todo-marker"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 97,
+                  "startLine": 94
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover todo!() in production code — reconcile_inventory panics when invoked."
+          },
+          "ruleId": "todo-marker"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}
