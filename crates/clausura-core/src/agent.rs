@@ -279,9 +279,9 @@ async fn run_agent_loop_inner(config: AgentConfig<'_>) -> Result<AgentResult, Pr
 
         // Persist any findings in this response to the on-disk ledger so they
         // survive later context truncation/compaction and can be merged back
-        // into the final answer. Best-effort: a failed write is ignored.
+        // into the final answer. Silent on prose-only tool-call thoughts.
         if config.contract.findings_ledger {
-            let interim = extract_findings_lenient(&response.message.content);
+            let interim = extract_findings(&response.message.content).unwrap_or_default();
             if !interim.is_empty() {
                 let ledger = ledger_path(&config.workspace_root, &config.contract.id);
                 if let Err(e) = append_findings_to_ledger(&ledger, &interim) {
@@ -1468,12 +1468,30 @@ fn fix_finding_message(el: &mut serde_json::Value) {
     }
 }
 
-/// Normalize a `location` given as a `"file:line"` string (optionally with a
-/// column: `"file:line:col"`) into the structured object form.
+/// Normalize a `location` field:
+/// - If given as a `"file:line"` (or `"file:line:col"`) string, expand into the
+///   structured object form.
+/// - If given as a JSON object missing `line_end` (or `column_start`/`column_end`),
+///   fill safe defaults (`line_end = line_start`, columns = `1`) so valid
+///   findings are not rejected over omitted column numbers.
 fn fix_finding_location(el: &mut serde_json::Value) {
     let Some(obj) = el.as_object_mut() else {
         return;
     };
+    if let Some(loc_obj) = obj.get_mut("location").and_then(|v| v.as_object_mut()) {
+        if !loc_obj.contains_key("line_end") {
+            if let Some(start) = loc_obj.get("line_start").cloned() {
+                loc_obj.insert("line_end".to_string(), start);
+            }
+        }
+        loc_obj
+            .entry("column_start")
+            .or_insert_with(|| serde_json::Value::from(1));
+        loc_obj
+            .entry("column_end")
+            .or_insert_with(|| serde_json::Value::from(1));
+        return;
+    }
     let Some(raw) = obj.get("location").and_then(|v| v.as_str()) else {
         return;
     };

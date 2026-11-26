@@ -118,8 +118,14 @@ pub struct Location {
     pub file: String,
     pub line_start: u32,
     pub line_end: u32,
+    #[serde(default = "default_location_column")]
     pub column_start: u32,
+    #[serde(default = "default_location_column")]
     pub column_end: u32,
+}
+
+fn default_location_column() -> u32 {
+    1
 }
 
 /// Structured finding from agent output

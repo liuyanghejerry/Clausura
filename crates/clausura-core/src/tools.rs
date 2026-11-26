@@ -109,6 +109,17 @@ impl SpillStore {
     }
 }
 
+fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
+    if max_bytes >= s.len() {
+        return s.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 fn output_keep_end(output: &str, max_bytes: usize) -> usize {
     let mut offset = 0usize;
     for (lines_kept, line) in output.split_inclusive('\n').enumerate() {
@@ -133,9 +144,13 @@ fn format_byte_limit(max_bytes: usize) -> String {
 /// Appends a marker when truncation occurs.
 fn truncate_output_with_spill(output: String, spill: Option<&SpillStore>) -> String {
     let max_bytes = spill.map_or(MAX_OUTPUT_BYTES, |s| s.max_inline_bytes);
-    let keep_end = output_keep_end(&output, max_bytes);
+    let mut keep_end = output_keep_end(&output, max_bytes);
     if keep_end == output.len() {
         return output;
+    }
+    // Single line exceeds max_bytes: still return a safe UTF-8 prefix instead of empty output.
+    if keep_end == 0 && !output.is_empty() {
+        keep_end = floor_char_boundary(&output, max_bytes);
     }
     let limit_label = format_byte_limit(max_bytes);
     let mut truncated = output[..keep_end].to_string();
@@ -162,19 +177,35 @@ fn truncate_read_file_output(
     offset: usize,
     max_bytes: usize,
 ) -> String {
-    let keep_end = output_keep_end(&output, max_bytes);
+    let mut keep_end = output_keep_end(&output, max_bytes);
     if keep_end == output.len() {
         return output;
     }
+    let single_oversized_line = keep_end == 0 && !output.is_empty();
+    if single_oversized_line {
+        keep_end = floor_char_boundary(&output, max_bytes);
+    }
     let limit_label = format_byte_limit(max_bytes);
-    let consumed_lines = output[..keep_end].lines().count();
+    let consumed_lines = if single_oversized_line {
+        1
+    } else {
+        output[..keep_end].lines().count().max(1)
+    };
     let next_offset = offset + consumed_lines;
     let mut truncated = output[..keep_end].to_string();
     truncated.truncate(truncated.trim_end_matches('\n').len());
-    truncated.push_str(&format!(
-        "\n... [output truncated: limit is {limit_label} or 1000 lines; \
-         resume from the original file {path} with read_file (offset={next_offset}, limit=1000)]"
-    ));
+    let note = if single_oversized_line {
+        format!(
+            "\n... [line {offset} exceeded {limit_label} and was clipped; \
+             resume from the next line in {path} with read_file (offset={next_offset}, limit=1000)]"
+        )
+    } else {
+        format!(
+            "\n... [output truncated: limit is {limit_label} or 1000 lines; \
+             resume from the original file {path} with read_file (offset={next_offset}, limit=1000)]"
+        )
+    };
+    truncated.push_str(&note);
     truncated
 }
 
@@ -856,7 +887,7 @@ fn list_directory(
         let file_name = entry.file_name();
         let file_name_str = file_name.to_string_lossy();
 
-        if file_name_str == ".clausura" {
+        if file_name_str == ".clausura" || file_name_str == ".git" {
             continue;
         }
 
@@ -3175,5 +3206,19 @@ mod tests {
         let truncated = normalize_separators(&small.truncate_or_spill(payload));
         assert!(truncated.contains("saved to .clausura/archives/tool-output-small-1.txt"));
         assert!(truncated.contains("limit is 3000 bytes"));
+    }
+
+    #[test]
+    fn test_read_file_oversized_single_line_returns_prefix_and_advances_offset() {
+        let long_line = format!("{}\nsecond line\n", "x".repeat(5_000));
+        let out = truncate_read_file_output(long_line, "archive.log", 6, 3_000);
+        assert!(
+            out.starts_with(&"x".repeat(100)),
+            "must return prefix instead of empty string"
+        );
+        assert!(
+            out.contains("offset=7"),
+            "next offset must advance past the oversized line, got: {out}"
+        );
     }
 }

@@ -168,7 +168,15 @@ async fn send_json_with_retry(
                     last_error = Some(ProviderError::ServerError(format!("HTTP {}", status)));
                     continue;
                 } else if status.as_u16() == 401 || (treat_403_as_auth && status.as_u16() == 403) {
-                    return Err(ProviderError::AuthError("Invalid API key".into()));
+                    let detail = resp.text().await.unwrap_or_default();
+                    let detail = detail.trim();
+                    let msg = if detail.is_empty() {
+                        "Invalid API key".to_string()
+                    } else {
+                        let snippet: String = detail.chars().take(300).collect();
+                        format!("Invalid API key ({snippet})")
+                    };
+                    return Err(ProviderError::AuthError(msg));
                 } else {
                     let text = resp.text().await.unwrap_or_default();
                     return Err(ProviderError::BadRequest(format!(
