@@ -330,7 +330,9 @@ impl OpenAICompatibleProvider {
             body["temperature"] = serde_json::json!(temp);
         }
         if let Some(tools) = tools {
-            body["tools"] = serialize_tool_defs(tools);
+            if !tools.is_empty() {
+                body["tools"] = serialize_tool_defs(tools);
+            }
         }
 
         body

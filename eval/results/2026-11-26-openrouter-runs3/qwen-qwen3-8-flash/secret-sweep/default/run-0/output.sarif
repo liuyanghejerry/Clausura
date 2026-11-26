@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "invocations": [
+        {
+          "executionSuccessful": false,
+          "properties": {
+            "incompleteReason": "iteration_limit"
+          }
+        }
+      ],
+      "properties": {
+        "incomplete": true,
+        "status": "incomplete"
+      },
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-a/config.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-a/config.py: DEPLOY_CONFIG[\"api_secret\"] is assigned the non-placeholder secret \"sk-sweep-1f3a9c7e2b4d8a6c\" (known sk- prefix). It is handed to callers via get_config(), so the live secret ships in the build artifact and VCS history. Move it to a runtime secret store / env injection and rotate the value."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-a/util.py"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-a/util.py: module-level EXPORT_TOKEN is assigned a live GitHub-style token (\"ghp_sweepT0ken9q2w8e4r7t\") and is used to build the Authorization Bearer header in make_headers(). Load from the environment/secret store at runtime and revoke/rotate the token."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-b/config.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-b/config.py: DEPLOY_CONFIG[\"api_secret\"] is a literal AWS-style access key ID (\"AKIAEXAMPLE12SWEEP34KEY\", AKIA prefix), not a placeholder. Inject from a secret store at runtime and rotate the key."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-b/util.py"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-b/util.py: EXPORT_TOKEN holds a live sk- prefixed secret (\"sk-sweep-5d8b2f4a6c1e9d3b\") used to construct the Authorization Bearer header. Load from env/secret store and revoke/rotate."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-c/config.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-c/config.py: DEPLOY_CONFIG[\"api_secret\"] set to a live GitHub-style token (\"ghp_sweepS3cr3t8u7y6t5r4\", ghp_ prefix) and exported through get_config(). Move to a runtime secret store and rotate."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-d/config.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-d/config.py: DEPLOY_CONFIG[\"api_secret\"] is a literal AWS access key ID (\"AKIAEXAMPLE56SWEEP78KEY\") with the AKIA prefix, not a placeholder. Move to a secret store / env injection and rotate."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-e/config.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-e/config.py: DEPLOY_CONFIG[\"api_secret\"] assigned the non-placeholder sk- prefixed secret \"sk-sweep-9c1e3d5f7b2a4c6e\". Remove from source, load from a secret store at runtime, and rotate."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-f/config.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-f/config.py: DEPLOY_CONFIG[\"api_secret\"] holds a live GitHub-style token \"ghp_sweepK3y9a8s7d6f5g4\" (ghp_ prefix), returned by get_config(). Inject at runtime and revoke/rotate."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-g/config.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-g/config.py: DEPLOY_CONFIG[\"api_secret\"] is a literal AWS access key ID \"AKIAEXAMPLE90SWEEP12KEY\" (AKIA prefix), not a placeholder. Move to a secret store / env injection and rotate."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-h/config.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-h/config.py: DEPLOY_CONFIG[\"api_secret\"] assigned the sk- prefixed secret \"sk-sweep-2b4d6f8a1c3e5d7b\". Remove it from source, load from a secret store at runtime and rotate."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-i/config.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-i/config.py: DEPLOY_CONFIG[\"api_secret\"] is a live GitHub-style token \"ghp_sweepT0k3n4e5r6t7y8u\" (ghp_ prefix), exposed via get_config(). Move to a runtime secret store and revoke/rotate."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "svc-j/config.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded credential in svc-j/config.py: DEPLOY_CONFIG[\"api_secret\"] is a literal AWS access key ID \"AKIAEXAMPLE34SWEEP56KEY\" (AKIA prefix), not a placeholder. Inject from a secret store at runtime and rotate the key."
+          },
+          "ruleId": "hardcoded-secret"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

@@ -1,0 +1,248 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "invocations": [
+        {
+          "executionSuccessful": false,
+          "properties": {
+            "incompleteReason": "iteration_limit"
+          }
+        }
+      ],
+      "properties": {
+        "incomplete": true,
+        "status": "incomplete"
+      },
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/components/Chat.tsx"
+                },
+                "region": {
+                  "endLine": 27,
+                  "startLine": 23
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Stored XSS in Chat: user-controlled message sender/text fetched from /api/rooms/:id/messages are concatenated into an HTML string and assigned to innerHTML, so markup/scripts in any stored message execute in the DOM. Render messages as React children (text) instead of building HTML."
+          },
+          "ruleId": "xss"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/components/Comments.tsx"
+                },
+                "region": {
+                  "endLine": 29,
+                  "startLine": 27
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Stored XSS in Comments: server-supplied comment field `html` is injected with dangerouslySetInnerHTML and is never sanitized on the API side (users route returns raw DB values). Use plain text rendering or sanitize (e.g. DOMPurify) before injecting HTML."
+          },
+          "ruleId": "xss"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/components/Profile.tsx"
+                },
+                "region": {
+                  "endLine": 21,
+                  "startLine": 18
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Stored XSS in Profile: the `bio` value fetched from /api/users/:id/profile is assigned directly to containerRef.current.innerHTML, allowing script execution from user-authored profile content. Use textContent / React text rendering."
+          },
+          "ruleId": "xss"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/routes/users.ts"
+                },
+                "region": {
+                  "endLine": 13,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL injection in GET /:id/profile: req.params.id is interpolated into the query with a template literal and executed with no bind parameters. Use pool.query(\"SELECT id, name, bio FROM users WHERE id = $1\", [id])."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/server.ts"
+                },
+                "region": {
+                  "endLine": 21,
+                  "startLine": 17
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL injection in GET /users: the `name` query parameter is concatenated inside single quotes into the SQL string, so input like ' OR '1'='1 or '; DROP TABLE users; -- alters the query. Use pool.query(\"SELECT * FROM users WHERE name = $1\", [name])."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/auth.ts"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded signing secret committed in source: AUTH_SECRET is used by signPayload/verifySignature, so anyone with repo access can forge valid tokens (and base64 of a shared secret is not a real signature). Load from process.env/secret manager and rotate the leaked value."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/server.ts"
+                },
+                "region": {
+                  "endLine": 7,
+                  "startLine": 7
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded API key exported from source: SERVICE_API_KEY is committed in plaintext in the API entry point. Move it to environment configuration (as the PG* values are in db.ts) and revoke/rotate the exposed key."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "none",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/db.ts"
+                },
+                "region": {
+                  "endLine": 10,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Weak credential fallback in the DB pool: when PGUSER/PGPASSWORD are unset the code silently connects with the guessable default \"api\" instead of failing fast, which can leak into non-dev environments. Throw at startup if the env vars are missing."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/shared/src/utils.ts"
+                },
+                "region": {
+                  "endLine": 5,
+                  "startLine": 5
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Debug logging left in production code — 4 console.log call sites: shared logDebug helper, App render log (fires on every render), API startup log, and per-request fetch log in useFetch. Route through a logger that is disabled/stripped in production builds."
+          },
+          "ruleId": "console-log"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/shared/src/utils.ts"
+                },
+                "region": {
+                  "endLine": 15,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Explicit `any` in exported shared utilities: parseJson returns `any` and mergeOptions takes/returns `any`, so both api and web consumers silently lose type checking. Prefer `unknown` with narrowing, or generics (parseJson<T>(raw: string): T, mergeOptions<T extends object>(base: T, extra: Partial<T>): T)."
+          },
+          "ruleId": "no-explicit-any"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/hooks/useFetch.ts"
+                },
+                "region": {
+                  "endLine": 15,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Further explicit `any` usages: useFetch defaults its type parameter to `any` (calls without an explicit type argument lose all checking) and casts the parsed response to `body: any`; routes/users.ts does `req.body as any`, erasing validation of name/email before the INSERT. Use `T = unknown`, type the fetch body as `unknown`, and add a request-body interface or runtime schema validation for POST /users."
+          },
+          "ruleId": "no-explicit-any"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

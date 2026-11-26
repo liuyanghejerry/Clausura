@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/login.js"
+                },
+                "region": {
+                  "endLine": 8,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL injection via string concatenation in findByUsername. User-supplied `username` is directly interpolated into the SQL query."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/login.js"
+                },
+                "region": {
+                  "endLine": 13,
+                  "startLine": 13
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded API key (SERVICE_API_KEY) exposed in source code."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/render.js"
+                },
+                "region": {
+                  "endLine": 6,
+                  "startLine": 6
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Stored XSS: user-controlled `user.bio` is assigned to innerHTML without sanitization."
+          },
+          "ruleId": "xss"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

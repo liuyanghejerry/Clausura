@@ -1,0 +1,336 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/auth.ts"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Signing secret AUTH_SECRET is hardcoded in source."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/server.ts"
+                },
+                "region": {
+                  "endLine": 7,
+                  "startLine": 7
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Service API key SERVICE_API_KEY is hardcoded in source."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/routes/users.ts"
+                },
+                "region": {
+                  "endLine": 11,
+                  "startLine": 11
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "The query string is built by interpolating the request parameter `id` straight into the SQL. This allows SQL injection. Use a parameterized query."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/server.ts"
+                },
+                "region": {
+                  "endLine": 19,
+                  "startLine": 19
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "The query string is built by interpolating the query-string value `name` into the SQL. This allows SQL injection. Use a parameterized query."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/components/Chat.tsx"
+                },
+                "region": {
+                  "endLine": 28,
+                  "startLine": 26
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Fetched message sender and text are assigned to innerHTML without escaping. This allows stored XSS."
+          },
+          "ruleId": "xss"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/components/Comments.tsx"
+                },
+                "region": {
+                  "endLine": 29,
+                  "startLine": 29
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Server-supplied comment HTML is rendered with dangerouslySetInnerHTML and is not sanitized. This allows stored XSS."
+          },
+          "ruleId": "xss"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/components/Profile.tsx"
+                },
+                "region": {
+                  "endLine": 20,
+                  "startLine": 20
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "The user-controlled bio is assigned to innerHTML without sanitization. This allows stored XSS."
+          },
+          "ruleId": "xss"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/routes/users.ts"
+                },
+                "region": {
+                  "endLine": 22,
+                  "startLine": 22
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "`req.body as any` removes type safety from the request body."
+          },
+          "ruleId": "no-explicit-any"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/shared/src/utils.ts"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "parseJson has an explicit `any` return type."
+          },
+          "ruleId": "no-explicit-any"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/shared/src/utils.ts"
+                },
+                "region": {
+                  "endLine": 14,
+                  "startLine": 14
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "mergeOptions uses explicit `any` for both parameters and the return type."
+          },
+          "ruleId": "no-explicit-any"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/hooks/useFetch.ts"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "The generic parameter T defaults to `any`."
+          },
+          "ruleId": "no-explicit-any"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/hooks/useFetch.ts"
+                },
+                "region": {
+                  "endLine": 15,
+                  "startLine": 15
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "The `.then` callback annotates the parsed body as `any`."
+          },
+          "ruleId": "no-explicit-any"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/server.ts"
+                },
+                "region": {
+                  "endLine": 31,
+                  "startLine": 31
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Debug console.log is left in server startup code."
+          },
+          "ruleId": "console-log"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/shared/src/utils.ts"
+                },
+                "region": {
+                  "endLine": 5,
+                  "startLine": 5
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "The logDebug helper calls console.log in production code."
+          },
+          "ruleId": "console-log"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/App.tsx"
+                },
+                "region": {
+                  "endLine": 8,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Debug console.log is left in the App component."
+          },
+          "ruleId": "console-log"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/hooks/useFetch.ts"
+                },
+                "region": {
+                  "endLine": 11,
+                  "startLine": 11
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Debug console.log is left in the useFetch hook."
+          },
+          "ruleId": "console-log"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

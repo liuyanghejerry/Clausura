@@ -1,0 +1,236 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded database credentials are embedded in the source and will be shipped in the binary if the environment variable is unset."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 22,
+                  "startLine": 16
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Store initialization failures are converted to `None` and the service keeps running, silently disabling database-backed functionality."
+          },
+          "ruleId": "swallowed-error"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 30,
+                  "startLine": 27
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Connection handling errors are intentionally discarded with `let _ =`, so request failures are hidden instead of being logged or handled."
+          },
+          "ruleId": "swallowed-error"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 36,
+                  "startLine": 34
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Production code still contains a `todo!()` marker, which will panic if reached."
+          },
+          "ruleId": "todo-marker"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/handlers.rs"
+                },
+                "region": {
+                  "endLine": 25,
+                  "startLine": 25
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Parsing the user id from the request path uses `unwrap()` on untrusted input, so a malformed `/users/...` request can panic the server."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/handlers.rs"
+                },
+                "region": {
+                  "endLine": 33,
+                  "startLine": 33
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "JSON payload parsing uses `unwrap()` on user-controlled request bodies, so invalid JSON will panic the handler."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 27,
+                  "startLine": 24
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL is built with `format!` and interpolated username directly into the query, allowing quote-breaking injection."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 46,
+                  "startLine": 43
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL LIKE clause is assembled via string formatting with unescaped user input, which permits SQL injection through the domain parameter."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 59,
+                  "startLine": 59
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Order insertion unwraps both the SKU prefix and the numeric parse without validation, so malformed order data can panic the service."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 86,
+                  "startLine": 83
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Production storage code still contains a `todo!()` marker that will panic if reconciliation is called."
+          },
+          "ruleId": "todo-marker"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-core/src/models.rs"
+                },
+                "region": {
+                  "endLine": 26,
+                  "startLine": 26
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "The first element of a user-supplied comma list is unwrapped unconditionally, so an empty string will panic before the `Option` is returned."
+          },
+          "ruleId": "panic-unwrap"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

@@ -438,7 +438,7 @@ clausura eval --models eval/models.yaml --variant default Compare models; write 
 Multi-model matrices run the same scenarios against every entry in
 [`eval/models.yaml`](eval/models.yaml) and publish a cross-model recall
 report. See [`eval/`](eval/) for the matrix format and published results.
-Most recent historical matrix (pre-hardening; see its errata): [2026-11-11, eight models via OpenRouter, three repeats](eval/results/2026-11-11-openrouter-runs3/eval-matrix.md).
+Most recent published matrix (`main @ 43ec174`, post-hardening): [2026-11-26, eight models via OpenRouter, three repeats](eval/results/2026-11-26-openrouter-runs3/eval-matrix.md) (previous pre-hardening baseline: [2026-11-11](eval/results/2026-11-11-openrouter-runs3/eval-matrix.md)).
 
 See [`eval/`](eval/) and [`docs/guide/eval.md`](docs/guide/eval.md).
 

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/login.js"
+                },
+                "region": {
+                  "endLine": 8,
+                  "startLine": 6
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "用户输入 username 通过字符串拼接直接构造 SQL 查询，存在 SQL 注入风险。应改用参数化查询。"
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/login.js"
+                },
+                "region": {
+                  "endLine": 12,
+                  "startLine": 12
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "源码中硬编码了服务 API key，并通过 module.exports 导出，任何能读取代码的人都可获取该凭据。应改为从环境变量或密钥管理服务读取，并轮换该密钥。"
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/render.js"
+                },
+                "region": {
+                  "endLine": 5,
+                  "startLine": 5
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "user.bio 为用户可控内容，未经转义直接赋值给 innerHTML，构成存储型 XSS。应使用 textContent，或对内容进行净化后再插入。"
+          },
+          "ruleId": "xss"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

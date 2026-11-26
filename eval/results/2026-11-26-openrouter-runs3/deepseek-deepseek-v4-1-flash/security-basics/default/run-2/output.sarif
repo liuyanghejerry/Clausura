@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/login.js"
+                },
+                "region": {
+                  "endLine": 11,
+                  "startLine": 7
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "`findByUsername` builds the SQL query by concatenating the caller-supplied `username` directly into the statement, allowing SQL injection (e.g. `' OR '1'='1`). Use parameterized queries/placeholders instead."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/login.js"
+                },
+                "region": {
+                  "endLine": 14,
+                  "startLine": 14
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded API credential `SERVICE_API_KEY` is committed in source and exported from the module. Load secrets from environment variables or a secret manager."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/render.js"
+                },
+                "region": {
+                  "endLine": 6,
+                  "startLine": 6
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "`renderUserProfile` assigns user-controlled `user.bio` to `innerHTML` without escaping, enabling stored XSS. Use `textContent` or sanitize the HTML."
+          },
+          "ruleId": "xss"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

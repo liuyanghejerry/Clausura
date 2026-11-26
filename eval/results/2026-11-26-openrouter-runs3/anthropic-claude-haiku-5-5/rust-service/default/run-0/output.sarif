@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 32,
+                  "startLine": 29
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "find_user builds SQL with format! from the username argument instead of a parameterized query, so a crafted username can inject SQL."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 52,
+                  "startLine": 49
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "find_users_by_domain concatenates the domain argument into a LIKE pattern via format!, enabling SQL injection."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/handlers.rs"
+                },
+                "region": {
+                  "endLine": 27,
+                  "startLine": 27
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Client-controlled path segment is parsed with unwrap(); a malformed /users/<id> request panics the connection handler."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/handlers.rs"
+                },
+                "region": {
+                  "endLine": 36,
+                  "startLine": 36
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Request body JSON is parsed with unwrap(); a malformed POST /orders payload panics the handler."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 68,
+                  "startLine": 68
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "insert_order indexes items[0] without a bounds check and unwraps strip_prefix/parse; an empty or malformed SKU or item list panics instead of returning an error."
+          },
+          "ruleId": "panic-unwrap"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 11,
+                  "startLine": 10
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Database connection string with a plaintext password is hardcoded as the default DATABASE_URL."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 31,
+                  "startLine": 31
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "The Result from handle_connection is discarded with `let _ =`, so per-connection failures are silently dropped with no logging."
+          },
+          "ruleId": "swallowed-error"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-api/src/main.rs"
+                },
+                "region": {
+                  "endLine": 39,
+                  "startLine": 37
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "rebuild_indexes contains a leftover todo!() in production code; calling it panics at runtime."
+          },
+          "ruleId": "todo-marker"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "crates/svc-store/src/lib.rs"
+                },
+                "region": {
+                  "endLine": 96,
+                  "startLine": 94
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "reconcile_inventory contains a leftover todo!() in production code and panics when called."
+          },
+          "ruleId": "todo-marker"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

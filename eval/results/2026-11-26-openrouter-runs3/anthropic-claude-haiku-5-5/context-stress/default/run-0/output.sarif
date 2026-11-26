@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "data/records.json"
+                },
+                "region": {
+                  "endLine": 9808,
+                  "startLine": 9808
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "data/records.json contains a hardcoded API key in record rec-1400 (role \"admin\"). A credential is committed in a data file, where it is exposed to anyone with repository access."
+          },
+          "ruleId": "hardcoded-secret"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

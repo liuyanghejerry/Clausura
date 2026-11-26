@@ -128,4 +128,4 @@ not abort the others.
 Only real, unedited harness output belongs there — never hand-written
 numbers.
 
-Most recent historical matrix (pre-hardening; see its errata): [2026-11-11, eight models via OpenRouter, three repeats](results/2026-11-11-openrouter-runs3/eval-matrix.md).
+Most recent published matrix (`main @ 43ec174`, post-hardening): [2026-11-26, eight models via OpenRouter, three repeats](results/2026-11-26-openrouter-runs3/eval-matrix.md) (previous pre-hardening baseline: [2026-11-11](results/2026-11-11-openrouter-runs3/eval-matrix.md)).

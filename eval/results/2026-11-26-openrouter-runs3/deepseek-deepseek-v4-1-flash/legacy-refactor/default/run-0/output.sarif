@@ -1,0 +1,296 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 20,
+                  "startLine": 20
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL built via f-string with user-controlled `name` interpolated directly into the WHERE clause; allows SQL injection."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 33,
+                  "startLine": 33
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL built via f-string with user-controlled `domain` interpolated into a LIKE clause; allows SQL injection."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 25,
+                  "startLine": 24
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception:` swallows all DB errors and silently returns None; no logging or handling."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/importer.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "pickle.loads() deserializes the contents of a caller-supplied file path; untrusted archives lead to arbitrary code execution."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/importer.py"
+                },
+                "region": {
+                  "endLine": 22,
+                  "startLine": 21
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception:` with only `pass` silently discards all CSV parsing errors."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 10,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "pickle.loads() on session file contents; unsafe deserialization of untrusted input."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 16,
+                  "startLine": 16
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "pickle.loads() on legacy cache file contents; unsafe deserialization of untrusted input."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 33,
+                  "startLine": 32
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception:` with only `pass` swallows errors in migrate_session (e.g. unexpected types)."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 13,
+                  "startLine": 12
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception:` with only `pass` hides failures of db.initialize()."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 19,
+                  "startLine": 18
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception:` swallows query errors and silently substitutes an empty user list."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Payments API key hardcoded in source and shipped to consumers of the module."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/cache.py"
+                },
+                "region": {
+                  "endLine": 7,
+                  "startLine": 7
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug print in the cache lookup path; should use structured logging."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 17,
+                  "startLine": 17
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug print in the legacy cache loader."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 8,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug print in the payment charging path."
+          },
+          "ruleId": "debug-print"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

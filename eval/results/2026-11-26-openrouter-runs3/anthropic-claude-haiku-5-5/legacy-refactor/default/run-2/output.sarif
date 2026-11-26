@@ -1,0 +1,356 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 20,
+                  "startLine": 20
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "find_user_by_name builds SQL with an f-string from an untrusted `name` argument."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 33,
+                  "startLine": 33
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "find_users_by_domain builds SQL with an f-string from an untrusted `domain` argument. Use a parameterized query."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 25,
+                  "startLine": 24
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "find_user_by_name catches Exception and returns None with no logging or error signal, so database errors are silently swallowed."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/importer.py"
+                },
+                "region": {
+                  "endLine": 22,
+                  "startLine": 21
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "import_legacy_csv catches Exception and passes, silently dropping malformed rows."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 32,
+                  "startLine": 31
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "migrate_session catches Exception and passes with no logging or handling."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 13,
+                  "startLine": 12
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "main() swallows any exception from db.initialize() and returns 0 with no logging."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/importer.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "import_archive unpickles file contents with pickle.loads. Archives are untrusted input, so this allows arbitrary code execution."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "load_session unpickles a session file with pickle.loads, which allows arbitrary code execution from a crafted file."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 15,
+                  "startLine": 15
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "load_legacy_cache unpickles file contents with pickle.loads, which allows arbitrary code execution."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "A payments API key is hardcoded in source."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/cache.py"
+                },
+                "region": {
+                  "endLine": 8,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug print in cache get()."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/cache.py"
+                },
+                "region": {
+                  "endLine": 15,
+                  "startLine": 15
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug print in cache set_value()."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 16,
+                  "startLine": 16
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug print in load_legacy_cache()."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 25,
+                  "startLine": 25
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug print in save_session()."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 20,
+                  "startLine": 20
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Debug print of the error path in main(). Errors should go through logging."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 8,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug print in charge()."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 13,
+                  "startLine": 13
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug print in refund()."
+          },
+          "ruleId": "debug-print"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

@@ -1,0 +1,336 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/components/Chat.tsx"
+                },
+                "region": {
+                  "endLine": 28,
+                  "startLine": 25
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "User-controlled chat messages are concatenated into HTML and assigned to innerHTML — stored XSS."
+          },
+          "ruleId": "xss"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/components/Comments.tsx"
+                },
+                "region": {
+                  "endLine": 30,
+                  "startLine": 30
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Server-provided comment HTML is injected raw via dangerouslySetInnerHTML without sanitization — stored XSS."
+          },
+          "ruleId": "xss"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/components/Profile.tsx"
+                },
+                "region": {
+                  "endLine": 23,
+                  "startLine": 23
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "User-controlled profile bio fetched from the API is assigned directly to innerHTML — stored XSS."
+          },
+          "ruleId": "xss"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/routes/users.ts"
+                },
+                "region": {
+                  "endLine": 11,
+                  "startLine": 11
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL query built by interpolating req.params.id into a template string — SQL injection."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/server.ts"
+                },
+                "region": {
+                  "endLine": 21,
+                  "startLine": 21
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL query built by interpolating req.query.name into a template string — SQL injection."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/auth.ts"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded signing secret shipped in source code."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/server.ts"
+                },
+                "region": {
+                  "endLine": 7,
+                  "startLine": 7
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded service API key shipped in source code."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/routes/users.ts"
+                },
+                "region": {
+                  "endLine": 22,
+                  "startLine": 22
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Explicit `as any` cast erases the request body type."
+          },
+          "ruleId": "no-explicit-any"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/shared/src/utils.ts"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Explicit `any` return type erases the parsed payload type."
+          },
+          "ruleId": "no-explicit-any"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/shared/src/utils.ts"
+                },
+                "region": {
+                  "endLine": 14,
+                  "startLine": 14
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Explicit `any` parameter and return types erase the options type."
+          },
+          "ruleId": "no-explicit-any"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/hooks/useFetch.ts"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Generic default `T = any` erases the response shape type."
+          },
+          "ruleId": "no-explicit-any"
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/hooks/useFetch.ts"
+                },
+                "region": {
+                  "endLine": 16,
+                  "startLine": 16
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Explicit `any` parameter annotation erases the parsed body type."
+          },
+          "ruleId": "no-explicit-any"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/api/src/server.ts"
+                },
+                "region": {
+                  "endLine": 31,
+                  "startLine": 31
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Debug console.log left in production server code."
+          },
+          "ruleId": "console-log"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/shared/src/utils.ts"
+                },
+                "region": {
+                  "endLine": 5,
+                  "startLine": 5
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Debug console.log helper in shared production code."
+          },
+          "ruleId": "console-log"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/App.tsx"
+                },
+                "region": {
+                  "endLine": 8,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Debug console.log left in App render path."
+          },
+          "ruleId": "console-log"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "packages/web/src/hooks/useFetch.ts"
+                },
+                "region": {
+                  "endLine": 12,
+                  "startLine": 12
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Debug console.log left in the useFetch hook."
+          },
+          "ruleId": "console-log"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

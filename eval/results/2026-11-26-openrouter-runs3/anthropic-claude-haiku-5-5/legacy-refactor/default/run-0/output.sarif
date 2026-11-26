@@ -1,0 +1,376 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 20,
+                  "startLine": 20
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "find_user_by_name 用 f-string 把 name 拼接进 SQL，存在 SQL 注入。"
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 33,
+                  "startLine": 33
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "find_users_by_domain 用 f-string 拼接 domain 构造 LIKE 查询，存在 SQL 注入。应改用参数化查询。"
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 25,
+                  "startLine": 24
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "find_user_by_name 捕获所有 Exception 后直接返回 None，没有日志或重新抛出，数据库错误被静默吞掉。"
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/importer.py"
+                },
+                "region": {
+                  "endLine": 22,
+                  "startLine": 21
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "import_legacy_csv 捕获所有 Exception 后仅 pass，坏行被静默丢弃。"
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 13,
+                  "startLine": 12
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "main 的 init 分支捕获所有 Exception 后仅 pass，初始化失败却返回 0。"
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 33,
+                  "startLine": 32
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "migrate_session 捕获所有 Exception 后仅 pass，迁移错误被静默忽略。"
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/importer.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "import_archive 对文件内容直接 pickle.loads，攻击者可构造恶意 pickle 执行任意代码。"
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 10,
+                  "startLine": 10
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "load_session 对文件内容直接 pickle.loads，存在任意代码执行风险。"
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 16,
+                  "startLine": 16
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "load_legacy_cache 对文件内容直接 pickle.loads，存在任意代码执行风险。"
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "payments 模块在源码中硬编码了 PAYMENTS_API_KEY，密钥已进入版本库，应移到环境变量或密钥管理服务，并轮换该密钥。"
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/cache.py"
+                },
+                "region": {
+                  "endLine": 8,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "生产代码中遗留 print 调试输出。"
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/cache.py"
+                },
+                "region": {
+                  "endLine": 15,
+                  "startLine": 15
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "生产代码中遗留 print 调试输出。"
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 17,
+                  "startLine": 17
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "生产代码中遗留 print 调试输出。"
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 26,
+                  "startLine": 26
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "生产代码中遗留 print 调试输出。"
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 20,
+                  "startLine": 20
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "生产代码中遗留 print 调试输出。"
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 23,
+                  "startLine": 23
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "生产代码中遗留 print 调试输出。"
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 8,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "生产代码中遗留 print 调试输出。"
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 13,
+                  "startLine": 13
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "生产代码中遗留 print 调试输出。"
+          },
+          "ruleId": "debug-print"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

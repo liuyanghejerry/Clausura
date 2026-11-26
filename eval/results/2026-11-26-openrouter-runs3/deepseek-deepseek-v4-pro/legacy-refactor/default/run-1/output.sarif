@@ -1,0 +1,396 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 22,
+                  "startLine": 21
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception` silently swallows all exceptions, masking errors like database connection failures."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 18,
+                  "startLine": 18
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "f-string interpolation in SQL query allows SQL injection via the `name` parameter."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 32,
+                  "startLine": 32
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "f-string interpolation in SQL query allows SQL injection via the `domain` parameter."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/importer.py"
+                },
+                "region": {
+                  "endLine": 8,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Unsafe deserialization via `pickle.loads()` on data read from an arbitrary file path — classic RCE vector."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/importer.py"
+                },
+                "region": {
+                  "endLine": 22,
+                  "startLine": 21
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception` with `pass` silently discards all errors during CSV parsing."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 10,
+                  "startLine": 10
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Unsafe deserialization via `pickle.loads()` on untrusted file input."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 15,
+                  "startLine": 15
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Unsafe deserialization via `pickle.loads()` on untrusted file input."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 17,
+                  "startLine": 17
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug `print()` in production code."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 24,
+                  "startLine": 24
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug `print()` in production code."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 32,
+                  "startLine": 31
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception` with `pass` silently discards KeyError or any other exception when popping `legacy_field`."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 14,
+                  "startLine": 13
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception` with `pass` silently discards all errors during DB initialization."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 19,
+                  "startLine": 17
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception` silently swallows errors from `db.list_users()`, falling back to an empty list without proper logging."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 18,
+                  "startLine": 18
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug `print()` in production code."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 21,
+                  "startLine": 21
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug `print()` in production code."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded API key shipped in source code — a secret that must be rotated and moved to a secure vault."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 8,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug `print()` in production code."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 13,
+                  "startLine": 13
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug `print()` in production code."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/cache.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug `print()` in production code."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/cache.py"
+                },
+                "region": {
+                  "endLine": 15,
+                  "startLine": 15
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug `print()` in production code."
+          },
+          "ruleId": "debug-print"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

@@ -20,8 +20,39 @@ model leaderboards.
 
 | Date | Provider | Models | Scenarios | Runs/model | Report |
 |------|----------|--------|-----------|------------|--------|
-| 2026-11-11 | OpenRouter | 8 | 6 (`default` variant) | 18 (3 repeats) | [eval-matrix.md](2026-11-11-openrouter-runs3/eval-matrix.md) **(historical, pre-hardening)** |
-| 2026-11-11 | OpenRouter | 5 | 6 (`default` variant) | 12 (2 repeats) | [eval-matrix.md](2026-11-11-openrouter/eval-matrix.md) |
+| 2026-11-26 | OpenRouter | 8 | 6 (`default` variant) | 18 (3 repeats) | [eval-matrix.md](2026-11-26-openrouter-runs3/eval-matrix.md) **(current, post-hardening `main @ 43ec174`)** |
+| 2026-11-11 | OpenRouter | 8 | 6 (`default` variant) | 18 (3 repeats) | [eval-matrix.md](2026-11-11-openrouter-runs3/eval-matrix.md) *(historical, pre-hardening)* |
+| 2026-11-11 | OpenRouter | 5 | 6 (`default` variant) | 12 (2 repeats) | [eval-matrix.md](2026-11-11-openrouter/eval-matrix.md) *(historical)* |
+
+### 2026-11-26-openrouter-runs3 (current)
+
+- Binary: clean release build of `main @ 43ec174` (`v1.11.0` + PR #34,
+  `source_tree_dirty: false`). 144 runs, 6,028,352 billed tokens in total;
+  all 144 `run.events.jsonl` and `output.sarif` artifacts preserved.
+- Headline: `anthropic/claude-sonnet-5.5` and `moonshotai/kimi-k3` both hit
+  **100% (60/60)** pooled rule recall across all six scenarios;
+  `anthropic/claude-haiku-5.5` reached **98% (59/60)** (94% success);
+  `openai/gpt-5.4-mini` jumped from 68% to **93% (56/60)** (94% success);
+  `deepseek/deepseek-v4.1-flash` and `deepseek/deepseek-v4-pro` both reached
+  **92% (55/60)**.
+- Impact of contract injection, `report_finding`, dynamic spill caps, and
+  in-place tool-output pruning versus the `2026-11-11` snapshot:
+  - `context-stress` moved from 7/8 models at 0% to **4 models at 100%**
+    (Sonnet 5.5, Haiku 5.5, Kimi K3, GPT-5.4-mini) plus DeepSeek-v4.1-flash
+    at 67%.
+  - `secret-sweep` moved to **100% recall on 5/8 models** (including Haiku
+    5.5 jumping from 0% → 100% once gating `rule_id`s were injected into the
+    system prompt).
+  - Mean tokens/run dropped 6–19% on Sonnet 5.5, Haiku 5.5, GPT-5.4-mini,
+    and DeepSeek-v4.1-flash.
+- Notable regressions on two flash models under strict fail-closed
+  `iteration_limit` accounting:
+  - `google/gemini-3.8-flash` (45% recall, 17% success) and
+    `qwen/qwen3.8-flash` (68% recall, 33% success) repeatedly exhausted
+    `max_iterations` by issuing single-tool searches or per-finding
+    `report_finding` turns, and Gemini attempted further tool calls during the
+    recovery step. These observations motivated follow-up hardening (no-tool
+    recovery calls and a final-iteration wrap-up nudge).
 
 ### 2026-11-11-openrouter-runs3 (historical)
 

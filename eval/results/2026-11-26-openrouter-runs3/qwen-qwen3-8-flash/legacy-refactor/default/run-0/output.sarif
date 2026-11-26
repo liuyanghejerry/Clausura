@@ -1,0 +1,296 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 20,
+                  "startLine": 20
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL injection: user-controlled `name` is interpolated into the query with an f-string instead of a bound parameter. A value like `'); DROP TABLE users;--` alters the statement. Use `conn.execute(\"SELECT id, name, email FROM users WHERE name = ?\", (name,))`."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 33,
+                  "startLine": 33
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL injection: `domain` is concatenated into a LIKE clause via f-string. Use a parameterized query: `conn.execute(\"SELECT ... WHERE email LIKE ?\", ('%' + domain,))`."
+          },
+          "ruleId": "sql-injection"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/db.py"
+                },
+                "region": {
+                  "endLine": 23,
+                  "startLine": 21
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Broad `except Exception:` in `find_user_by_name` swallows every error (including the sqlite injection/syntax errors the f-string SQL can produce) and returns `None`, so a DB failure is indistinguishable from \"user not found\". Log the exception and/or catch `sqlite3.Error`."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/importer.py"
+                },
+                "region": {
+                  "endLine": 22,
+                  "startLine": 19
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Bare `except Exception: pass` silently discards malformed CSV rows; the importer loses data with no record. Catch `ValueError`/`IndexError` (or `csv.Error`) and log the offending line number."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 33,
+                  "startLine": 31
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "`session.pop(\"legacy_field\")` raises `KeyError` when the field is absent; wrapping it in `except Exception: pass` also hides AttributeError/TypeError from non-dict sessions. Use `session.pop(\"legacy_field\", None)`."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 13,
+                  "startLine": 11
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Setup failure in `main \"init\"` is swallowed by `except Exception: pass` and still returns exit code 0, so callers/CI see success even when the schema was never created. Log the error and return a non-zero code."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 20,
+                  "startLine": 16
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "`except Exception:` masks a DB outage as an empty user list (silent data loss for downstream logic); the only signal is `print(\"failed to load users\")`. Use a narrow exception type plus `logging.exception` and fail loudly."
+          },
+          "ruleId": "bare-except"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/importer.py"
+                },
+                "region": {
+                  "endLine": 9,
+                  "startLine": 7
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Unsafe deserialization: `pickle.loads` on an externally supplied archive file. Pickle executes arbitrary `__reduce__` code during load, so a malicious archive gives remote code execution. Replace with json/`yaml.safe_load` or verify a signature and trusted origin before unpickling."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 10,
+                  "startLine": 7
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Unsafe deserialization: session files are loaded with `pickle.loads`, letting any attacker-controlled session file run arbitrary code at load time (classic RCE/persistence path). Use a signed, non-executable format such as JSON plus an HMAC."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 16,
+                  "startLine": 14
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Unsafe deserialization: `load_legacy_cache` unpickles a cache file from disk. Cache storage is typically the least-trusted input path in this stack, so `pickle.loads` here is a code-execution entry point. Use `json.load` (and pair with the `pickle.dump` in `save_session`)."
+          },
+          "ruleId": "unsafe-deserialization"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/payments.py"
+                },
+                "region": {
+                  "endLine": 4,
+                  "startLine": 3
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Hardcoded payment API secret committed to source. Anyone with repo read access obtains a production payments credential. Rotate the key, load it from the environment/secret manager (`os.environ[\"PAYMENTS_API_KEY\"]`), and scrub it from git history."
+          },
+          "ruleId": "hardcoded-secret"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/cache.py"
+                },
+                "region": {
+                  "endLine": 15,
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Leftover debug prints in the hot cache path: every get/set writes to stdout, adding per-request overhead and leaking cache keys into logs. Replace with a module-level `logging.getLogger(__name__)` at DEBUG level."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/legacy_utils.py"
+                },
+                "region": {
+                  "endLine": 26,
+                  "startLine": 16
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Debug `print()` calls remain in the session load/save helpers; `print(f\"saved {path}\")` writes filesystem paths to stdout on every save. Route through `logging` and keep the path at DEBUG level only."
+          },
+          "ruleId": "debug-print"
+        },
+        {
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "app/main.py"
+                },
+                "region": {
+                  "endLine": 23,
+                  "startLine": 23
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Remaining debug prints in the entry point and payments module: `print(f\"user: {user}\")` emits PII (name + email) to stdout for every user, and the payments prints expose account/charge identifiers. Replace with `logging` calls using non-PII fields (user id only)."
+          },
+          "ruleId": "debug-print"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/liuyanghejerry/Clausura",
+          "name": "Clausura"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}
